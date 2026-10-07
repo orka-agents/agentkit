@@ -102,15 +102,15 @@ def test_review_wait_and_process_restart_preserve_completed_steps_and_final_resu
             assert _message_text(final.json()) == f"{outcome}: {_ERRORS[outcome]}"
         else:
             assert len(second_model.requests) == 1
-            messages = second_model.requests[0]["messages"]
-            assert len([message for message in messages if message["role"] == "user"]) == 1
-            tool_results = [message for message in messages if message["role"] == "tool"]
+            items = second_model.requests[0]["input"]
+            assert len([item for item in items if item.get("role") == "user"]) == 1
+            tool_results = [item for item in items if item["type"] == "function_call_output"]
             assert len(tool_results) == 2
-            assert json.loads(tool_results[0]["content"]) == first_output
-            assert tool_results[1]["tool_call_id"] == _call(pending)["call_id"]
+            assert json.loads(tool_results[0]["output"]) == first_output
+            assert tool_results[1]["call_id"] == _call(pending)["call_id"]
             expected = output if outcome == "approved" else {"approved": False, "error": {"code": outcome, "message": _ERRORS[outcome]}}
-            assert json.loads(tool_results[1]["content"]) == expected
-            assert "UNSAFE_TOOL_DETAIL" not in json.dumps(messages)
+            assert json.loads(tool_results[1]["output"]) == expected
+            assert "UNSAFE_TOOL_DETAIL" not in json.dumps(items)
 
 
 @pytest.mark.parametrize("saved_state", [False, True])

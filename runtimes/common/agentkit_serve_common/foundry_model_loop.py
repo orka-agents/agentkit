@@ -5,6 +5,11 @@ resume externally brokered tool calls, AgentKit can drive a minimal model loop
 itself. The loop exposes only static safe brokered schemas to the model, converts
 one model tool request at a time into a hosted Responses function_call, and
 resumes with Orka's function_call_output until the assistant finishes.
+
+The model is called through the OpenAI Responses API because reasoning models
+can reject function tools on Chat Completions. The retained transcript keeps a
+chat-shaped message list so pending continuation state stays compatible; it is
+translated to Responses input items for each model request.
 """
 
 from __future__ import annotations
@@ -83,7 +88,7 @@ class ModelLoopToolRequest:
 
 
 class BrokeredChatModelLoop:
-    """Bounded sequential tool loop over OpenAI Chat Completions."""
+    """Bounded sequential tool loop over the OpenAI Responses API."""
 
     def __init__(
         self,
@@ -141,8 +146,9 @@ class BrokeredChatModelLoop:
         current_turn = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), 0)
         tool_count = sum(len(message.get("tool_calls") or []) for message in messages[current_turn:])
         exhausted = tool_count >= self.max_tool_calls
-        data = await self._chat(messages, tools=[] if exhausted else self._tool_payloads())
-        message = _choice_message(data)
+        # At the limit, keep the definitions that match the replayed calls but forbid new calls.
+        data = await self._create_response(messages, tools=self._tool_payloads(), tool_choice="none" if exhausted else "auto")
+        message = _output_message(data)
         usage = _usage(data)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -259,26 +265,25 @@ class BrokeredChatModelLoop:
         return messages
 
     def _tool_payloads(self) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = [self.skills.tool_schema()] if self.skills else []
+        definitions = [self.skills.tool_schema()["function"]] if self.skills else []
         for tool in self.tools:
             description = f"Brokered class: {tool.brokered_class}. {tool.description}".strip()
-            payloads.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": description,
-                        "parameters": dict(tool.parameters),
-                    },
-                }
-            )
-        return payloads
+            definitions.append({"name": tool.name, "description": description, "parameters": dict(tool.parameters)})
+        # Brokered schemas need not satisfy strict mode; AgentKit validates arguments itself.
+        return [{"type": "function", **definition, "strict": False} for definition in definitions]
 
-    async def _chat(self, messages: Sequence[Mapping[str, Any]], *, tools: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": self.spec.model.name, "messages": list(messages)}
+    async def _create_response(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        tools: Sequence[Mapping[str, Any]],
+        tool_choice: str,
+    ) -> dict[str, Any]:
+        # The full transcript is resent each round, so the provider need not retain it.
+        payload: dict[str, Any] = {"model": self.spec.model.name, "input": _responses_input(messages), "store": False}
         if tools:
             payload["tools"] = list(tools)
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice
             payload["parallel_tool_calls"] = False
         headers = await self._auth_headers()
         client = self.http_client
@@ -291,7 +296,7 @@ class BrokeredChatModelLoop:
                 retry_delay = None
                 async with client.stream(
                     "POST",
-                    _chat_completions_url(self.spec.model.base_url),
+                    _responses_url(self.spec.model.base_url),
                     json=payload,
                     headers=headers or None,
                 ) as response:
@@ -410,11 +415,37 @@ def _model_response_too_large_error() -> AgentRunError:
     )
 
 
-def _chat_completions_url(base_url: str) -> str:
+def _responses_url(base_url: str) -> str:
     root = base_url.rstrip("/")
-    if root.endswith("/chat/completions"):
+    if root.endswith("/responses"):
         return root
-    return f"{root}/chat/completions"
+    # Keep base URLs that previously named the Chat Completions endpoint working.
+    root = root.removesuffix("/chat/completions")
+    return f"{root}/responses"
+
+
+def _responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Translate the retained chat-shaped transcript into Responses input items."""
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if message["role"] == "tool":
+            items.append({"type": "function_call_output", "call_id": message["tool_call_id"], "output": message["content"]})
+            continue
+        tool_calls = message.get("tool_calls") or []
+        content = message.get("content")
+        if isinstance(content, str) and (content or not tool_calls):
+            items.append({"type": "message", "role": message["role"], "content": content})
+        for call in tool_calls:
+            function = call["function"]
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": function["name"],
+                    "arguments": function["arguments"],
+                }
+            )
+    return items
 
 
 def _normalized_model_http_error(status_code: int) -> AgentRunError:
@@ -475,16 +506,43 @@ def _model_auth_missing_error() -> AgentRunError:
     )
 
 
-def _choice_message(data: Mapping[str, Any]) -> Mapping[str, Any]:
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise AgentRunError("model response did not include choices", status=502, code="InvalidModelResponse")
-    choice = choices[0]
-    if not isinstance(choice, Mapping):
-        raise AgentRunError("model response choice must be an object", status=502, code="InvalidModelResponse")
-    message = choice.get("message")
-    if not isinstance(message, Mapping):
-        raise AgentRunError("model response choice did not include a message", status=502, code="InvalidModelResponse")
+def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project Responses output items onto the assistant message shape the loop retains."""
+    output = data.get("output")
+    if not isinstance(output, list):
+        raise AgentRunError("model response did not include output items", status=502, code="InvalidModelResponse")
+    texts: list[str] = []
+    refusals: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, Mapping):
+            raise AgentRunError("model response output item must be an object", status=502, code="InvalidModelResponse")
+        item_type = item.get("type")
+        if item_type == "function_call":
+            tool_calls.append({"type": "function", "function": {"name": item.get("name"), "arguments": item.get("arguments")}})
+        elif item_type == "message":
+            content = item.get("content")
+            if item.get("role") != "assistant" or not isinstance(content, list):
+                raise AgentRunError("model response message must be assistant content", status=502, code="InvalidModelResponse")
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, Mapping) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+                elif isinstance(part, Mapping) and part.get("type") == "refusal" and isinstance(part.get("refusal"), str):
+                    refusals.append(part["refusal"])
+                else:
+                    raise AgentRunError("model response message content is invalid", status=502, code="InvalidModelResponse")
+            if parts:
+                texts.append("".join(parts))
+        elif isinstance(item_type, str) and item_type.endswith("_call"):
+            # Only function tools are offered; any other tool call is unsupported.
+            tool_calls.append({"type": item_type})
+        # Reasoning and other non-tool items carry no assistant output.
+    message: dict[str, Any] = {"role": "assistant", "content": "\n\n".join(texts) if texts else None}
+    if not texts and refusals:
+        message["refusal"] = "\n\n".join(refusals)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return message
 
 
@@ -610,8 +668,8 @@ def _usage_token_count(value: Any) -> int:
 
 def _usage(data: Mapping[str, Any]) -> dict[str, int]:
     usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
-    prompt_count = _usage_token_count(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
-    completion_count = _usage_token_count(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+    prompt_count = _usage_token_count(usage.get("input_tokens", 0))
+    completion_count = _usage_token_count(usage.get("output_tokens", 0))
     total_count = _usage_token_count(usage.get("total_tokens", prompt_count + completion_count))
     return {"prompt_tokens": prompt_count, "completion_tokens": completion_count, "total_tokens": total_count}
 

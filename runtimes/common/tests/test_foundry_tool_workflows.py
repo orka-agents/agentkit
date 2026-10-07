@@ -86,17 +86,17 @@ def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill)
         assert _message_text(final.json()) == "Incident INC-17 explains the signal loss."
         assert final.json()["usage"] == {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10}
 
-    advertised = {tool["function"]["name"] for tool in fake.requests[0]["tools"]}
+    advertised = {tool["name"] for tool in fake.requests[0]["tools"]}
     assert advertised == {"load_skill", "check-network-telemetry", "get-active-incidents"}
-    assert "inspection" in fake.requests[0]["messages"][1]["content"]
-    messages = fake.requests[-1]["messages"]
-    calls = [call for message in messages for call in message.get("tool_calls", [])]
-    outputs = [message for message in messages if message["role"] == "tool"]
-    assert len(calls) == len({call["id"] for call in calls}) == 4
-    assert [call["id"] for call in calls] == [output["tool_call_id"] for output in outputs]
-    assert outputs[0]["content"] == outputs[2]["content"] == text
-    assert calls[1]["id"] == _call(first.json())["call_id"]
-    assert calls[3]["id"] == _call(second.json())["call_id"]
+    assert "inspection" in fake.requests[0]["input"][1]["content"]
+    items = fake.requests[-1]["input"]
+    calls = [item for item in items if item["type"] == "function_call"]
+    outputs = [item for item in items if item["type"] == "function_call_output"]
+    assert len(calls) == len({call["call_id"] for call in calls}) == 4
+    assert [call["call_id"] for call in calls] == [output["call_id"] for output in outputs]
+    assert outputs[0]["output"] == outputs[2]["output"] == text
+    assert calls[1]["call_id"] == _call(first.json())["call_id"]
+    assert calls[3]["call_id"] == _call(second.json())["call_id"]
     assert all(request["parallel_tool_calls"] is False for request in fake.requests)
 
 
@@ -124,7 +124,8 @@ def test_hosted_local_skill_calls_share_the_tool_budget(packaged_skill):
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "tool_loop_limit_exceeded"
         assert len(fake.requests) == 17
-        assert "tools" not in fake.requests[-1]
+        assert fake.requests[-1]["tool_choice"] == "none"
+        assert fake.requests[-1]["tools"] == fake.requests[0]["tools"]
 
 
 @pytest.mark.parametrize("denied", [False, True])
@@ -151,7 +152,7 @@ def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(tmp_p
         assert _call(second)["name"] == "get-active-incidents"
         assert client.post("/responses", json=first_result, headers=CONTINUATION_AUTH).json() == second
         assert len(fake.requests) == 2
-        assert json.loads(fake.requests[1]["messages"][-1]["content"]) == first_output
+        assert json.loads(fake.requests[1]["input"][-1]["output"]) == first_output
     # Capacity is per workflow, so advancing remains possible with one entry.
     assert len(json.loads(state_file.read_text())["states"]) == 1
     resumed_model = _FakeChatTransport([_chat_response({"role": "assistant", "content": "Incident INC-17 explains the outage."})])
@@ -170,7 +171,7 @@ def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(tmp_p
         assert client.post("/responses", json=first_result, headers=CONTINUATION_AUTH).json() == second
         assert client.post("/responses", json=second_result, headers=CONTINUATION_AUTH).json() == completed.json()
         assert len(resumed_model.requests) == 1
-        returned = [json.loads(m["content"]) for m in resumed_model.requests[0]["messages"] if m["role"] == "tool"]
+        returned = [json.loads(item["output"]) for item in resumed_model.requests[0]["input"] if item["type"] == "function_call_output"]
         assert returned == [first_output, {"approved": True, "output": {"incident": "INC-17"}}]
 
 
@@ -258,7 +259,8 @@ def test_brokered_workflow_has_a_finite_tool_budget():
             response = client.post("/responses", json=_result(response.json(), {"approved": True, "output": {}}), headers=CONTINUATION_AUTH)
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "tool_loop_limit_exceeded"
-        assert "tools" not in fake.requests[-1]
+        assert fake.requests[-1]["tool_choice"] == "none"
+        assert fake.requests[-1]["tools"] == fake.requests[0]["tools"]
 
 
 def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_path):
@@ -277,11 +279,11 @@ def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_p
         request["agent_session_id"] = "session-a"
         completed = client.post("/responses", json=request, headers=CONTINUATION_AUTH)
         assert completed.status_code == 200, completed.text
-        context = fake.requests[1]["messages"]
+        context = fake.requests[1]["input"]
         assert context[-3:] == [
-            {"role": "user", "content": "My site is site-a"},
-            {"role": "assistant", "content": "I will inspect site-a."},
-            {"role": "user", "content": "Check it"},
+            {"type": "message", "role": "user", "content": "My site is site-a"},
+            {"type": "message", "role": "assistant", "content": "I will inspect site-a."},
+            {"type": "message", "role": "user", "content": "Check it"},
         ]
     restarted = _FakeChatTransport([_chat_response({"role": "assistant", "content": "INC-17 is the incident at site-a."})])
     with TestClient(_model_loop_app(_spec(), restarted, response_state_file=state_file)) as client:
@@ -296,10 +298,10 @@ def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_p
         followup = client.post("/responses", json=payload)
         assert followup.status_code == 200, followup.text
         assert _message_text(followup.json()) == "INC-17 is the incident at site-a."
-        messages = restarted.requests[0]["messages"]
-        assert any(message.get("content") == "Site-a has incident INC-17." for message in messages)
-        assert all(message["role"] != "tool" for message in messages)
-        assert "tool-data-only" not in json.dumps(messages)
+        items = restarted.requests[0]["input"]
+        assert any(item.get("content") == "Site-a has incident INC-17." for item in items)
+        assert all(item["type"] == "message" for item in items)
+        assert "tool-data-only" not in json.dumps(items)
         assert len(restarted.requests) == 1
 
 

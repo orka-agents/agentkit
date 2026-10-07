@@ -1725,7 +1725,7 @@ def test_foundry_brokered_file_state_survives_restart_for_model_loop_continuatio
 
     assert final.status_code == 200, final.text
     assert _message_text(final.json()) == "Restart resume worked."
-    assert second_fake.requests[0]["messages"][-1]["tool_call_id"] == call["call_id"]
+    assert second_fake.requests[0]["input"][-1]["call_id"] == call["call_id"]
 
 
 def test_foundry_brokered_model_loop_continuation_requires_model_loop_after_restart(tmp_path):
@@ -1902,8 +1902,10 @@ class _FakeChatTransport:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = list(responses)
         self.requests: list[dict[str, Any]] = []
+        self.urls: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
         self.requests.append(json.loads(request.content.decode("utf-8")))
         if not self.responses:
             return httpx.Response(500, json={"error": "unexpected extra model call"})
@@ -1912,11 +1914,33 @@ class _FakeChatTransport:
 
 
 def _chat_response(message: dict[str, Any], *, prompt_tokens: int = 1, completion_tokens: int = 1) -> dict[str, Any]:
+    """Build the Responses API payload a model returns for a chat-shaped assistant message."""
+    output: list[dict[str, Any]] = []
+    content = message.get("content")
+    if isinstance(content, str):
+        output.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content, "annotations": []}]})
+    elif content is not None:
+        # Keep malformed content malformed so response validation still sees it.
+        output.append({"type": "message", "role": "assistant", "content": content})
+    if "refusal" in message:
+        output.append({"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": message["refusal"]}]})
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        output.append(
+            {
+                "type": "function_call",
+                "call_id": call.get("id"),
+                "name": function.get("name"),
+                "arguments": function.get("arguments"),
+            }
+        )
     return {
-        "choices": [{"message": message}],
+        "object": "response",
+        "status": "completed",
+        "output": output,
         "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
@@ -1935,9 +1959,9 @@ def test_foundry_brokered_model_loop_bounds_streamed_upstream_body_before_json_m
 
         async def __aiter__(self):
             chunks = [
-                b'{"choices":[{"message":{"role":"assistant","content":"',
+                b'{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"',
                 b"x" * 300,
-                b'"}}],"usage":{}}',
+                b'"}]}],"usage":{}}',
             ]
             for index, chunk in enumerate(chunks):
                 self.chunks_read += 1
@@ -2258,7 +2282,7 @@ def test_foundry_brokered_active_resume_survives_ttl_and_completed_state_retains
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content.decode("utf-8"))
             self.requests.append(payload)
-            if not any(message.get("role") == "tool" for message in payload["messages"]):
+            if not any(item["type"] == "function_call_output" for item in payload["input"]):
                 self.initial_calls += 1
                 return httpx.Response(
                     200,
@@ -2386,11 +2410,23 @@ def test_foundry_brokered_model_loop_emits_model_requested_tool_and_resumes_to_f
     assert final.status_code == 200, final.text
     assert _message_text(final.json()) == "Telemetry is healthy."
     assert final.json()["usage"] == {"input_tokens": 7, "output_tokens": 10, "total_tokens": 17}
-    assert fake.requests[0]["tools"][0]["function"]["name"] == "check-network-telemetry"
-    assert fake.requests[0]["tools"][0]["function"]["description"].startswith("Brokered class: read.")
-    assert fake.requests[1]["messages"][-1]["role"] == "tool"
-    assert fake.requests[1]["messages"][-1]["tool_call_id"] == call["call_id"]
+    assert fake.urls == ["https://api.openai.com/v1/responses"] * 2
+    tool = fake.requests[0]["tools"][0]
+    assert tool["type"] == "function"
+    assert tool["name"] == "check-network-telemetry"
+    assert tool["description"].startswith("Brokered class: read.")
+    assert tool["strict"] is False
+    assert fake.requests[0]["input"] == [
+        {"type": "message", "role": "system", "content": "Be helpful."},
+        {"type": "message", "role": "user", "content": "Check SFO telemetry"},
+    ]
+    assert fake.requests[1]["input"] == [
+        *fake.requests[0]["input"],
+        {"type": "function_call", "call_id": call["call_id"], "name": "check-network-telemetry", "arguments": '{"site":"sfo"}'},
+        {"type": "function_call_output", "call_id": call["call_id"], "output": '{"approved":true,"output":{"status":"healthy"}}'},
+    ]
     assert fake.requests[1]["tools"] == fake.requests[0]["tools"]
+    assert all(request["store"] is False for request in fake.requests)
     assert fake.requests[1]["parallel_tool_calls"] is False
     assert CONTINUATION_PROOF not in json.dumps(fake.requests, sort_keys=True)
 
@@ -2690,8 +2726,8 @@ def test_foundry_brokered_model_loop_rejects_decoded_lone_surrogate():
             200,
             request=request,
             content=(
-                b'{"choices":[{"message":{"role":"assistant","content":"\\ud800"}}],'
-                b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+                b'{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\\ud800"}]}],'
+                b'"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}'
             ),
             headers={"content-type": "application/json"},
         )
@@ -3193,7 +3229,7 @@ def test_foundry_brokered_model_loop_failed_resume_can_be_retried():
                     ],
                 }
             ),
-            {"choices": []},
+            {"output": None},
             _chat_response({"role": "assistant", "content": "Retry worked."}),
         ]
     )
@@ -3499,6 +3535,101 @@ def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call(
     assert response.status_code == 200, response.text
     assert _message_text(response.json()) == "No tool needed."
     assert fake.requests[0]["tool_choice"] == "auto"
+
+
+def test_foundry_brokered_model_loop_reads_responses_output_around_reasoning_items():
+    spec = _spec(tool_name="check-network-telemetry")
+    reasoning = {"type": "reasoning", "id": "rs_model", "summary": []}
+    fake = _FakeChatTransport(
+        [
+            {
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    reasoning,
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking SFO."}]},
+                    {
+                        "type": "function_call",
+                        "id": "fc_model",
+                        "call_id": "call_model",
+                        "name": "check-network-telemetry",
+                        "arguments": '{"site":"sfo"}',
+                    },
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            },
+            {
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    reasoning,
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Telemetry is healthy."}]},
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+            },
+        ]
+    )
+    app = _model_loop_app(spec, fake)
+
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "Check SFO telemetry"})
+        call = _call(initial.json())
+        final = client.post(
+            "/responses",
+            headers=CONTINUATION_AUTH,
+            json=_continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"status": "healthy"}}),
+        )
+
+    assert initial.status_code == 200, initial.text
+    assert json.loads(call["arguments"]) == {"site": "sfo"}
+    assert final.status_code == 200, final.text
+    assert _message_text(final.json()) == "Telemetry is healthy."
+    assert final.json()["usage"] == {"input_tokens": 7, "output_tokens": 10, "total_tokens": 17}
+    # Provider item IDs and reasoning items are not replayed; the assistant preamble is.
+    assert fake.requests[1]["input"][-3:] == [
+        {"type": "message", "role": "assistant", "content": "Checking SFO."},
+        {"type": "function_call", "call_id": call["call_id"], "name": "check-network-telemetry", "arguments": '{"site":"sfo"}'},
+        {"type": "function_call_output", "call_id": call["call_id"], "output": '{"approved":true,"output":{"status":"healthy"}}'},
+    ]
+
+
+def _function_call_item(name: str = "check-network-telemetry") -> dict[str, Any]:
+    return {"type": "function_call", "call_id": f"call_{name}", "name": name, "arguments": "{}"}
+
+
+@pytest.mark.parametrize(
+    ("output", "status", "code"),
+    [
+        ([{"type": "web_search_call", "id": "ws_model", "status": "completed"}], 400, "unsupported_tool_call"),
+        ([_function_call_item(), _function_call_item()], 400, "multiple_tool_calls_unsupported"),
+        ([{"type": "reasoning", "id": "rs_model", "summary": []}], 502, "InvalidModelResponse"),
+        ([{"type": "message", "role": "user", "content": [{"type": "output_text", "text": "hi"}]}], 502, "InvalidModelResponse"),
+        ([{"type": "message", "role": "assistant", "content": [{"type": "output_audio"}]}], 502, "InvalidModelResponse"),
+        (["not an item"], 502, "InvalidModelResponse"),
+    ],
+)
+def test_foundry_brokered_model_loop_rejects_unusable_responses_output(output: list[Any], status: int, code: str):
+    fake = _FakeChatTransport([{"object": "response", "status": "completed", "output": output, "usage": {}}])
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Check telemetry"})
+
+    assert response.status_code == status, response.text
+    assert response.json()["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://example.test/openai/v1",
+        "https://example.test/openai/v1/",
+        "https://example.test/openai/v1/responses",
+        "https://example.test/openai/v1/chat/completions",
+    ],
+)
+def test_foundry_model_loop_calls_responses_endpoint(base_url: str):
+    assert foundry_model_loop_module._responses_url(base_url) == "https://example.test/openai/v1/responses"
 
 
 def test_foundry_brokered_model_loop_rejects_unsupported_pattern_deterministically():
@@ -4594,7 +4725,7 @@ def test_foundry_brokered_model_loop_omits_authorization_when_auth_is_omitted(mo
         async def __aenter__(self) -> httpx.Response:
             return httpx.Response(
                 200,
-                request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
                 content=json.dumps(_chat_response({"role": "assistant", "content": "done"})).encode("utf-8"),
                 headers={"content-type": "application/json"},
             )
@@ -4609,7 +4740,7 @@ def test_foundry_brokered_model_loop_omits_authorization_when_auth_is_omitted(mo
 
         def stream(self, method: str, url: str, **kwargs: Any) -> FakeStream:
             assert method == "POST"
-            assert url.endswith("/chat/completions")
+            assert url.endswith("/responses")
             captured_headers.update(kwargs.get("headers") or {})
             return FakeStream()
 
@@ -4629,9 +4760,9 @@ def test_foundry_brokered_model_loop_omits_authorization_when_auth_is_omitted(mo
 @pytest.mark.parametrize(
     "usage",
     [
-        {"prompt_tokens": {"unexpected": 1}},
-        {"completion_tokens": "not-a-number"},
-        {"prompt_tokens": "12"},
+        {"input_tokens": {"unexpected": 1}},
+        {"output_tokens": "not-a-number"},
+        {"input_tokens": "12"},
         {"total_tokens": 1.5},
     ],
 )
@@ -4639,7 +4770,7 @@ def test_foundry_brokered_model_loop_normalizes_malformed_usage(usage: dict[str,
     fake = _FakeChatTransport(
         [
             {
-                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
                 "usage": usage,
             }
         ]

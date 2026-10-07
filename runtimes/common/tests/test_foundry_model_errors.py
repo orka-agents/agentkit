@@ -83,7 +83,7 @@ def test_model_tool_validation_never_reflects_names_keys_or_paths(
     marker = "private-upstream-detail"
     spec = _spec()
     payload = _tool_response()
-    function = payload["choices"][0]["message"]["tool_calls"][0]["function"]
+    function = payload["output"][0]
     if kind == "unknown-name":
         function["name"] = marker
     elif kind == "duplicate-key":
@@ -186,14 +186,14 @@ def test_non_http_model_failures_have_no_upstream_status(continuation, kind):
 def _raise_model_error(monkeypatch, *, continuation, error):
     calls = 0
 
-    async def fail(self, messages, *, tools):
+    async def fail(self, messages, *, tools, tool_choice):
         nonlocal calls
         calls += 1
         if continuation and calls == 1:
             return _tool_response()
         raise error
 
-    monkeypatch.setattr(foundry_model_loop.BrokeredChatModelLoop, "_chat", fail)
+    monkeypatch.setattr(foundry_model_loop.BrokeredChatModelLoop, "_create_response", fail)
     return _app(brokered_model_loop_enabled=True)
 
 

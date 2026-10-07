@@ -74,7 +74,7 @@ read/write/coordination and `/continue` behind
 advertise observed mode only. Foundry hosted `/responses` can also exercise a
 deterministic brokered function-call loop from static `brokeredTools`. For
 A4/A5 fallback validation, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` enables a
-lower-level OpenAI-compatible chat-completions loop that exposes static safe
+lower-level OpenAI Responses API model loop that exposes static safe
 brokered schemas as function tools, emits hosted Responses `function_call`
 items, and resumes the model with Orka-provided `function_call_output`. Orka
 remains responsible for coordination policy,

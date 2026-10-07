@@ -436,7 +436,7 @@ class NativeModelRuntime(EchoRuntime):
         if response.status_code >= 400:
             raise AgentRunError(response.text, status=502, code="UpstreamFailure")
         body = response.json()
-        return RunResult(text=body["choices"][0]["message"]["content"])
+        return RunResult(text=body["output"][0]["content"][0]["text"])
 
 
 def _native_app(client, *, url="http://model/v1/chat/completions", **options):

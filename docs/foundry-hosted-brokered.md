@@ -400,10 +400,17 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
 ## Model-driven tool workflows
 
 Set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` to let the model choose tools and
-work through a task. AgentKit calls the configured OpenAI-compatible Chat
-Completions model with the static `brokeredTools` schemas. For example, the
-agent can inspect telemetry, use the result to look up an incident, and then
-explain what it found.
+work through a task. AgentKit calls the configured model through the OpenAI
+Responses API at `<model.baseURL>/responses` and offers the static
+`brokeredTools` schemas as non-strict function tools. For example, the agent can
+inspect telemetry, use the result to look up an incident, and then explain what
+it found. Reasoning models that reject function tools on Chat Completions
+accept them on Responses with reasoning enabled. A `baseURL` that ends in
+`/chat/completions` is treated as its `/responses` sibling.
+
+Each model request resends the transcript as Responses input items with
+`store: false`, so the model provider does not retain the conversation.
+Reasoning items and provider item IDs are not replayed between rounds.
 
 Each operational tool call returns a `function_call` for Orka to execute. After
 Orka sends the matching `function_call_output`, AgentKit resumes the model. It
@@ -414,8 +421,8 @@ returns the cached next response without another model request. File-backed
 state preserves these completed rounds across restarts.
 
 The model can make up to 16 sequential tool calls per user turn. At the limit,
-AgentKit asks for a final answer without tools and rejects any further tool
-call. The model endpoint must support `parallel_tool_calls: false`, which asks
+AgentKit asks for a final answer with `tool_choice: "none"` and rejects any
+further tool call. The model endpoint must support `parallel_tool_calls: false`, which asks
 for one tool call at a time. AgentKit also rejects parallel tool batches if a
 model ignores that setting. AgentKit-owned MCP and direct operational tools
 remain disabled.

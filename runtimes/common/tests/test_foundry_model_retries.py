@@ -262,7 +262,7 @@ def test_model_does_not_retry_other_rejections_or_ambiguous_failures(
 
     class IncompleteBody(httpx.AsyncByteStream):
         async def __aiter__(self):
-            yield b'{"choices":'
+            yield b'{"output":'
             raise httpx.ReadError("private-upstream-detail")
 
     def model(request):
