@@ -410,7 +410,11 @@ accept them on Responses with reasoning enabled. A `baseURL` that ends in
 
 Each model request resends the transcript as Responses input items with
 `store: false`, so the model provider does not retain the conversation.
-Reasoning items and provider item IDs are not replayed between rounds.
+Reasoning items that carry `encrypted_content`, which stateless responses
+include by default, are kept in hosted state with their tool call and replayed
+on the next round. Other reasoning items and provider function-call item IDs are
+not replayed. A model response whose `status` is not `completed`, such as an
+`incomplete` result cut off by a token limit, fails with `InvalidModelResponse`.
 
 Each operational tool call returns a `function_call` for Orka to execute. After
 Orka sends the matching `function_call_output`, AgentKit resumes the model. It

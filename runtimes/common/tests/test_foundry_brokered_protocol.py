@@ -2726,7 +2726,7 @@ def test_foundry_brokered_model_loop_rejects_decoded_lone_surrogate():
             200,
             request=request,
             content=(
-                b'{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\\ud800"}]}],'
+                b'{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\\ud800"}]}],'
                 b'"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}'
             ),
             headers={"content-type": "application/json"},
@@ -3540,6 +3540,13 @@ def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call(
 def test_foundry_brokered_model_loop_reads_responses_output_around_reasoning_items():
     spec = _spec(tool_name="check-network-telemetry")
     reasoning = {"type": "reasoning", "id": "rs_model", "summary": []}
+    encrypted = {
+        "type": "reasoning",
+        "id": "rs_encrypted",
+        "summary": [{"type": "summary_text", "text": "Need telemetry."}],
+        "encrypted_content": "opaque-reasoning",
+        "status": "completed",
+    }
     fake = _FakeChatTransport(
         [
             {
@@ -3547,6 +3554,7 @@ def test_foundry_brokered_model_loop_reads_responses_output_around_reasoning_ite
                 "status": "completed",
                 "output": [
                     reasoning,
+                    encrypted,
                     {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking SFO."}]},
                     {
                         "type": "function_call",
@@ -3585,8 +3593,14 @@ def test_foundry_brokered_model_loop_reads_responses_output_around_reasoning_ite
     assert final.status_code == 200, final.text
     assert _message_text(final.json()) == "Telemetry is healthy."
     assert final.json()["usage"] == {"input_tokens": 7, "output_tokens": 10, "total_tokens": 17}
-    # Provider item IDs and reasoning items are not replayed; the assistant preamble is.
-    assert fake.requests[1]["input"][-3:] == [
+    # Only reasoning with encrypted content can be replayed statelessly; it precedes its call.
+    assert fake.requests[1]["input"][-4:] == [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Need telemetry."}],
+            "encrypted_content": "opaque-reasoning",
+            "id": "rs_encrypted",
+        },
         {"type": "message", "role": "assistant", "content": "Checking SFO."},
         {"type": "function_call", "call_id": call["call_id"], "name": "check-network-telemetry", "arguments": '{"site":"sfo"}'},
         {"type": "function_call_output", "call_id": call["call_id"], "output": '{"approved":true,"output":{"status":"healthy"}}'},
@@ -3617,6 +3631,22 @@ def test_foundry_brokered_model_loop_rejects_unusable_responses_output(output: l
 
     assert response.status_code == status, response.text
     assert response.json()["error"]["code"] == code
+
+
+@pytest.mark.parametrize("status", ["incomplete", "failed", "cancelled", "in_progress", None])
+@pytest.mark.parametrize("item", [_function_call_item(), {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Trunc"}]}])
+def test_foundry_brokered_model_loop_rejects_responses_that_did_not_complete(status: str | None, item: dict[str, Any]):
+    payload = {"object": "response", "status": status, "output": [item], "usage": {}}
+    if status is None:
+        del payload["status"]
+    fake = _FakeChatTransport([payload])
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Check telemetry"})
+
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
 
 
 @pytest.mark.parametrize(
@@ -4770,6 +4800,7 @@ def test_foundry_brokered_model_loop_normalizes_malformed_usage(usage: dict[str,
     fake = _FakeChatTransport(
         [
             {
+                "status": "completed",
                 "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
                 "usage": usage,
             }

@@ -9,7 +9,8 @@ resumes with Orka's function_call_output until the assistant finishes.
 The model is called through the OpenAI Responses API because reasoning models
 can reject function tools on Chat Completions. The retained transcript keeps a
 chat-shaped message list so pending continuation state stays compatible; it is
-translated to Responses input items for each model request.
+translated to Responses input items for each model request. Tool-call turns also
+retain any encrypted reasoning items so the next stateless request can replay them.
 """
 
 from __future__ import annotations
@@ -196,6 +197,8 @@ class BrokeredChatModelLoop:
                 }
             ],
         }
+        if message.get("reasoning"):
+            assistant_message["reasoning"] = message["reasoning"]
         return ModelLoopToolRequest(name=name, arguments=arguments, messages=[*messages, assistant_message], usage=usage)
 
     async def resume(
@@ -431,6 +434,7 @@ def _responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         if message["role"] == "tool":
             items.append({"type": "function_call_output", "call_id": message["tool_call_id"], "output": message["content"]})
             continue
+        items.extend(message.get("reasoning") or [])
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
         if isinstance(content, str) and (content or not tool_calls):
@@ -508,12 +512,16 @@ def _model_auth_missing_error() -> AgentRunError:
 
 def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
     """Project Responses output items onto the assistant message shape the loop retains."""
+    # Incomplete or failed generations can carry truncated text or tool arguments.
+    if data.get("status") != "completed":
+        raise AgentRunError("model response did not complete", status=502, code="InvalidModelResponse")
     output = data.get("output")
     if not isinstance(output, list):
         raise AgentRunError("model response did not include output items", status=502, code="InvalidModelResponse")
     texts: list[str] = []
     refusals: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    reasoning: list[dict[str, Any]] = []
     for item in output:
         if not isinstance(item, Mapping):
             raise AgentRunError("model response output item must be an object", status=502, code="InvalidModelResponse")
@@ -534,15 +542,26 @@ def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
                     raise AgentRunError("model response message content is invalid", status=502, code="InvalidModelResponse")
             if parts:
                 texts.append("".join(parts))
+        elif item_type == "reasoning":
+            # With store: false, only reasoning that carries its encrypted content can be replayed.
+            encrypted_content = item.get("encrypted_content")
+            if isinstance(encrypted_content, str) and encrypted_content:
+                summary = item.get("summary")
+                retained = {"type": "reasoning", "summary": summary if isinstance(summary, list) else [], "encrypted_content": encrypted_content}
+                if isinstance(item.get("id"), str):
+                    retained["id"] = item["id"]
+                reasoning.append(retained)
         elif isinstance(item_type, str) and item_type.endswith("_call"):
             # Only function tools are offered; any other tool call is unsupported.
             tool_calls.append({"type": item_type})
-        # Reasoning and other non-tool items carry no assistant output.
+        # Other non-tool items carry no assistant output.
     message: dict[str, Any] = {"role": "assistant", "content": "\n\n".join(texts) if texts else None}
     if not texts and refusals:
         message["refusal"] = "\n\n".join(refusals)
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if reasoning:
+        message["reasoning"] = reasoning
     return message
 
 
