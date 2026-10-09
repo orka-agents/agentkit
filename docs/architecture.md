@@ -175,8 +175,13 @@ idempotency, and side-effect policy.
   `RuntimeSession`, `RunResult`, and `AgentRunError`.
 - `adapter_support.py` provides shared helpers for API-key resolution, tool env
   allowlists, MCP timeout parsing, and framework exception normalization.
+- `model_errors.py` defines the runtime-owned model error codes every protocol
+  skin reports instead of framework or upstream text.
 - `conformance.py` defines adapter-neutral HTTP behavior tests reused by each
   adapter package.
+- `parity.py` defines the wire-level parity suite each adapter package imports.
+  It runs the adapter's real runtime against a scripted loopback model and a
+  stdio MCP fixture through the OpenAI, Foundry, and Orka skins.
 
 The shared server imports no agent framework.
 

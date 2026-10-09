@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+
+# Container parity smoke: run each runtime's built parity agent image under the
+# openai, foundry, and orka protocols against a scripted model and remote MCP
+# tool. Checks a plain answer, a tool round trip, the normalized response to a
+# 401 that echoes the model key, and that the key never appears in a response or
+# container log. Needs the frontend and adapter images from `make build-agentkit
+# build-serve build-serve-maf build-serve-langgraph` at the same TAG.
+
+set -Eeuo pipefail
+
+log() { printf '==> %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+tag="${TAG:-test}"
+platform="${PLATFORM:-linux/amd64}"
+builder="${BUILDER-desktop-linux}"
+runtimes=("$@")
+[[ ${#runtimes[@]} -gt 0 ]] || runtimes=(pydantic-ai microsoft-agent-framework langgraph)
+
+model_key="sk-parity-container-canary"
+auth_token="parity-smoke-token"
+# A hung model call or SSE stream fails the scenario instead of the CI job.
+request_timeout=120
+network="agentkit-parity-$$"
+fixture="agentkit-parity-fixture-$$"
+containers=()
+
+for command in curl docker jq make; do
+  command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+cleanup() {
+  local name
+  for name in ${containers[@]+"${containers[@]}"}; do
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done
+  docker network rm "$network" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+serve_image() {
+  case "$1" in
+    pydantic-ai) echo "agentkit-serve:$tag" ;;
+    microsoft-agent-framework) echo "agentkit-serve-maf:$tag" ;;
+    langgraph) echo "agentkit-serve-langgraph:$tag" ;;
+    *) die "unsupported runtime: $1" ;;
+  esac
+}
+
+wait_for() {
+  local url="$1"
+  for _ in $(seq 1 90); do
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# The parity agent's request to the model and MCP fixture leaves the agent
+# container; everything checked here is what a client or operator can read.
+assert_no_canary() {
+  local label="$1" text="$2"
+  if grep -qF "$model_key" <<<"$text"; then
+    die "$label exposed the model key"
+  fi
+}
+
+check() {
+  local label="$1" filter="$2" body="$3"
+  assert_no_canary "$label" "$body"
+  jq -e "$filter" >/dev/null <<<"$body" || die "$label: unexpected response: $body"
+}
+
+openai_scenarios() {
+  local base="$1" label="$2" out status
+  local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
+  out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"plain:P1"}]}')"
+  check "$label plain" '.choices[0].message.content == "parity-answer: P1"' "$out"
+  out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"tool:T1"}]}')"
+  check "$label tool" '.choices[0].message.content | contains("receipt-T1")' "$out"
+  out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"auth-echo"}]}')"
+  status="${out##*$'\n'}"
+  [[ "$status" == 503 ]] || die "$label auth-echo returned HTTP $status"
+  check "$label auth-echo" '.error.code == "ModelAuthRejected"' "${out%$'\n'*}"
+}
+
+foundry_scenarios() {
+  local base="$1" label="$2" out status
+  local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
+  out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"plain:P2"}')"
+  check "$label plain" '.output[0].content[0].text == "parity-answer: P2"' "$out"
+  out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"tool:T2"}')"
+  check "$label tool" '.output[0].content[0].text | contains("receipt-T2")' "$out"
+  out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/responses" -d '{"input":"auth-echo"}')"
+  status="${out##*$'\n'}"
+  [[ "$status" == 503 ]] || die "$label auth-echo returned HTTP $status"
+  check "$label auth-echo" '.error.code == "ModelAuthRejected" and .error.upstream_status == 401' "${out%$'\n'*}"
+}
+
+orka_turn() {
+  local base="$1" turn="$2" prompt="$3" deadline payload
+  deadline="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)"
+  payload="$(jq -n --arg turn "$turn" --arg prompt "$prompt" --arg deadline "$deadline" '{
+    version: "orka.harness.v1", namespace: "default", taskName: "parity", sessionName: "parity",
+    runtimeSessionID: "parity-session", turnID: $turn, correlationID: ("corr-" + $turn),
+    deadline: $deadline, authIdentity: {subject: "system:serviceaccount:default:orka"},
+    input: {prompt: $prompt, contextRefs: [], env: []}, toolExecutionMode: "observed", metadata: {}
+  }')"
+  curl -fsS --max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json" \
+    "$base/v1/turns" -d "$payload" >/dev/null
+  curl -fsS --max-time "$request_timeout" -H "Authorization: Bearer $auth_token" "$base/v1/turns/$turn/events" |
+    sed -n 's/^data: //p' | tail -n 1
+}
+
+orka_scenarios() {
+  local base="$1" label="$2"
+  check "$label plain" '.type == "TurnCompleted" and .completed.result == "parity-answer: P3"' "$(orka_turn "$base" turn-plain plain:P3)"
+  check "$label tool" '.type == "TurnCompleted" and (.completed.result | contains("receipt-T3"))' "$(orka_turn "$base" turn-tool tool:T3)"
+  check "$label auth-echo" '.type == "TurnFailed" and .failed.reason == "ModelAuthRejected"' "$(orka_turn "$base" turn-auth auth-echo)"
+}
+
+run_protocol() {
+  local runtime="$1" protocol="$2" image="parity-$1:$tag"
+  local name="agentkit-parity-$runtime-$protocol-$$" health base port
+  case "$protocol" in
+    openai) health=/healthz ;;
+    foundry) health=/readiness ;;
+    orka) health=/v1/health ;;
+  esac
+  containers+=("$name")
+  docker run -d --name "$name" --platform "$platform" --network "$network" \
+    -p 127.0.0.1::8080 \
+    -e AGENTKIT_PROTOCOL="$protocol" \
+    -e AGENTKIT_PORT=8080 \
+    -e AGENTKIT_BIND=0.0.0.0 \
+    -e AGENTKIT_AUTH_TOKEN="$auth_token" \
+    -e PARITY_MODEL_KEY="$model_key" \
+    -e PARITY_MCP_URL="http://parity-fixture:8090/mcp" \
+    "$image" >/dev/null
+  port="$(docker port "$name" 8080/tcp | head -n 1)"
+  base="http://127.0.0.1:${port##*:}"
+  wait_for "$base$health" || { docker logs "$name" >&2 || true; die "$runtime $protocol never became healthy"; }
+  log "Checking $runtime under $protocol"
+  "${protocol}_scenarios" "$base" "$runtime $protocol"
+  assert_no_canary "$runtime $protocol container log" "$(docker logs "$name" 2>&1)"
+  docker rm -f "$name" >/dev/null
+}
+
+main() {
+  local runtime protocol fixture_port
+  docker network create "$network" >/dev/null
+  log "Starting scripted model and MCP fixture"
+  containers+=("$fixture")
+  # The parity Agentkitfiles bake http://parity-fixture:8090 as the model URL.
+  docker run -d --name "$fixture" --platform "$platform" --network "$network" \
+    --network-alias parity-fixture \
+    -p 127.0.0.1::8090 \
+    -v "$repo_root/test/parity/fixture.py:/parity/fixture.py:ro" \
+    --entrypoint /opt/agentkit/bin/python \
+    "agentkit-serve:$tag" /parity/fixture.py >/dev/null
+  fixture_port="$(docker port "$fixture" 8090/tcp | head -n 1)"
+  wait_for_fixture "http://127.0.0.1:${fixture_port##*:}" || { docker logs "$fixture" >&2 || true; die "fixture never started"; }
+
+  for runtime in "${runtimes[@]}"; do
+    log "Building parity agent image for $runtime"
+    make build-test-agent TAG="$tag" BUILDER="$builder" PLATFORM="$platform" RUNTIME="$runtime" \
+      SERVE_IMAGE="$(serve_image "$runtime")" FIXTURE="test/parity/agentkitfile-$runtime.yaml" \
+      AGENT_IMAGE="parity-$runtime:$tag"
+    for protocol in openai foundry orka; do
+      run_protocol "$runtime" "$protocol"
+    done
+  done
+  log "Container parity smoke passed for: ${runtimes[*]}"
+}
+
+# The fixture answers only POSTs; any HTTP response means it is listening.
+wait_for_fixture() {
+  local url="$1"
+  for _ in $(seq 1 60); do
+    curl -sS --max-time 5 -o /dev/null "$url/v1/chat/completions" 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+main

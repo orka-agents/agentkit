@@ -12,19 +12,23 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Mapping
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .adapter_support import AgentBuildError, exception_types, normalize_agent_run_error
 from .config import AgentSpec
-from .conversation import RunRequest
+from .conversation import ConversationTurn, RunRequest
 from .runtime import (
     AgentRunError,
     BrokeredRuntimeSession,
@@ -37,6 +41,8 @@ from .runtime import (
     ToolBroker,
 )
 from .server import make_auth_dependency
+
+logger = logging.getLogger(__name__)
 
 ORKA_HARNESS_VERSION = "orka.harness.v1"
 HTTP_TRANSPORT = "http+sse"
@@ -61,8 +67,12 @@ _SSE_DATA_PREFIX = "data: "
 _OUTPUT_LIMIT_CODE = "MaxOutputBytesExceeded"
 _DEFAULT_MAX_TERMINAL_TURNS = 256
 _DEFAULT_MAX_RUNTIME_SESSIONS = 64
+_DEFAULT_MAX_SESSION_HISTORIES = 256
+_DEFAULT_MAX_SESSION_HISTORY_BYTES = 1024 * 1024
 _MAX_TERMINAL_TURNS_ENV = "AGENTKIT_ORKA_MAX_TERMINAL_TURNS"
 _MAX_RUNTIME_SESSIONS_ENV = "AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS"
+_MAX_SESSION_HISTORIES_ENV = "AGENTKIT_ORKA_MAX_SESSION_HISTORIES"
+_MAX_SESSION_HISTORY_BYTES_ENV = "AGENTKIT_ORKA_MAX_SESSION_HISTORY_BYTES"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _JSON_VALUE_ABSENT = object()
 # Go net/url.PathEscape leaves these reserved bytes unescaped in a path segment.
@@ -80,6 +90,12 @@ class ActiveRuntime:
     context: Any
     session: Any
     env: dict[str, str]
+    # Orka sends only the new prompt, so the harness owns each runtime session's
+    # committed user/assistant transcript, as the ACP child does. The list is
+    # shared with the app's transcript store, which outlives this runtime.
+    history: list[ConversationTurn] = field(default_factory=list)
+    # A fatal run failure means the next turn must rebuild this runtime.
+    broken: bool = False
 
 
 @contextmanager
@@ -395,6 +411,33 @@ def _max_runtime_sessions(value: int | None = None) -> int:
     )
 
 
+def _max_session_histories(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_SESSION_HISTORIES_ENV,
+        default=_DEFAULT_MAX_SESSION_HISTORIES,
+        field_name="max_session_histories",
+    )
+
+
+def _max_session_history_bytes(value: int | None = None) -> int:
+    return _positive_int_setting(
+        value,
+        env_name=_MAX_SESSION_HISTORY_BYTES_ENV,
+        default=_DEFAULT_MAX_SESSION_HISTORY_BYTES,
+        field_name="max_session_history_bytes",
+    )
+
+
+def _trim_history(history: list[ConversationTurn], max_bytes: int) -> None:
+    """Drop the oldest completed turns until the transcript fits its budget."""
+    size = sum(len(turn.text.encode()) for turn in history)
+    while history and size > max_bytes:
+        # Turns are committed as user/assistant pairs; drop whole pairs.
+        size -= sum(len(turn.text.encode()) for turn in history[:2])
+        del history[:2]
+
+
 def _truthy_env(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -448,7 +491,7 @@ async def _append_terminal_if_missing(
     failed: Mapping[str, Any] | None = None,
     completed: Mapping[str, Any] | None = None,
     error: Mapping[str, Any] | None = None,
-) -> None:
+) -> bool:
     _, created = await state.append(
         event_type,
         severity="error" if event_type == "TurnFailed" else "info",
@@ -460,6 +503,7 @@ async def _append_terminal_if_missing(
     )
     if created:
         _record_terminal_turn(state.turn_id, terminal_order, turns, max_terminal_turns)
+    return created
 
 
 def _ensure_terminal_on_task_done(
@@ -964,24 +1008,37 @@ class OrkaToolBroker:
                 self.state.condition.notify_all()
 
 
+def _runtime_start_error(exc: BaseException) -> AgentRunError:
+    # Tool and model clients put credential-bearing URLs and upstream bodies in
+    # startup errors, so operators get the exception types only.
+    logger.warning("runtime session failed to start: %s", exception_types(exc))
+    return AgentRunError("runtime failed to start", status=503, code="RuntimeStartFailed")
+
+
 async def _run_turn(
-    get_runtime: Callable[[RunRequest], Awaitable[Any]],
+    get_runtime: Callable[[RunRequest], Awaitable[ActiveRuntime]],
     turns: dict[str, TurnState],
     terminal_order: list[str],
     state: TurnState,
     run_request: RunRequest,
     *,
     max_terminal_turns: int,
+    max_history_bytes: int,
     brokered_tools: list[BrokeredToolDefinition] | None = None,
 ) -> None:
+    active: ActiveRuntime | None = None
+
     async def _run_with_runtime() -> RunResult:
-        runtime = await get_runtime(run_request)
+        nonlocal active
+        active = await get_runtime(run_request)
+        runtime = active.session
+        request = replace(run_request, history=tuple(active.history))
         with _scoped_process_env(run_request.env):
             if brokered_tools is not None:
                 if not isinstance(runtime, BrokeredRuntimeSession):
                     raise AgentRunError("runtime does not support brokered Orka tools", status=400, code="BrokeredUnsupported")
-                return await runtime.run_brokered(run_request, brokered_tools, OrkaToolBroker(state, brokered_tools))
-            return await runtime.run(run_request)
+                return await runtime.run_brokered(request, brokered_tools, OrkaToolBroker(state, brokered_tools))
+            return await runtime.run(request)
 
     try:
         if run_request.deadline is None:
@@ -1015,6 +1072,8 @@ async def _run_turn(
         )
         return
     except AgentRunError as exc:
+        if exc.fatal and active is not None:
+            active.broken = True
         code = exc.code or exc.__class__.__name__
         await _append_terminal_if_missing(
             state,
@@ -1028,7 +1087,15 @@ async def _run_turn(
         )
         return
     except Exception as exc:  # noqa: BLE001 - protocol envelope must be deterministic.
-        code = exc.__class__.__name__
+        # AgentBuildError messages are secret-free configuration guidance. Any
+        # other exception text may carry upstream bodies or credential-bearing URLs.
+        if isinstance(exc, AgentBuildError):
+            code, message = exc.__class__.__name__, str(exc)
+        else:
+            normalized = normalize_agent_run_error(exc)
+            code, message = normalized.code or normalized.__class__.__name__, str(normalized)
+            if normalized.fatal and active is not None:
+                active.broken = True
         await _append_terminal_if_missing(
             state,
             terminal_order,
@@ -1036,8 +1103,8 @@ async def _run_turn(
             max_terminal_turns,
             "TurnFailed",
             summary="turn failed",
-            failed={"reason": code, "message": str(exc), "retryable": False},
-            error={"code": code, "message": str(exc), "retryable": False},
+            failed={"reason": code, "message": message, "retryable": False},
+            error={"code": code, "message": message, "retryable": False},
         )
         return
 
@@ -1073,7 +1140,7 @@ async def _run_turn(
                 content_text=result.text,
                 metadata={},
             )
-        await _append_terminal_if_missing(
+        completed = await _append_terminal_if_missing(
             state,
             terminal_order,
             turns,
@@ -1082,6 +1149,10 @@ async def _run_turn(
             summary="turn completed",
             completed={"result": result.text},
         )
+        if completed and active is not None:
+            active.history.append(ConversationTurn(role="user", text=run_request.prompt))
+            active.history.append(ConversationTurn(role="assistant", text=result.text))
+            _trim_history(active.history, max_history_bytes)
     except _SSEFrameTooLargeError as exc:
         await _append_output_failure(
             state,
@@ -1100,6 +1171,8 @@ def create_orka_app(
     *,
     max_terminal_turns: int | None = None,
     max_runtime_sessions: int | None = None,
+    max_session_histories: int | None = None,
+    max_session_history_bytes: int | None = None,
     enable_brokered_read: bool | None = None,
     enable_brokered_write: bool | None = None,
     enable_brokered_coordination: bool | None = None,
@@ -1109,6 +1182,10 @@ def create_orka_app(
         raise ValueError("Orka mode requires a bearer auth token")
     retention_limit = _max_terminal_turns(max_terminal_turns)
     runtime_session_limit = _max_runtime_sessions(max_runtime_sessions)
+    # Sessions with a live runtime always keep their transcripts, so a smaller
+    # history limit could not be honored.
+    history_limit = max(_max_session_histories(max_session_histories), runtime_session_limit)
+    history_byte_limit = _max_session_history_bytes(max_session_history_bytes)
     brokered_classes: set[str] = set()
     if _brokered_read_enabled(enable_brokered_read):
         brokered_classes.add(BROKERED_CLASS_READ)
@@ -1123,6 +1200,8 @@ def create_orka_app(
     terminal_order: list[str] = []
     active_runtimes: dict[str, ActiveRuntime] = {}
     runtime_order: list[str] = []
+    # Ordered least recently used first.
+    session_histories: dict[str, list[ConversationTurn]] = {}
     background_tasks: set[asyncio.Task[None]] = set()
     runtime_close_tasks: set[asyncio.Task[BaseException | None]] = set()
     runtime_close_tasks_by_session: dict[str, asyncio.Task[BaseException | None]] = {}
@@ -1239,15 +1318,35 @@ def create_orka_app(
             if evicted is not None:
                 await close_runtime(evict_id, evicted)
 
-    async def get_runtime(run_request: RunRequest) -> Any:
+    def session_history(runtime_session_id: str) -> list[ConversationTurn]:
+        # Transcripts outlive runtimes, so a session keeps its conversation when
+        # its runtime is evicted for capacity or rebuilt. A new session is only
+        # stored once its runtime starts, so failed starts add no entries.
+        history = session_histories.pop(runtime_session_id, None)
+        if history is None:
+            return []
+        session_histories[runtime_session_id] = history
+        return history
+
+    def store_session_history(runtime_session_id: str, history: list[ConversationTurn]) -> None:
+        session_histories[runtime_session_id] = history
+        # The session's runtime is live by now, and any runtime evicted to make
+        # room is not, so only idle sessions are dropped to fit the limit.
+        overflow = len(session_histories) - history_limit
+        idle = [session_id for session_id in session_histories if session_id not in active_runtimes]
+        for session_id in idle[: max(overflow, 0)]:
+            del session_histories[session_id]
+
+    async def get_runtime(run_request: RunRequest) -> ActiveRuntime:
         runtime_session_id = run_request.session_id or ""
+        history = session_history(runtime_session_id)
         active = active_runtimes.get(runtime_session_id)
         if active is not None:
-            if active.env == dict(run_request.env):
+            if active.env == dict(run_request.env) and not active.broken:
                 if runtime_session_id in runtime_order:
                     runtime_order.remove(runtime_session_id)
                 runtime_order.append(runtime_session_id)
-                return active.session
+                return active
             if close_failure := new_runtime_close_failure():
                 raise close_failure
             active_runtimes.pop(runtime_session_id, None)
@@ -1260,16 +1359,31 @@ def create_orka_app(
         # section on the event loop thread so cancellation cannot leave a worker
         # thread running with turn credentials in process-global os.environ.
         with _scoped_process_env(run_request.env):
-            context = factory.build_runtime(spec)
-            session = await context.__aenter__()
-        active_runtimes[runtime_session_id] = ActiveRuntime(context=context, session=session, env=dict(run_request.env))
+            try:
+                context = factory.build_runtime(spec)
+                session = await context.__aenter__()
+            except AgentBuildError:
+                raise
+            except asyncio.CancelledError as exc:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # An MCP client task group can report its own startup failure as
+                # a CancelledError; with no cancellation pending, it is a failure.
+                raise _runtime_start_error(exc) from exc
+            except Exception as exc:
+                raise _runtime_start_error(exc) from exc
+        active = ActiveRuntime(context=context, session=session, env=dict(run_request.env), history=history)
+        active_runtimes[runtime_session_id] = active
         runtime_order.append(runtime_session_id)
-        return session
+        store_session_history(runtime_session_id, history)
+        return active
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.turns = turns
         app.state.active_runtimes = active_runtimes
+        app.state.session_histories = session_histories
         try:
             yield
         finally:
@@ -1297,6 +1411,20 @@ def create_orka_app(
     app = FastAPI(title="agentkit-serve-orka", lifespan=lifespan)
     auth = Depends(make_auth_dependency(auth_token))
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exc_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # Orka's native error body is {"error": message} (harness.WriteError).
+        return JSONResponse({"error": str(exc.detail)}, status_code=exc.status_code, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exc_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default body echoes the rejected input; name the field only,
+        # with the same status as the adapter's own request validation.
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'][1:])}: {error['msg']}" for error in exc.errors()
+        )
+        return JSONResponse({"error": problems or "invalid request"}, status_code=400)
+
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
         return health_response(spec)
@@ -1315,10 +1443,13 @@ def create_orka_app(
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
         turn_id = _turn_id_from_payload(data)
-        if turn_id in turns:
-            raise HTTPException(status_code=409, detail="turn already exists")
+        # Orka's client recognizes these exact 409 messages as duplicate-turn and
+        # capacity outcomes; other wording reads as an opaque failure.
+        if (existing := turns.get(turn_id)) is not None:
+            detail = "turn already completed" if existing.terminal_event is not None else "turn already exists"
+            raise HTTPException(status_code=409, detail=detail)
         if any(state.terminal_event is None for state in turns.values()):
-            raise HTTPException(status_code=429, detail="maxConcurrentTurns limit reached")
+            raise HTTPException(status_code=409, detail="maximum concurrent turns reached")
 
         tool_mode = _clean(data.get("toolExecutionMode")) or TOOL_MODE_OBSERVED
         run_request = _request_to_run_request(data, turn_id=turn_id, spec=spec, allow_brokered=bool(brokered_classes))
@@ -1356,6 +1487,7 @@ def create_orka_app(
                 state,
                 run_request,
                 max_terminal_turns=retention_limit,
+                max_history_bytes=history_byte_limit,
                 brokered_tools=brokered_tools,
             )
         )

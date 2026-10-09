@@ -437,7 +437,7 @@ def test_runtime_reuses_sessions_by_request_session_id(monkeypatch):
 
     seen_sessions = []
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+    async def fake_run_agent(agent, request, *, session=None):
         seen_sessions.append(session)
         return RunResult(text="ok")
 
@@ -469,7 +469,7 @@ def test_runtime_session_cache_is_bounded(monkeypatch):
     from agentkit_serve_common.conversation import RunRequest
     from agentkit_serve_common.runtime import RunResult
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+    async def fake_run_agent(agent, request, *, session=None):
         return RunResult(text=session.session_id if session else "none")
 
     monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
@@ -504,7 +504,7 @@ def test_session_cache_evicts_idle_entry_when_new_session_acquires(monkeypatch):
     release_b = asyncio.Event()
     seen_sessions = {}
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+    async def fake_run_agent(agent, request, *, session=None):
         seen_sessions[session.session_id] = session
         if session.session_id == "b":
             b_started.set()
@@ -555,7 +555,7 @@ def test_session_cache_overflow_keeps_current_session_serialized(monkeypatch):
     second_current_started = asyncio.Event()
     current_sessions = []
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+    async def fake_run_agent(agent, request, *, session=None):
         if session.session_id == "busy":
             busy_started.set()
             await release_busy.wait()
@@ -719,15 +719,15 @@ def test_memory_context_requires_explicit_scope(monkeypatch):
         asyncio.run(runtime._build_context_providers())
 
 
-def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
+def test_reused_session_runs_with_each_request_history(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import ConversationTurn, RunRequest
     from agentkit_serve_common.runtime import RunResult
 
-    include_history_values = []
+    seen = []
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
-        include_history_values.append(include_history)
+    async def fake_run_agent(agent, request, *, session=None):
+        seen.append((request.history, session))
         return RunResult(text="ok")
 
     monkeypatch.setattr(agent_factory, "run_agent", fake_run_agent)
@@ -751,21 +751,20 @@ def test_reused_session_does_not_duplicate_explicit_history(monkeypatch):
     asyncio.run(runtime.run(request))
     asyncio.run(runtime.run(request))
 
-    assert include_history_values == [True, False]
+    assert [history for history, _ in seen] == [request.history, request.history]
+    assert seen[0][1] is seen[1][1]
 
 
-def test_discarded_failed_first_turn_replaces_session_and_keeps_explicit_history_on_retry(monkeypatch):
+def test_discarded_failed_first_turn_replaces_session(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import ConversationTurn, RunRequest
     from agentkit_serve_common.runtime import RunResult
 
-    include_history_values = []
     seen_sessions = []
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
-        include_history_values.append(include_history)
+    async def fake_run_agent(agent, request, *, session=None):
         seen_sessions.append(session)
-        if len(include_history_values) == 1:
+        if len(seen_sessions) == 1:
             raise RuntimeError("provider unavailable")
         return RunResult(text="ok")
 
@@ -798,21 +797,18 @@ def test_discarded_failed_first_turn_replaces_session_and_keeps_explicit_history
 
     asyncio.run(exercise())
 
-    assert include_history_values == [True, True, False]
     assert seen_sessions[0] is not seen_sessions[1]
     assert seen_sessions[1] is seen_sessions[2]
 
 
-def test_failed_reused_session_preserves_native_conversation_state(monkeypatch):
+def test_failed_reused_session_keeps_session_state(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import RunRequest
     from agentkit_serve_common.runtime import RunResult
 
-    include_history_values = []
     seen_sessions = []
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
-        include_history_values.append(include_history)
+    async def fake_run_agent(agent, request, *, session=None):
         seen_sessions.append(session)
         if len(seen_sessions) == 2:
             raise RuntimeError("provider unavailable")
@@ -842,7 +838,6 @@ def test_failed_reused_session_preserves_native_conversation_state(monkeypatch):
 
     asyncio.run(exercise())
 
-    assert include_history_values == [True, False, False]
     assert seen_sessions[0] is seen_sessions[1] is seen_sessions[2]
 
 
@@ -954,20 +949,18 @@ def test_result_usage_reads_usage_details_to_dict():
 
 
 
-def test_concurrent_same_session_waits_before_dropping_history(monkeypatch):
+def test_concurrent_same_session_runs_are_serialized(monkeypatch):
     from agentkit_serve_common.config import AgentSpec
     from agentkit_serve_common.conversation import ConversationTurn, RunRequest
     from agentkit_serve_common.runtime import RunResult
 
     started: list[bool] = []
-    include_history_values: list[bool] = []
 
     import asyncio
     first_can_finish = asyncio.Event()
 
-    async def fake_run_agent(agent, request, *, session=None, include_history=True):
+    async def fake_run_agent(agent, request, *, session=None):
         started.append(True)
-        include_history_values.append(include_history)
         if len(started) == 1:
             await first_can_finish.wait()
         return RunResult(text="ok")
@@ -1000,7 +993,7 @@ def test_concurrent_same_session_waits_before_dropping_history(monkeypatch):
 
     asyncio.run(run_two())
 
-    assert include_history_values == [True, False]
+    assert len(started) == 2
 
 
 def test_maf_orka_offline_echo_bypasses_provider_runtime(monkeypatch):

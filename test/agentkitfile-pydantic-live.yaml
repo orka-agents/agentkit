@@ -1,0 +1,17 @@
+#syntax=agentkit:test
+# Real CPU inference supplied by scripts/live-aikit-agent-e2e.sh.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: pydantic-live-e2e-agent
+runtime: pydantic-ai
+model:
+  provider: openai-compatible
+  baseURL: http://aikit:8080/v1
+  name: qwen-3.5-2b
+  apiKeyEnv: MODEL_API_KEY                         # NAME only; value injected at `docker run -e`
+instructions: |
+  SENTINEL_INSTRUCTION_42: You are the AgentKit live-e2e agent.
+  Always answer in exactly one short sentence, and end with the token DONE42.
+expose:
+  openai: true

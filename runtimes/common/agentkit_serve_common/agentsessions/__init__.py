@@ -5,6 +5,7 @@ from .binding import (
     VerifiedAgentsessionsBinding,
     load_verified_agentsessions_binding,
 )
+from .exchange import ExecutionExchange
 from .service import ExecutionRunner, create_server, run, serve
 
 __all__ = [
@@ -12,6 +13,7 @@ __all__ = [
     "VerifiedAgentsessionsBinding",
     "load_verified_agentsessions_binding",
     "ExecutionRunner",
+    "ExecutionExchange",
     "create_server",
     "run",
     "serve",

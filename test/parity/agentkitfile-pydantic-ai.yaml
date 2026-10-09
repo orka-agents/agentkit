@@ -1,0 +1,23 @@
+#syntax=agentkit:test
+# Container parity smoke fixture. scripts/parity-container-smoke.sh runs this
+# image beside test/parity/fixture.py, which scripts the model and serves the
+# remote MCP tool on the shared Docker network.
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: parity-agent
+runtime: pydantic-ai
+model:
+  provider: openai-compatible
+  baseURL: http://parity-fixture:8090/v1
+  name: parity-model
+  apiKeyEnv: PARITY_MODEL_KEY
+instructions: |
+  Follow the scripted parity fixture.
+tools:
+  - name: parity
+    type: mcp
+    transport: streamable-http
+    urlEnv: PARITY_MCP_URL
+expose:
+  openai: true

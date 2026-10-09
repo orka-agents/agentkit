@@ -1,0 +1,24 @@
+# Override the bundled Qwen preset for bounded CPU-only E2E inference.
+- name: qwen-3.5-2b
+  backend: llama-cpp
+  parameters:
+    model: Qwen3.5-2B-Q4_K_M.gguf
+    temperature: 0
+    top_p: 1
+    top_k: 1
+    min_p: 0
+    presence_penalty: 0
+    repeat_penalty: 1
+    max_tokens: 256
+  context_size: 4096
+  threads: 4
+  gpu_layers: 0
+  mmap: true
+  reasoning_effort: none
+  template:
+    use_tokenizer_template: true
+  options:
+    - "use_jinja:true"
+  function:
+    grammar:
+      disable: true

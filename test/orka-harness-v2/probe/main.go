@@ -62,7 +62,7 @@ func command(ctx context.Context, args []string) error {
 	mode := flags.String("mode", "offline", "offline or live")
 	runtimeURL := flags.String("runtime-url", "http://runtime:8080", "production supervisor URL")
 	results := flags.String("results", "/results/result.json", "sanitized result file")
-	upstream := flags.String("upstream", "", "live Vekil URL")
+	upstream := flags.String("upstream", "", "live OpenAI-compatible provider URL")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func command(ctx context.Context, args []string) error {
 			return err
 		}
 		if (cfg.Mode == "live") != (*upstream != "") {
-			return errors.New("live mode requires a Vekil upstream; offline mode forbids it")
+			return errors.New("live mode requires a provider upstream; offline mode forbids it")
 		}
 		return exercise(ctx, cfg, *runtimeURL, *upstream, *results)
 	default:

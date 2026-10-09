@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
-from agentkit_serve_common.runtime import RunResult, RuntimeSession
+from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
 from agentkit_serve_common.server import create_app
 
 
@@ -61,3 +61,30 @@ def test_openai_facade_forwards_agentkit_session_header():
 
     assert resp.status_code == 200
     assert factory.runtime.requests[0].session_id == "local-session"
+
+
+class FailingRuntime(Runtime):
+    def __init__(self, *errors: AgentRunError):
+        super().__init__()
+        self.errors = list(errors)
+
+    async def run(self, request: RunRequest) -> RunResult:
+        raise self.errors.pop(0)
+
+
+def test_openai_healthz_fails_only_after_fatal_run_error():
+    factory = Factory()
+    factory.runtime = FailingRuntime(
+        AgentRunError("model service is unavailable", status=503, code="ModelUnavailable"),
+        AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True),
+    )
+    app = create_app(_spec(), factory)
+    body = {"messages": [{"role": "user", "content": "hello"}]}
+    with TestClient(app) as client:
+        assert client.post("/v1/chat/completions", json=body).status_code == 503
+        assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.post("/v1/chat/completions", json=body).status_code == 502
+        health = client.get("/healthz")
+
+    assert health.status_code == 503
+    assert health.json() == {"status": "unhealthy"}

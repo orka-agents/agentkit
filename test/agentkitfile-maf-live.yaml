@@ -1,23 +1,5 @@
 #syntax=agentkit:test
-#
-# Live end-to-end fixture for the Microsoft Agent Framework runtime (plan §10.3).
-#
-# Drives a REAL prompt through a deployed MAF agent image to a real
-# OpenAI-compatible endpoint and back (a single collapsed chat.completion). The
-# baseURL points at a host-side OpenAI-compatible proxy reachable from the agent
-# container via host.docker.internal (Docker Desktop's host bridge):
-#
-#   docker buildx build --builder desktop-linux . -f test/agentkitfile-maf-live.yaml \
-#     --build-arg BUILDKIT_SYNTAX=agentkit:test --build-arg adapter=agentkit-serve-maf:test \
-#     --platform linux/amd64 -t maf-live-agent:test --load --provenance=false
-#   docker run -d --name maf-live -p 127.0.0.1:8080:8080 \
-#     -e AGENTKIT_BIND=0.0.0.0 -e AGENTKIT_AUTH_TOKEN=secret \
-#     --add-host host.docker.internal:host-gateway maf-live-agent:test
-#   # then POST /v1/chat/completions with Authorization: Bearer secret
-#
-# Model note: this proxy serves claude-haiku-4.5 with a spec-compliant `created`
-# field; its gpt-4o-mini responses omit `created`, which the OpenAI SDK parser
-# rejects. claude-haiku-4.5 is therefore the right live model here.
+# Real CPU inference supplied by scripts/live-aikit-agent-e2e.sh.
 apiVersion: v1alpha1
 kind: Agent
 metadata:
@@ -25,11 +7,11 @@ metadata:
 runtime: microsoft-agent-framework
 model:
   provider: openai-compatible
-  baseURL: http://host.docker.internal:1337/v1   # host-side OpenAI-compatible proxy
-  name: claude-haiku-4.5
+  baseURL: http://aikit:8080/v1
+  name: qwen-3.5-2b
   apiKeyEnv: MODEL_API_KEY                         # NAME only; value injected at `docker run -e`
 instructions: |
-  SENTINEL_INSTRUCTION_42: You are the AgentKit MAF live-e2e agent.
+  SENTINEL_INSTRUCTION_42: You are the AgentKit live-e2e agent.
   Always answer in exactly one short sentence, and end with the token DONE42.
 expose:
   openai: true

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Do not trace this script: live mode may inherit a Copilot token.
+# Do not trace this script: runtime/controller credentials are generated per run.
 set +x
 set -Eeuo pipefail
 umask 077
@@ -11,11 +11,11 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'USAGE'
 Usage: scripts/orka-harness-v2-e2e.sh offline [adapter]
-       scripts/orka-harness-v2-e2e.sh live
+       scripts/orka-harness-v2-e2e.sh live [adapter]
 
-Offline defaults to all adapters: pydantic-ai, microsoft-agent-framework, langgraph.
-Live uses microsoft-agent-framework and requires COPILOT_GITHUB_TOKEN or an explicit
-VEKIL_CACHE_DIR. Configured credentials that fail authentication fail the test.
+Both modes default to all adapters: pydantic-ai, microsoft-agent-framework, langgraph.
+Use an adapter argument to select one; maf aliases microsoft-agent-framework.
+Live uses a digest-pinned local AIKit model without external model credentials.
 
 PLATFORM defaults to the Linux Docker daemon's architecture. BUILDER may select a
 docker-driver Buildx builder. ARTIFACT_DIR selects the parent for safe run results.
@@ -25,34 +25,28 @@ USAGE
 mode="${1:-offline}"
 case "$mode" in -h|--help) usage; exit 0 ;; esac
 [[ $# -le 2 ]] || die 'expected a mode and at most one adapter'
-adapters=()
 case "$mode" in
-  offline)
-    if [[ -n "${2:-}" ]]; then
-      case "$2" in
-        maf) adapters=(microsoft-agent-framework) ;;
-        pydantic-ai|microsoft-agent-framework|langgraph) adapters=("$2") ;;
-        *) die "unsupported adapter: $2" ;;
-      esac
-    else
-      adapters=(pydantic-ai microsoft-agent-framework langgraph)
-    fi
-    ;;
-  live)
-    [[ -z "${2:-}" || "${2:-}" == microsoft-agent-framework || "${2:-}" == maf ]] ||
-      die 'live mode currently supports microsoft-agent-framework only'
-    [[ -n "${COPILOT_GITHUB_TOKEN:-}" || -d "${VEKIL_CACHE_DIR:-}" ]] ||
-      die 'live mode requires COPILOT_GITHUB_TOKEN or VEKIL_CACHE_DIR with cached Vekil auth'
-    adapters=(microsoft-agent-framework)
-    ;;
+  offline|live) ;;
   *) usage >&2; die "unsupported mode: $mode" ;;
 esac
+adapters=()
+if [[ -n "${2:-}" ]]; then
+  case "$2" in
+    maf) adapters=(microsoft-agent-framework) ;;
+    pydantic-ai|microsoft-agent-framework|langgraph) adapters=("$2") ;;
+    *) die "unsupported adapter: $2" ;;
+  esac
+else
+  adapters=(pydantic-ai microsoft-agent-framework langgraph)
+fi
 
 for command in curl docker git go jq make; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/aikit-e2e-common.sh
+source "$repo_root/scripts/aikit-e2e-common.sh"
 temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 work_dir="$(mktemp -d "${temp_root%/}/agentkit-orka-v2.XXXXXX")"
 run_id="${work_dir##*/}"
@@ -62,7 +56,7 @@ phase=setup
 active_adapter=setup
 active_runtime=''
 active_artifacts=''
-vekil_name=''
+aikit_name=''
 containers=()
 volumes=()
 networks=()
@@ -98,8 +92,8 @@ cleanup() {
     docker stop --time 50 "$active_runtime" >/dev/null 2>&1 || true
     collect_runtime_diagnostics "$active_runtime" "$active_artifacts"
   fi
-  if [[ -n "$vekil_name" && -n "$artifact_dir" ]]; then
-    collect_container_state "$vekil_name" "$artifact_dir/vekil-state.json"
+  if [[ -n "$aikit_name" && -n "$artifact_dir" ]]; then
+    collect_container_state "$aikit_name" "$artifact_dir/aikit-state.json"
   fi
   for name in ${containers[@]+"${containers[@]}"}; do
     docker rm -fv "$name" >/dev/null 2>&1 || true
@@ -207,7 +201,6 @@ phase=probe-build
 )
 
 registry_image='docker.io/library/registry:3@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33'
-vekil_image='ghcr.io/sozercan/vekil:v0.14.10@sha256:656eb73f6eeea2ca0c1277cdd7bb8eede72efc5cac2450cdc30a3b94bda44d4b'
 registry_name="$run_id-registry"
 registry_volume="$run_id-registry"
 network_name="$run_id-runtime"
@@ -247,35 +240,19 @@ network_args=()
 docker network create --label "$label" ${network_args[@]+"${network_args[@]}"} "$network_name" >/dev/null
 
 if [[ "$mode" == live ]]; then
-  phase=vekil-readiness
-  vekil_name="$run_id-vekil"
-  vekil_args=(-d --name "$vekil_name" --label "$label" --platform "$platform"
-    --network "$network_name" --network-alias vekil -p 127.0.0.1::1337
-    -e PORT=1337 -e TOKEN_DIR=/home/nonroot/.config/vekil)
-  if [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]]; then
-    vekil_args+=(-e COPILOT_GITHUB_TOKEN)
-  else
-    # Copy the cache so refreshes cannot modify the caller's credential files.
-    cache_dir="$(cd "$VEKIL_CACHE_DIR" && pwd)"
-    cache_volume="$run_id-vekil-cache"
-    cache_copy="$run_id-cache-copy"
-    volumes+=("$cache_volume")
-    docker volume create --label "$label" "$cache_volume" >/dev/null
-    containers+=("$cache_copy")
-    docker run --name "$cache_copy" --label "$label" --platform "$platform" --network none \
-      --user 0:0 --entrypoint /bin/sh \
-      --mount "type=bind,src=$cache_dir,dst=/input,readonly" \
-      --mount "type=volume,src=$cache_volume,dst=/auth" "$registry_image" -ec \
-      'cp -R /input/. /auth/; chown -R 65532:65532 /auth; chmod 0700 /auth'
-    vekil_args+=(--mount "type=volume,src=$cache_volume,dst=/home/nonroot/.config/vekil")
-  fi
-  containers+=("$vekil_name")
-  docker run "${vekil_args[@]}" "$vekil_image" >/dev/null
-  vekil_port="$(published_port "$vekil_name" 1337)"
-  wait_ready "$vekil_name" "http://127.0.0.1:$vekil_port/readyz" 180
-  curl -fsS --max-time 15 "http://127.0.0.1:$vekil_port/v1/models" >"$work_dir/models.json"
-  jq -e '.data | any(.id == "claude-haiku-4.5")' "$work_dir/models.json" >/dev/null ||
-    die 'Vekil did not advertise the required claude-haiku-4.5 model'
+  phase=aikit-readiness
+  aikit_name="$run_id-aikit"
+  containers+=("$aikit_name")
+  log "Starting local AIKit ($aikit_image)"
+  start_aikit "$repo_root/test/aikit-e2e/model.yaml" -d --name "$aikit_name" --label "$label" --platform "$platform" \
+    --network "$network_name" --network-alias aikit -p 127.0.0.1::8080
+  aikit_port="$(published_port "$aikit_name" 8080)"
+  wait_ready "$aikit_name" "http://127.0.0.1:$aikit_port/readyz" 300
+  curl -fsS --max-time 15 "http://127.0.0.1:$aikit_port/v1/models" >"$work_dir/models.json"
+  jq -e --arg model "$aikit_model" '.data | any(.id == $model)' "$work_dir/models.json" >/dev/null ||
+    die "AIKit did not advertise the required $aikit_model model"
+  phase=aikit-warmup
+  warm_aikit "http://127.0.0.1:$aikit_port" "$work_dir/warmup.json"
 fi
 
 phase=frontend-build
@@ -306,10 +283,10 @@ run_adapter() {
   fixture="test/orka-harness-v2/agentkitfile-$adapter.yaml"
   model=gpt-4o-mini
   if [[ "$mode" == live ]]; then
-    fixture=test/orka-harness-v2/agentkitfile-live.yaml
-    model=claude-haiku-4.5
+    fixture="test/orka-harness-v2/agentkitfile-$adapter-live.yaml"
+    model="$aikit_model"
     timeout=900
-    probe_args=(--upstream http://vekil:1337)
+    probe_args=(--upstream http://aikit:8080)
   fi
   source_tag="127.0.0.1:$registry_port/agentkit-$adapter:$run_id"
   composed_tag="127.0.0.1:$registry_port/orka-$adapter:$run_id"

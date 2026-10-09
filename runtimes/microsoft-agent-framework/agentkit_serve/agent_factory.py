@@ -30,6 +30,7 @@ from agent_framework import (
     FunctionInvocationContext,
     FunctionMiddleware,
     FunctionTool,
+    HistoryProvider,
     MCPSkillsSource,
     MCPStdioTool,
     MCPStreamableHTTPTool,
@@ -45,6 +46,7 @@ from agentkit_serve_common.adapter_support import (
     AsyncExitStackLifecycle,
     AgentBuildError,
     declared_tool_env,
+    mcp_tool_protocol_error,
     normalize_agent_run_error,
     positive_int_env,
     resolve_api_key,
@@ -77,16 +79,36 @@ _DEFAULT_SEARCH_AUDIENCE = "https://search.azure.com/.default"
 _DEFAULT_FOUNDRY_AUDIENCE = "https://ai.azure.com/.default"
 _DEFAULT_MCP_REQUEST_TIMEOUT = 120
 _DEFAULT_SESSION_CACHE_MAX = 256
+class _RunFailure:
+    """The error that ends a run, shared by its concurrent tool calls."""
+
+    def __init__(self) -> None:
+        self.signal: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.error: AgentRunError | None = None
+
+    def record(self, error: AgentRunError) -> None:
+        # The first failure ends the run, but a sibling call that then finds
+        # its session dead must still mark the runtime unhealthy.
+        if self.error is None or (error.fatal and not self.error.fatal):
+            self.error = error
+        if not self.signal.done():
+            self.signal.set_result(None)
+
+
 # Invocation tasks share a fatal-error signal with their run owner. Concurrent
 # Sessions on the same Agent have independent signals.
-_run_failure: ContextVar[asyncio.Future[AgentRunError] | None] = ContextVar("agentkit_maf_run_failure", default=None)
+_run_failure: ContextVar[_RunFailure | None] = ContextVar("agentkit_maf_run_failure", default=None)
 _ORKA_TOOL_ERROR_CONTEXT_KEY = "agentkit_orka_tool_error"
 
 
 def _fail_run(message: str, *, code: str | None = None) -> None:
+    _fail_run_with(AgentRunError(message, code=code))
+
+
+def _fail_run_with(error: AgentRunError) -> None:
     failure = _run_failure.get()
-    if failure is not None and not failure.done():
-        failure.set_result(AgentRunError(message, code=code))
+    if failure is not None:
+        failure.record(error)
 
 
 def _mcp_request_timeout() -> int:
@@ -307,6 +329,10 @@ class _OrkaToolError(_MCPToolError):
 class _MCPProtocolError(Exception):
     """An MCP call failed without an admitted tool error result."""
 
+    def __init__(self, error: AgentRunError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
 
 class _MCPCallBoundary:
     """Keep MCP protocol failures out of MAF's recoverable tool-error loop."""
@@ -316,10 +342,11 @@ class _MCPCallBoundary:
             return await super().call_tool(tool_name, **kwargs)
         except _MCPToolError:
             raise
-        except Exception:
+        except Exception as exc:
             # Do not attach upstream exceptions: framework tool logging and
             # detailed-error options must never expose transport credentials.
-            raise _MCPProtocolError("MCP tool protocol failed") from None
+            error = mcp_tool_protocol_error(exc)
+            raise _MCPProtocolError(error) from None
 
     async def _call_tool_with_retries(self, tool_name, filtered_kwargs, meta, parser, span):
         # MAF 1.9+ retries tools/call after a lost connection. An attempted call
@@ -329,7 +356,7 @@ class _MCPCallBoundary:
 
     def _parse_tool_result_from_mcp(self, result):
         if not isinstance(result, CallToolResult):
-            raise _MCPProtocolError("MCP tool protocol failed")
+            raise _MCPProtocolError(mcp_tool_protocol_error())
         if result.isError:
             details = orka_tool_error_details(result.structuredContent)
             if details is not None:
@@ -404,8 +431,8 @@ class _MCPFailureMiddleware(FunctionMiddleware):
         self, context: FunctionInvocationContext, call_next: Callable[[], Awaitable[None]]
     ) -> None:
         failure = _run_failure.get()
-        if failure is not None and failure.done():
-            raise MiddlewareTermination(str(failure.result()))
+        if failure is not None and failure.error is not None:
+            raise MiddlewareTermination(str(failure.error))
         try:
             await call_next()
         except _OrkaToolError as exc:
@@ -416,11 +443,35 @@ class _MCPFailureMiddleware(FunctionMiddleware):
             # The SDK hides ordinary exception messages from the model. Project
             # only these fixed broker outcomes through its normal tool result.
             context.result = {"isError": True, "code": exc.code, "message": exc.message}
-        except _MCPProtocolError:
-            _fail_run("MCP tool protocol failed")
+        except _MCPProtocolError as exc:
+            _fail_run_with(exc.error)
             # MiddlewareTermination stops the model loop even on MAF 1.9,
             # which predates MiddlewareFailure. run_agent makes it a failure.
             raise MiddlewareTermination("MCP tool protocol failed") from None
+
+
+# The current run's request history, which _RequestHistoryProvider loads.
+_request_history: ContextVar[tuple[Message, ...]] = ContextVar("agentkit_maf_request_history", default=())
+
+
+class _RequestHistoryProvider(HistoryProvider):
+    """Make each run's request history the only conversation the model sees.
+
+    MAF injects an in-memory history provider into session-backed runs unless a
+    loading history provider is registered, and that stored copy would replace
+    the history the protocol layer sends. Loading the request history here, not
+    passing it as run input, also keeps context providers that persist input
+    messages, such as Foundry memory, to the new turn.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("agentkit-request-history", store_inputs=False, store_outputs=False)
+
+    async def get_messages(self, session_id, *, state=None, **kwargs) -> list[Message]:  # noqa: ANN001, ANN003
+        return list(_request_history.get())
+
+    async def save_messages(self, session_id, messages, *, state=None, **kwargs) -> None:  # noqa: ANN001, ANN003
+        return None
 
 
 class _ModelMessageMiddleware(ChatMiddleware):
@@ -458,13 +509,19 @@ def build_agent(
             func=skills.load_skill,
             approval_mode="never_require",
         ))
+    chat_client = client if client is not None else build_client(spec)
     return Agent(
-        client=client if client is not None else build_client(spec),
+        client=chat_client,
         instructions=instructions,
         name=spec.metadata.name,
         tools=tools,
-        context_providers=context_providers,
+        context_providers=[_RequestHistoryProvider(), *(context_providers or [])],
         middleware=[_ModelMessageMiddleware(), _MCPFailureMiddleware()],
+        # Each run already carries the full request history. A client that
+        # stores responses by default (the Foundry Responses API) would also
+        # chain the stored conversation and repeat that history. Other
+        # OpenAI-compatible servers may reject an unknown store field.
+        default_options={"store": False} if getattr(chat_client, "STORES_BY_DEFAULT", False) else None,
     )
 
 
@@ -480,7 +537,6 @@ class MAFRuntime:
         self.session_locks: dict[str, asyncio.Lock] = {}
         # Claims cover both lock holders and queued waiters during eviction.
         self.session_claims: dict[str, int] = {}
-        self.initialized_sessions: set[str] = set()
         self.most_recent_session_id: str | None = None
         self.session_cache_max = _session_cache_max()
 
@@ -524,21 +580,14 @@ class MAFRuntime:
         session_id = request.session_id
         session, lock = self._session_for(session_id)
         if lock is None:
-            return await run_agent(self.agent, request, session=session, include_history=True)
+            return await run_agent(self.agent, request, session=session)
         assert session_id
         try:
+            # Sessions keep context-provider state; the request still carries the
+            # whole conversation, so runs in one session stay ordered.
             async with lock:
                 self._touch_session(session_id)
-                session = self.sessions[session_id]
-                include_history = session_id not in self.initialized_sessions
-                result = await run_agent(
-                    self.agent,
-                    request,
-                    session=session,
-                    include_history=include_history,
-                )
-                self.initialized_sessions.add(session_id)
-                return result
+                return await run_agent(self.agent, request, session=self.sessions[session_id])
         finally:
             self._release_session_claim(session_id)
 
@@ -560,7 +609,6 @@ class MAFRuntime:
         if session is None:
             session = AgentSession(session_id=session_id)
             self.sessions[session_id] = session
-            self.initialized_sessions.discard(session_id)
         if lock is None:
             lock = asyncio.Lock()
             self.session_locks[session_id] = lock
@@ -578,7 +626,6 @@ class MAFRuntime:
 
     def _reset_session(self, session_id: str) -> None:
         self.sessions[session_id] = AgentSession(session_id=session_id)
-        self.initialized_sessions.discard(session_id)
 
     def _release_session_claim(self, session_id: str) -> None:
         claims = self.session_claims.get(session_id, 0)
@@ -602,7 +649,6 @@ class MAFRuntime:
             self.sessions.pop(session_id, None)
             self.session_locks.pop(session_id, None)
             self.session_claims.pop(session_id, None)
-            self.initialized_sessions.discard(session_id)
 
     async def _enter_owned_async_context(self, resource):
         """Enter an adapter-owned async context with partial-enter cleanup."""
@@ -821,15 +867,13 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-def _to_messages(request: RunRequest, *, include_history: bool = True) -> list[Message]:
-    """Map a neutral RunRequest to MAF messages."""
-    messages: list[Message] = []
-    if include_history:
-        for turn in request.history:
-            if turn.role in FORWARDED_ROLES and turn.text:
-                messages.append(Message(role=turn.role, contents=[turn.text]))
-    messages.append(Message(role="user", contents=[request.prompt]))
-    return messages
+def _history_messages(request: RunRequest) -> tuple[Message, ...]:
+    """Map a neutral RunRequest's prior turns to MAF messages."""
+    return tuple(
+        Message(role=turn.role, contents=[turn.text])
+        for turn in request.history
+        if turn.role in FORWARDED_ROLES and turn.text
+    )
 
 
 class _ToolEventMiddleware(FunctionMiddleware):
@@ -868,15 +912,15 @@ async def run_agent(
     request: RunRequest,
     *,
     session: AgentSession | None = None,
-    include_history: bool = True,
 ) -> RunResult:
     """Run the MAF agent and return the neutral result shape."""
-    messages = _to_messages(request, include_history=include_history)
+    messages = [Message(role="user", contents=[request.prompt])]
     kwargs = {}
     if request.on_tool_event is not None:
         kwargs["middleware"] = [_ToolEventMiddleware(request.on_tool_event)]
-    failure: asyncio.Future[AgentRunError] = asyncio.get_running_loop().create_future()
+    failure = _RunFailure()
     token = _run_failure.set(failure)
+    history_token = _request_history.set(_history_messages(request))
 
     async def execute():
         return await agent.run(messages, session=session, **kwargs)
@@ -887,8 +931,8 @@ async def run_agent(
             # MiddlewareTermination stops the next model step, but supported
             # MAF versions first join all calls in the current batch. Cancel
             # and join the SDK run so a fatal call also stops pending siblings.
-            await asyncio.wait((running, failure), return_when=asyncio.FIRST_COMPLETED)
-            if not failure.done():
+            await asyncio.wait((running, failure.signal), return_when=asyncio.FIRST_COMPLETED)
+            if failure.error is None:
                 try:
                     result = await running
                 except Exception as exc:  # noqa: BLE001 — normalized for the façade
@@ -896,9 +940,10 @@ async def run_agent(
         finally:
             running.cancel()
             await asyncio.gather(running, return_exceptions=True)
-        if failure.done():
-            raise failure.result()
+        if failure.error is not None:
+            raise failure.error
         return RunResult(text=_result_text(result), usage=_result_usage(result))
     finally:
-        failure.cancel()
+        failure.signal.cancel()
         _run_failure.reset(token)
+        _request_history.reset(history_token)

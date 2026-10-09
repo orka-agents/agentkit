@@ -15,10 +15,12 @@ authors = [{ name = "AgentKit" }]
 # depend on an agent framework — that is what keeps the lock-in boundary (plan
 # §12) inside each adapter's agent_factory.py.
 dependencies = [
-    "fastapi>=0.110",
+    # Older Starlette TestClient builds pass `app=` to httpx, which 0.28 removed.
+    "fastapi>=0.112",
     "uvicorn[standard]>=0.29",
     "pydantic>=2.7",
-    "pyyaml>=6.0",
+    # 6.0 has no Python 3.12 wheel and no longer builds from source.
+    "pyyaml>=6.0.1",
     "httpx>=0.28",
     # Runtime wheels only; stub compiler pins live in scripts/ separately.
     "grpcio>=1.78.0,<2",

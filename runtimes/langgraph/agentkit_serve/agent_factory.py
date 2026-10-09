@@ -34,6 +34,7 @@ from typing import Any
 from uuid import UUID
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -45,6 +46,7 @@ from agentkit_serve_common.adapter_support import (
     AsyncExitStackLifecycle,
     AgentBuildError,
     declared_tool_env,
+    mcp_tool_protocol_error,
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
@@ -68,6 +70,9 @@ from agentkit_serve_common.runtime import (
 # `npx` tool may download/install before speaking MCP, so match pydantic-ai's
 # generous default and let operators tune via env.
 _DEFAULT_MCP_INIT_TIMEOUT = 120.0
+# Fixed tool results the model sees instead of upstream diagnostics.
+_MCP_TOOL_ERROR = "MCP tool execution failed"
+_INVALID_TOOL_ARGUMENTS = "tool call arguments must be a JSON object"
 
 
 def _mcp_init_timeout() -> float:
@@ -125,6 +130,50 @@ def build_mcp_connection(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
+class _MCPSessionBoundary:
+    """End the run on MCP transport/protocol failures without upstream detail."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    async def call_tool(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await self._session.call_tool(*args, **kwargs)
+        except Exception as exc:
+            raise mcp_tool_protocol_error(exc) from None
+
+
+class _InvalidToolCallMiddleware(AgentMiddleware):
+    """Answer tool calls whose arguments are not JSON so the model can retry.
+
+    LangChain parks them in ``invalid_tool_calls``, which the agent loop would
+    otherwise treat as a final (often empty) answer.
+    """
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        message = state["messages"][-1]
+        if not isinstance(message, AIMessage) or not message.invalid_tool_calls:
+            return None
+        update: dict[str, Any] = {
+            "messages": [
+                ToolMessage(
+                    content=_INVALID_TOOL_ARGUMENTS,
+                    tool_call_id=call["id"],
+                    name=call.get("name") or "",
+                    status="error",
+                )
+                for call in message.invalid_tool_calls
+            ]
+        }
+        if not message.tool_calls:
+            update["jump_to"] = "model"
+        return update
+
+
 class LangGraphRuntime:
     """Async lifespan wrapper around a compiled LangGraph agent.
 
@@ -147,6 +196,7 @@ class LangGraphRuntime:
                 model=model,
                 tools=tools,
                 system_prompt=self.spec.instructions,
+                middleware=[_InvalidToolCallMiddleware()],
             )
             return self
 
@@ -184,13 +234,16 @@ class LangGraphRuntime:
             session_cm = self.client.session(tool.name, auto_initialize=False)
             session = await self.stack.enter_async_context(session_cm)
             await asyncio.wait_for(session.initialize(), timeout=_mcp_init_timeout())
-            tools.extend(
-                await load_mcp_tools(
-                    session,
-                    server_name=tool.name,
-                    tool_name_prefix=True,
-                )
+            loaded = await load_mcp_tools(
+                _MCPSessionBoundary(session),
+                server_name=tool.name,
+                tool_name_prefix=True,
             )
+            for loaded_tool in loaded:
+                # Admitted MCP errors still return to the model so it can recover,
+                # but as a fixed result: tool error text can carry upstream detail.
+                loaded_tool.handle_tool_error = _MCP_TOOL_ERROR
+            tools.extend(loaded)
         return tools
 
 

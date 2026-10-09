@@ -217,6 +217,35 @@ def test_fatal_parallel_call_cancels_and_joins_pending_sibling(monkeypatch, capl
 
 
 @pytest.mark.parametrize("transport", ["streamable-http", "stdio"])
+def test_dead_session_after_recoverable_parallel_failure_stays_fatal(monkeypatch, transport):
+    async def exercise():
+        started = asyncio.Event()
+
+        async def recoverable():
+            await started.wait()
+            raise _failure("timeout")
+
+        async def dead():
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                # The session dies while the first failure cancels the batch.
+                raise _failure("closed") from None
+
+        async with AsyncExitStack() as stack:
+            agent, _, session, _ = await _setup(
+                stack, monkeypatch, [recoverable, dead], transport=transport, parallel_calls=2,
+            )
+            with pytest.raises(AgentRunError, match="^MCP tool protocol failed$") as caught:
+                await asyncio.wait_for(agent_factory.run_agent(agent, RunRequest("mixed-batch")), 3)
+            assert len(session.calls) == 2
+        assert caught.value.fatal
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("transport", ["streamable-http", "stdio"])
 def test_admitted_parallel_error_does_not_cancel_successful_sibling(monkeypatch, caplog, transport):
     async def exercise():
         started, failed_event, release, cancelled = (asyncio.Event() for _ in range(4))

@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .config import AgentSpec
 from .conversation import ConversationError, RunRequest, run_request_from_messages
-from .runtime import AgentRunError, RunResult, RuntimeFactory
+from .runtime import AgentRunError, RunResult, RuntimeFactory, RuntimeHealth
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +136,7 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
     module framework-agnostic.
     """
     runtime = factory.build_runtime(spec)
+    health = RuntimeHealth()
     model_name = spec.model.name
 
     @asynccontextmanager
@@ -150,7 +151,9 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
     auth = Depends(make_auth_dependency(auth_token))
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    async def healthz():
+        if not health.healthy:
+            return JSONResponse(status_code=503, content={"status": "unhealthy"})
         return {"status": "ok"}
 
     @app.get("/v1/models", dependencies=[auth])
@@ -214,6 +217,7 @@ def create_app(spec: AgentSpec, factory: RuntimeFactory, auth_token: str | None 
         except HTTPException:
             raise
         except AgentRunError as exc:  # neutral error: framework/model failure
+            health.record(exc)
             return _error_response(
                 exc.status,
                 str(exc),

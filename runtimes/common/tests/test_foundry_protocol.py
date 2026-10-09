@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 from agentkit_serve_common.foundry import create_foundry_app
+from agentkit_serve_common.model_errors import normalized_model_http_error
 from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
 
 
@@ -239,6 +240,38 @@ def test_foundry_non_brokered_runtime_4xx_preserves_caller_actionable_detail():
     assert invocation.json()["error"] == expected
     assert response.status_code == 422
     assert response.json()["error"] == expected
+
+
+def test_foundry_non_brokered_model_errors_use_normalized_envelope_and_fatal_fails_readiness():
+    class FailingRuntime(EchoRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.errors = [
+                normalized_model_http_error(401),
+                AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True),
+            ]
+
+        async def run(self, request: RunRequest) -> RunResult:
+            self.requests.append(request)
+            raise self.errors.pop(0)
+
+    factory = EchoFactory()
+    factory.runtime = FailingRuntime()
+    app = create_foundry_app(_spec(), factory)
+
+    with TestClient(app) as client:
+        auth = client.post("/responses", json={"input": "hello"})
+        ready_after_model_error = client.get("/readiness")
+        client.post("/invocations", json={"message": "hello"})
+        ready_after_fatal = client.get("/readiness")
+
+    assert auth.status_code == 503
+    assert auth.json() == {
+        "error": {"message": "model service rejected configured credentials", "code": "ModelAuthRejected", "upstream_status": 401}
+    }
+    assert ready_after_model_error.status_code == 200
+    assert ready_after_fatal.status_code == 503
+    assert ready_after_fatal.json() == {"ready": False}
 
 
 def test_foundry_protocols_reject_non_object_json():

@@ -44,11 +44,11 @@ from .foundry_model_loop import (
     BrokeredChatModelLoop,
     ModelLoopFinal,
     ModelLoopToolRequest,
-    normalized_model_error_details,
 )
+from .model_errors import normalized_model_error_details
 from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
-from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory
+from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory, RuntimeHealth
 from .server import make_auth_dependency
 from .tool_errors import orka_tool_error_details
 
@@ -232,6 +232,10 @@ def _brokered_model_run_error(exc: Exception) -> JSONResponse:
 
 
 def _non_brokered_agent_run_error(exc: AgentRunError) -> JSONResponse:
+    normalized = normalized_model_error_details(exc)
+    if normalized is not None:
+        status, error = normalized
+        return JSONResponse({"error": error}, status_code=status)
     if exc.status < 500:
         return _error(str(exc), status=exc.status, code=exc.code)
     logger.warning("non-brokered Foundry runtime request failed: %s", exc, exc_info=True)
@@ -2735,6 +2739,7 @@ def create_foundry_app(
     """Create a Foundry-compatible wrapper app for one AgentKit runtime."""
     brokered_tools = brokered_tool_definitions(spec)
     runtime = None if brokered_tools else factory.build_runtime(spec)
+    health = RuntimeHealth()
     continuation_proof = brokered_continuation_proof or os.environ.get(_CONTINUATION_PROOF_ENV) or None
     max_argument_bytes = _max_argument_bytes(max_brokered_argument_bytes)
     max_output_bytes = _max_output_bytes(max_brokered_output_bytes)
@@ -2784,6 +2789,8 @@ def create_foundry_app(
     @app.get("/readiness")
     async def readiness():
         body: dict[str, Any] = {"ready": True}
+        if not health.healthy:
+            return JSONResponse({"ready": False}, status_code=503)
         if brokered_tools:
             body["foundryResponses"] = {
                 "brokeredTools": len(brokered_tools),
@@ -2833,6 +2840,7 @@ def create_foundry_app(
                 RunRequest(prompt=prompt, session_id=_session_id_from_request(request))
             )
         except AgentRunError as exc:
+            health.record(exc)
             return _non_brokered_agent_run_error(exc)
         except Exception:  # noqa: BLE001 - deterministic protocol envelope.
             return _non_brokered_unexpected_runtime_error()
@@ -3160,6 +3168,7 @@ def create_foundry_app(
             created_at = await stream.accept(response_id) if stream is not None else None
             result = await request.app.state.runtime.run(run_request)
         except AgentRunError as exc:
+            health.record(exc)
             return _non_brokered_agent_run_error(exc)
         except Exception:  # noqa: BLE001 - deterministic protocol envelope.
             return _non_brokered_unexpected_runtime_error()

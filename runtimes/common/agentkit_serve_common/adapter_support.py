@@ -11,6 +11,7 @@ common run error.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shlex
@@ -20,9 +21,14 @@ from contextlib import AsyncExitStack
 from types import TracebackType
 from typing import Literal, Mapping, TypeVar, cast
 
+import anyio
+
 from .config import AgentSpec, ToolSpec
 from .conversation import FORWARDED_ROLES
+from .model_errors import normalized_model_http_error
 from .runtime import AgentRunError
+
+logger = logging.getLogger(__name__)
 
 # Placeholder API key for OpenAI-compatible endpoints that need no auth (many
 # local servers reject an EMPTY string but accept any non-empty token). Used only
@@ -411,8 +417,10 @@ def resolve_workload_identity_token(audience: str, env: Mapping[str, str] | None
                 timeout=30,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            # The exception text holds the full command line, which can carry
+            # secrets; Orka streams build errors, so name the failure type only.
             raise AgentBuildError(
-                f"workload identity token command failed for audience {audience!r}: {exc}"
+                f"workload identity token command failed for audience {audience!r}: {exc.__class__.__name__}"
             ) from exc
         token = completed.stdout.strip()
         if not token:
@@ -436,7 +444,7 @@ def resolve_workload_identity_token(audience: str, env: Mapping[str, str] | None
         error: BaseException
         if isinstance(exc, Exception):
             error = AgentBuildError(
-                f"workload identity token acquisition failed for audience {audience!r}: {exc}"
+                f"workload identity token acquisition failed for audience {audience!r}: {exc.__class__.__name__}"
             )
         else:
             error = exc
@@ -454,7 +462,7 @@ def resolve_workload_identity_token(audience: str, env: Mapping[str, str] | None
         identity_client.close()
     except Exception as exc:  # noqa: BLE001 - normalize provider failures.
         raise AgentBuildError(
-            f"workload identity credential cleanup failed for audience {audience!r}: {exc}"
+            f"workload identity credential cleanup failed for audience {audience!r}: {exc.__class__.__name__}"
         ) from exc
     return value
 
@@ -526,6 +534,28 @@ def positive_int_env(name: str = MCP_TIMEOUT_ENV, *, default: int | None, env: M
     return val if val > 0 else default
 
 
+def _exception_chain(exc: BaseException):
+    """Yield a bounded walk of an exception, its wrapped causes, and group members."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending and len(seen) < 32:  # bounded; guards against pathological cycles
+        cur = pending.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        yield cur
+        if isinstance(cur, BaseExceptionGroup):
+            pending.extend(reversed(cur.exceptions))
+        nested = getattr(cur, "inner_exception", None) or cur.__cause__ or cur.__context__
+        if isinstance(nested, BaseException):
+            pending.append(nested)
+
+
+def exception_types(exc: BaseException) -> str:
+    """Credential-free summary of an exception: the types in its chain."""
+    return " <- ".join(type(cur).__name__ for cur in _exception_chain(exc))
+
+
 def upstream_status_code(exc: BaseException, *, default: int = 502) -> int:
     """Best-effort upstream HTTP status from a framework/model exception.
 
@@ -535,23 +565,72 @@ def upstream_status_code(exc: BaseException, *, default: int = 502) -> int:
     own exception and store the original as ``inner_exception`` or as the normal
     exception cause/context, so this walks the bounded exception chain.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    for _ in range(10):  # bounded walk; guards against pathological cycles
-        if cur is None or id(cur) in seen:
-            break
-        seen.add(id(cur))
+    for cur in _exception_chain(exc):
         code = getattr(cur, "status_code", None)
         if isinstance(code, int) and 400 <= code <= 599:
             return code
-        cur = getattr(cur, "inner_exception", None) or cur.__cause__ or cur.__context__
     return default
 
 
-def normalize_agent_run_error(exc: Exception) -> AgentRunError:
-    """Convert an adapter/framework exception into the common façade error."""
-    return AgentRunError(
-        f"agent run failed: {exc}",
-        status=upstream_status_code(exc),
-        code=exc.__class__.__name__,
+def normalize_agent_run_error(exc: BaseException) -> AgentRunError:
+    """Convert an adapter/framework exception into the common façade error.
+
+    Framework and model SDK messages can carry upstream response bodies, URLs,
+    and echoed credentials, so only runtime-owned messages and codes cross into
+    protocol responses. Runtime-owned ``AgentRunError`` values pass through.
+    """
+    chain = list(_exception_chain(exc))
+    owned = [cur for cur in chain if isinstance(cur, AgentRunError)]
+    if owned:
+        return next((cur for cur in owned if cur.fatal), owned[0])
+    status = upstream_status_code(exc, default=0)
+    if status:
+        # The exception text is the upstream body, which a gateway may fill
+        # with the presented credential; operators get the status only.
+        logger.warning("model service returned HTTP %d", status)
+        return normalized_model_http_error(status)
+    if any(_is_transport_error(cur) for cur in chain):
+        logger.warning("model service request failed", exc_info=exc)
+        return AgentRunError("model service request failed", status=502, code="ModelUpstreamError")
+    logger.warning("agent run failed", exc_info=exc)
+    return AgentRunError("agent run failed", status=502, code="AgentRunFailed")
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    # Matched by name: model SDKs vendor their HTTP stack (the OpenAI SDK raises
+    # httpx2 errors), so an isinstance check against httpx misses them.
+    return any(klass.__name__ in {"TransportError", "APIConnectionError"} for klass in type(exc).__mro__)
+
+
+# Errors the MCP client generates itself when its session is gone: the read
+# stream ended (mcp.types.CONNECTION_CLOSED), or a remote server answered 404
+# for the session. The shared core cannot import the MCP SDK. Matching the
+# message too keeps a server's own -32000 error for one call from counting.
+_MCP_SESSION_GONE = {(-32000, "Connection closed"), (32600, "Session terminated")}
+
+
+def mcp_session_closed(exc: BaseException) -> bool:
+    """Whether an MCP client failure means its session is gone for good."""
+    for cur in _exception_chain(exc):
+        if isinstance(cur, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+            return True
+        error = getattr(cur, "error", None)
+        if type(cur).__name__ == "McpError" and (getattr(error, "code", None), getattr(error, "message", None)) in _MCP_SESSION_GONE:
+            return True
+    return False
+
+
+def mcp_tool_protocol_error(exc: BaseException | None = None) -> AgentRunError:
+    """Secret-free run error for an MCP failure that is not an admitted tool error.
+
+    Every adapter enters its MCP sessions once for the runtime lifespan, stdio
+    and remote alike, so a session that is gone for good is fatal.
+    """
+    fatal = exc is not None and mcp_session_closed(exc)
+    # Remote tool errors can carry credential-bearing URLs; log the type only.
+    logger.warning(
+        "MCP tool protocol failed: %s%s",
+        type(exc).__name__ if exc is not None else "unexpected tool result",
+        " (session closed)" if fatal else "",
     )
+    return AgentRunError("MCP tool protocol failed", status=502, code="MCPToolProtocolError", fatal=fatal)

@@ -20,7 +20,9 @@ must be identical across adapters:
 | `conversation.py` | Protocol request normalization into `RunRequest`. |
 | `runtime.py` | `RuntimeFactory`, `RuntimeSession`, `RunResult`, `AgentRunError`. |
 | `adapter_support.py` | API-key lookup, tool env projection, timeout parsing, error normalization. |
+| `model_errors.py` | Runtime-owned model error codes and messages shared by every protocol skin. |
 | `conformance.py` | Shared HTTP behavior tests adapter packages import. |
+| `parity.py` | Shared wire-level suite that runs each adapter's real runtime against a scripted model and MCP tool. |
 
 The protocol app factories receive an adapter module that satisfies
 `RuntimeFactory`. The shared core calls only `factory.build_runtime(spec)` and
@@ -35,7 +37,9 @@ default. `foundry` and `orka` are selected with `--protocol` or
 
 OpenAI mode exposes:
 
-- `GET /healthz` returns `{"status":"ok"}` and is always open.
+- `GET /healthz` returns `{"status":"ok"}` and is always open. It returns 503
+  `{"status":"unhealthy"}` after a run reports a fatal runtime failure, such as
+  a stdio MCP tool subprocess exiting.
 - `GET /v1/models` returns the one configured model name.
 - `POST /v1/chat/completions` runs the agent once and returns one
   `chat.completion` object with a single assistant message.
@@ -65,13 +69,38 @@ Request behavior is intentionally narrow:
 - prior `system`, `user`, and `assistant` messages become history.
 - prior `tool` and unknown roles are ignored because the built agent owns its
   tools.
+- the model receives the baked instructions first, then the client's history in
+  order.
 - `X-AgentKit-Session-Id`, when present, is forwarded through the neutral
-  `RunRequest` for runtime/session correlation. Orka mode additionally forwards
-  `turn_id`, `correlation_id`, `deadline`, `metadata`, and per-run `env` fields.
+  `RunRequest` for runtime/session correlation. It never replaces the history the
+  client sent. Orka mode additionally forwards `turn_id`, `correlation_id`,
+  `deadline`, `metadata`, and per-run `env` fields.
 
-Framework/model failures are normalized to an OpenAI-shaped error envelope with
-`type: agent_error`. The adapters preserve upstream HTTP status codes when the
-framework exposes them.
+The protocol layer owns the conversation: OpenAI and Foundry clients send it, and
+Orka mode keeps each runtime session's completed user/assistant turns, as the
+ACP child does. Runtime adapters do not keep their own transcript.
+
+Run failures use an OpenAI-shaped error envelope with `type: agent_error` and
+runtime-owned messages. Framework and model SDK text can carry upstream bodies,
+URLs, and echoed credentials, so it never reaches the client:
+
+| Failure | Status | `code` |
+|---|---|---|
+| Model returned 401 or 403 | 503 | `ModelAuthRejected` |
+| Model returned 429 or 5xx after SDK retries | 503 | `ModelUnavailable` |
+| Model returned another 4xx, or the request failed in transport | 502 | `ModelUpstreamError` |
+| MCP transport or protocol failure | 502 | `MCPToolProtocolError` |
+| Orka runtime session failed to start | 503 | `RuntimeStartFailed` |
+| LangGraph result has no messages list or assistant message | 502 | `LangGraphResultError` |
+| LangGraph graph is not initialized | 500 | `AgentNotInitialized` |
+| Other unclassified framework or SDK exception | 502 | `AgentRunFailed` |
+
+Foundry mode reports the same model codes with its `upstream_status` field; it
+reports other run failures as `RuntimeFailure` with a fixed message. Orka mode
+reports every code in `TurnFailed` frames. Operators get a warning log for
+each failure: the HTTP status for model HTTP errors, whose bodies may echo
+credentials; the exception types for MCP failures and Orka runtime startup
+failures; and a traceback otherwise.
 
 ## Model endpoint compatibility
 
@@ -123,6 +152,13 @@ startup credentials at runtime initialization; they are not rebuilt for every tu
 - each tool subprocess receives only env vars declared in that tool's `env`,
 - undeclared `${VAR}` interpolation inside a declared env value is rejected, and
 - tool sessions are entered once for the app lifespan and reused across requests,
+- an admitted MCP tool error returns to the model as a fixed failure result,
+  never the tool's own error text,
+- a tool session that is gone for good is fatal, whether a stdio subprocess
+  exited or a remote server no longer knows the session: OpenAI `/healthz` and
+  Foundry `/readiness` start failing so the platform replaces the container, and
+  Orka mode rebuilds that runtime session for its next turn. A server's error
+  for one call is not fatal,
 - remote MCP clients inject headers only for the configured origin and do not
   follow redirects with credentials.
 
@@ -152,7 +188,8 @@ Path: `runtimes/microsoft-agent-framework/`
 - Guardrail tests prevent unrelated cloud packages such as CopilotStudio/Purview
   from crossing the adapter boundary.
 - Supports session-aware runs, remote MCP, filesystem/MCP skills, search context,
-  and memory context through generic ABI fields.
+  and memory context through generic ABI fields. Sessions keep context-provider
+  state only; each run's conversation comes from the request.
 
 ### LangGraph
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+import anyio
+import httpx
 import pytest
 
 from agentkit_serve_common import adapter_support as support
@@ -162,15 +165,83 @@ def test_upstream_status_code_handles_cycles():
     assert support.upstream_status_code(exc) == 502
 
 
-def test_normalize_agent_run_error_preserves_code_and_status():
-    class Unavailable(Exception):
-        status_code = 503
+@pytest.mark.parametrize(
+    ("upstream", "status", "code", "message"),
+    [
+        (401, 503, "ModelAuthRejected", "model service rejected configured credentials"),
+        (403, 503, "ModelAuthRejected", "model service rejected configured credentials"),
+        (429, 503, "ModelUnavailable", "model service is unavailable"),
+        (500, 503, "ModelUnavailable", "model service is unavailable"),
+        (400, 502, "ModelUpstreamError", "model service request failed"),
+    ],
+)
+def test_normalize_agent_run_error_maps_upstream_status_without_upstream_text(upstream, status, code, message, caplog):
+    class SDKStatusError(Exception):
+        status_code = upstream
 
-    err = support.normalize_agent_run_error(Unavailable("upstream down"))
-    assert isinstance(err, AgentRunError)
-    assert err.status == 503
-    assert err.code == "Unavailable"
-    assert "upstream down" in str(err)
+    class FrameworkError(Exception):
+        pass
+
+    wrapped = FrameworkError("framework wrapper sk-echoed-secret")
+    wrapped.__cause__ = SDKStatusError("Error code: 401 - {'message': 'bad key Bearer sk-echoed-secret'}")
+    err = support.normalize_agent_run_error(wrapped)
+    assert (err.status, err.code, str(err)) == (status, code, message)
+    assert err.upstream_status == upstream
+    assert f"HTTP {upstream}" in caplog.text
+    assert "sk-echoed-secret" not in caplog.text
+
+
+def test_normalize_agent_run_error_maps_transport_and_unknown_failures():
+    class TransportError(Exception):  # a vendored HTTP stack, such as httpx2
+        pass
+
+    class ConnectError(TransportError):
+        pass
+
+    for cause in (httpx.ConnectError("https://model.example"), ConnectError("https://model.example")):
+        transport = RuntimeError("connection to https://model.example failed")
+        transport.__cause__ = cause
+        err = support.normalize_agent_run_error(transport)
+        assert (err.status, err.code, str(err)) == (502, "ModelUpstreamError", "model service request failed")
+
+    err = support.normalize_agent_run_error(TypeError("'NoneType' object is not iterable: private-response"))
+    assert (err.status, err.code, str(err)) == (502, "AgentRunFailed", "agent run failed")
+
+
+def test_normalize_agent_run_error_keeps_runtime_owned_errors():
+    owned = AgentRunError("MCP tool protocol failed", status=502, code="MCPToolProtocolError")
+    assert support.normalize_agent_run_error(owned) is owned
+
+    wrapped = RuntimeError("framework wrapper")
+    wrapped.__cause__ = owned
+    assert support.normalize_agent_run_error(wrapped) is owned
+
+    fatal = AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True)
+    group = ExceptionGroup("parallel tools", [owned, fatal])
+    assert support.normalize_agent_run_error(group) is fatal
+
+
+def test_mcp_tool_protocol_error_is_fatal_only_when_the_session_is_gone():
+    class ErrorData:
+        def __init__(self, code: int, message: str) -> None:
+            self.code = code
+            self.message = message
+
+    class McpError(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.error = ErrorData(code, message)
+
+    wrapped_closed = RuntimeError("tool failed")
+    wrapped_closed.__context__ = anyio.ClosedResourceError()
+    gone = (McpError(-32000, "Connection closed"), McpError(32600, "Session terminated"), wrapped_closed)
+    recoverable = (McpError(-32000, "upstream database unavailable"), TimeoutError("read timed out"))
+
+    for exc in gone:
+        err = support.mcp_tool_protocol_error(exc)
+        assert (err.code, str(err), err.fatal) == ("MCPToolProtocolError", "MCP tool protocol failed", True)
+    for exc in recoverable:
+        assert not support.mcp_tool_protocol_error(exc).fatal
 
 
 def _remote_tool(**overrides) -> ToolSpec:
@@ -225,6 +296,15 @@ def test_resolve_tool_headers_missing_value_env_fails_secret_free():
     msg = str(exc.value)
     assert "TRACE_HEADER" in msg
     assert "do-not-mention" not in msg
+
+
+def test_workload_identity_token_command_failure_hides_command_line():
+    command = f"{shlex.quote(sys.executable)} -c 'raise SystemExit(1)' --client-secret command-line-secret"
+    with mock.patch.dict(os.environ, {"AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND": command}, clear=True):
+        with pytest.raises(support.AgentBuildError, match="CalledProcessError$") as exc_info:
+            support.resolve_workload_identity_token("https://ai.azure.com/.default")
+
+    assert "command-line-secret" not in str(exc_info.value)
 
 
 def test_resolve_workload_identity_token_uses_explicit_runtime_hook():
@@ -340,9 +420,10 @@ def test_default_azure_credential_fallback_closes_after_failure_without_masking_
         mock.patch.dict(os.environ, {}, clear=True),
         mock.patch.dict(sys.modules, _fake_azure_identity_module(FakeCredential)),
     ):
-        with pytest.raises(support.AgentBuildError, match="token unavailable") as exc_info:
+        with pytest.raises(support.AgentBuildError, match="RuntimeError$") as exc_info:
             support.resolve_workload_identity_token("https://ai.azure.com/.default")
 
+    assert "token unavailable" not in str(exc_info.value)
     assert exc_info.value.__cause__ is acquisition_error
     assert len(instances) == 1
     assert instances[0].closed is True

@@ -1,0 +1,21 @@
+#syntax=agentkit:test
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: orka-v2-live-e2e
+runtime: langgraph
+model:
+  provider: openai-compatible
+  # ACP must replace this with the supervisor's authenticated loopback proxy.
+  baseURL: http://provider.invalid/v1
+  name: qwen-3.5-2b
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Follow only the latest user message for each new response.
+  Copy the latest requested marker character-for-character, without changing it.
+  Never reuse an earlier turn's marker unless the latest message asks for it.
+  When asked to use a tool, call it exactly once with the latest requested value.
+  Include the tool's exact returned receipt and value in your answer.
+  When asked not to use tools, reply only with the latest requested marker.
+expose:
+  openai: true

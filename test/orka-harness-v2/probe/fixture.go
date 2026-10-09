@@ -233,13 +233,19 @@ func (f *fixture) completion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fixture) forward(w http.ResponseWriter, r *http.Request, body []byte) {
+	var err error
+	body, err = localAIRequest(body)
+	if err != nil {
+		f.reject(w, "cannot construct AIKit provider request")
+		return
+	}
 	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.TrimRight(f.upstream, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		f.reject(w, "cannot construct live provider request")
 		return
 	}
 	upstream.Header.Set("Content-Type", "application/json")
-	// Vekil owns the Copilot credential. The fixture never reads or records it.
+	// AIKit runs on the private test network and requires no provider credential.
 	response, err := f.client.Do(upstream)
 	if err != nil {
 		f.reject(w, "live provider transport failed")

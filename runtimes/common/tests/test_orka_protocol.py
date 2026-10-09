@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import agentkit_serve_common.orka as orka_module
 from agentkit_serve_common.config import AgentSpec
-from agentkit_serve_common.conversation import RunRequest
+from agentkit_serve_common.conversation import ConversationTurn, RunRequest
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import (
     AgentRunError,
@@ -117,8 +117,9 @@ class StaticOutputFactory:
 
 
 class RaisingRuntime(StaticOutputRuntime):
+    # Runtime-owned AgentRunError text is the failure detail frames still carry.
     async def run(self, request: RunRequest) -> RunResult:
-        raise RuntimeError(self.text)
+        raise AgentRunError(self.text)
 
 
 class RaisingFactory(StaticOutputFactory):
@@ -555,7 +556,7 @@ def test_orka_rejects_start_frame_text_that_is_not_valid_utf8_without_retaining_
         )
 
     assert rejected.status_code == 400
-    assert rejected.json() == {"detail": "TurnStarted contains text that is not valid UTF-8"}
+    assert rejected.json() == {"error": "TurnStarted contains text that is not valid UTF-8"}
     assert "turn-invalid-utf8-start" not in app.state.turns
 
 
@@ -566,10 +567,32 @@ def test_orka_duplicate_turn_rejection_matches_orka_conformance_contract():
         turn_id = _create_turn(client, turnID="turn-duplicate", input={"prompt": "slow", "contextRefs": [], "env": []})
         duplicate = client.post("/v1/turns", json=_start_payload(turnID=turn_id, input={"prompt": "slow", "contextRefs": [], "env": []}), headers=AUTH)
         cancel = client.post(f"/v1/turns/{turn_id}/cancel", json=_cancel_payload(turnID=turn_id), headers=AUTH)
+        _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)
+        completed_duplicate = client.post("/v1/turns", json=_start_payload(turnID=turn_id, input={"prompt": "again", "contextRefs": [], "env": []}), headers=AUTH)
 
+    # Orka's client matches these exact native {"error": ...} bodies.
     assert duplicate.status_code == 409
-    assert duplicate.json() == {"detail": "turn already exists"}
+    assert duplicate.json() == {"error": "turn already exists"}
     assert cancel.status_code == 202
+    assert completed_duplicate.status_code == 409
+    assert completed_duplicate.json() == {"error": "turn already completed"}
+
+
+def test_orka_parameter_validation_uses_native_error_body():
+    app = create_orka_app(_spec(), EchoFactory(), auth_token="test-token")
+
+    with TestClient(app) as client:
+        negative = client.get("/v1/turns/turn-1/events?afterSeq=-1", headers=AUTH)
+        malformed = client.get("/v1/turns/turn-1/events?afterSeq=private-value", headers=AUTH)
+        missing = client.get("/v1/turns/turn-1/output", headers=AUTH)
+        unauthenticated = client.get("/v1/turns/turn-1/events?afterSeq=-1")
+
+    assert (negative.status_code, negative.json()) == (400, {"error": "afterSeq: Input should be greater than or equal to 0"})
+    assert malformed.status_code == 400
+    assert malformed.json()["error"].startswith("afterSeq: ")
+    assert "private-value" not in malformed.text
+    assert (missing.status_code, missing.json()) == (400, {"error": "ref: Field required"})
+    assert unauthenticated.status_code == 401
 
 
 def test_orka_turn_forwards_per_turn_metadata_env_and_session_fields():
@@ -795,7 +818,7 @@ def test_orka_cancel_rejects_turn_owner_mismatch_without_cancelling_turn(field_n
         )
 
         assert mismatch.status_code == 400
-        assert mismatch.json() == {"detail": "cancel namespace/taskName/sessionName must match turn"}
+        assert mismatch.json() == {"error": "cancel namespace/taskName/sessionName must match turn"}
         assert state.task is not None
         assert state.task.cancelling() == 0
         assert state.terminal_event is None
@@ -839,8 +862,8 @@ def test_orka_enforces_advertised_single_active_turn_limit():
             headers=AUTH,
         )
 
-    assert rejected.status_code == 429
-    assert "maxConcurrentTurns" in rejected.text
+    assert rejected.status_code == 409
+    assert rejected.json() == {"error": "maximum concurrent turns reached"}
     assert accepted_after_terminal.status_code == 202
 
 
@@ -903,9 +926,10 @@ def test_orka_lifespan_awaits_cancelled_turn_and_terminal_callback_before_runtim
         run_request,
         *,
         max_terminal_turns,
+        max_history_bytes,
         brokered_tools=None,
     ) -> None:
-        del turns, terminal_order, state, max_terminal_turns, brokered_tools
+        del turns, terminal_order, state, max_terminal_turns, max_history_bytes, brokered_tools
         await get_runtime(run_request)
         turn_started.set()
         await asyncio.Event().wait()
@@ -2021,7 +2045,7 @@ def test_orka_brokered_json_output_over_utf8_limit_returns_413_and_visible_termi
     )
     frames = _frames(response.text)
     assert rejected.status_code == 413
-    assert rejected.json() == {"detail": message}
+    assert rejected.json() == {"error": message}
     assert replayed_rejection.status_code == 413
     assert replayed_rejection.json() == rejected.json()
     assert conflicting.status_code == 409
@@ -2425,3 +2449,285 @@ def test_orka_brokered_late_continue_after_cancel_is_rejected():
 def test_orka_brokered_mode_does_not_advertise_or_fall_back_to_direct_runtime_run():
     with pytest.raises(ValueError, match="requires a runtime factory that supports brokered tools"):
         create_orka_app(_spec(), EchoFactory(), "test-token", enable_brokered_read=True)
+
+
+class ScriptedRuntime:
+    def __init__(self, *outcomes: str | BaseException) -> None:
+        self.outcomes = list(outcomes)
+        self.requests: list[RunRequest] = []
+        self.closed = False
+
+    async def __aenter__(self) -> RuntimeSession:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        self.closed = True
+        return None
+
+    async def run(self, request: RunRequest) -> RunResult:
+        self.requests.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return RunResult(text=outcome)
+
+
+class ScriptedFactory:
+    def __init__(self, *runtimes: ScriptedRuntime) -> None:
+        self.runtimes = list(runtimes)
+
+    def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+        return self.runtimes.pop(0)
+
+
+def _run_prompt(client: TestClient, turn_id: str, prompt: str, runtime_session_id: str = "runtime-session-1") -> dict[str, Any]:
+    _create_turn(
+        client,
+        turnID=turn_id,
+        runtimeSessionID=runtime_session_id,
+        input={"prompt": prompt, "contextRefs": [], "env": []},
+    )
+    return _frames(client.get(f"/v1/turns/{turn_id}/events", headers=AUTH).text)[-1]
+
+
+def test_orka_runtime_session_history_carries_only_completed_turns():
+    session = ScriptedRuntime("a1", AgentRunError("model service is unavailable", status=503, code="ModelUnavailable"), "a3")
+    other = ScriptedRuntime("b1")
+    app = create_orka_app(_spec(), ScriptedFactory(session, other), auth_token="test-token")
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-2", "q2")["failed"]["reason"] == "ModelUnavailable"
+        assert _run_prompt(client, "turn-3", "q3")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-4", "o1", runtime_session_id="runtime-session-2")["type"] == "TurnCompleted"
+
+    committed = (ConversationTurn(role="user", text="q1"), ConversationTurn(role="assistant", text="a1"))
+    assert [request.history for request in session.requests] == [(), committed, committed]
+    assert other.requests[0].history == ()
+
+
+class FailingStartRuntime(ScriptedRuntime):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def __aenter__(self) -> RuntimeSession:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(RuntimeError("401 for url https://tool.example/mcp?key=private-key"), id="exception"),
+        pytest.param(
+            AgentRunError("tool startup failed with private-key", status=502, code="MCPToolProtocolError"),
+            id="agent-run-error",
+        ),
+        pytest.param(asyncio.CancelledError("Cancelled via cancel scope"), id="leaked-task-group-cancel"),
+    ],
+)
+def test_orka_runtime_start_failure_hides_startup_detail(error, caplog):
+    app = create_orka_app(_spec(), ScriptedFactory(FailingStartRuntime(error)), auth_token="test-token")
+
+    with TestClient(app) as client:
+        terminal = _run_prompt(client, "turn-1", "q1")
+
+    assert terminal["type"] == "TurnFailed"
+    assert terminal["failed"] == {"reason": "RuntimeStartFailed", "message": "runtime failed to start", "retryable": False}
+    assert f"runtime session failed to start: {type(error).__name__}" in caplog.text
+    assert "private-key" not in caplog.text
+
+
+def test_orka_unexpected_run_exception_text_is_not_streamed():
+    class LeakyRuntime(ScriptedRuntime):
+        async def run(self, request: RunRequest) -> RunResult:
+            raise TypeError("unexpected response body with private-key")
+
+    app = create_orka_app(_spec(), ScriptedFactory(LeakyRuntime()), auth_token="test-token")
+    with TestClient(app) as client:
+        terminal = _run_prompt(client, "turn-1", "q1")
+
+    assert terminal["failed"] == {"reason": "AgentRunFailed", "message": "agent run failed", "retryable": False}
+
+
+def test_orka_fatal_run_failure_rebuilds_runtime_and_keeps_history():
+    broken = ScriptedRuntime("a1", AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True))
+    rebuilt = ScriptedRuntime("a3")
+    app = create_orka_app(_spec(), ScriptedFactory(broken, rebuilt), auth_token="test-token")
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-2", "q2")["failed"]["reason"] == "MCPToolProtocolError"
+        assert _run_prompt(client, "turn-3", "q3")["type"] == "TurnCompleted"
+        health = client.get("/v1/health").json()
+
+    assert broken.closed
+    assert rebuilt.requests[0].history == (
+        ConversationTurn(role="user", text="q1"),
+        ConversationTurn(role="assistant", text="a1"),
+    )
+    assert (health["status"], health["ready"]) == ("ok", True)
+
+
+def test_orka_fatal_error_inside_exception_group_rebuilds_runtime():
+    fatal = AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True)
+    broken = ScriptedRuntime(ExceptionGroup("parallel tools", [fatal]))
+    rebuilt = ScriptedRuntime("a2")
+    app = create_orka_app(_spec(), ScriptedFactory(broken, rebuilt), auth_token="test-token")
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["failed"]["reason"] == "MCPToolProtocolError"
+        assert _run_prompt(client, "turn-2", "q2")["type"] == "TurnCompleted"
+
+    assert broken.closed
+    assert [request.prompt for request in rebuilt.requests] == ["q2"]
+
+
+def test_orka_history_survives_failed_rebuild():
+    broken = ScriptedRuntime("a1", AgentRunError("MCP tool protocol failed", code="MCPToolProtocolError", fatal=True))
+    rebuilt = ScriptedRuntime("a4")
+    factory = ScriptedFactory(broken, FailingStartRuntime(RuntimeError("tool unreachable")), rebuilt)
+    app = create_orka_app(_spec(), factory, auth_token="test-token")
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-2", "q2")["failed"]["reason"] == "MCPToolProtocolError"
+        assert _run_prompt(client, "turn-3", "q3")["failed"]["reason"] == "RuntimeStartFailed"
+        assert _run_prompt(client, "turn-4", "q4")["type"] == "TurnCompleted"
+
+    assert rebuilt.requests[0].history == (
+        ConversationTurn(role="user", text="q1"),
+        ConversationTurn(role="assistant", text="a1"),
+    )
+
+
+def test_orka_failed_start_does_not_store_or_evict_history():
+    reopened = ScriptedRuntime("a2")
+    factory = ScriptedFactory(ScriptedRuntime("a1"), FailingStartRuntime(RuntimeError("tool unreachable")), reopened)
+    app = create_orka_app(_spec(), factory, auth_token="test-token", max_runtime_sessions=1, max_session_histories=1)
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        failed = _run_prompt(client, "turn-2", "o1", runtime_session_id="runtime-session-2")
+        stored = list(client.app.state.session_histories)
+        assert _run_prompt(client, "turn-3", "q2")["type"] == "TurnCompleted"
+
+    assert failed["failed"]["reason"] == "RuntimeStartFailed"
+    assert stored == ["runtime-session-1"]
+    assert reopened.requests[0].history == (
+        ConversationTurn(role="user", text="q1"),
+        ConversationTurn(role="assistant", text="a1"),
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("client setup failed for https://tool.example/mcp?key=private-key"),
+        AgentRunError("tool startup failed with private-key", status=502, code="MCPToolProtocolError"),
+    ],
+)
+def test_orka_runtime_build_failure_reports_runtime_start_failed(error, caplog):
+    class FailingFactory:
+        def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+            raise error
+
+    app = create_orka_app(_spec(), FailingFactory(), auth_token="test-token")
+    with TestClient(app) as client:
+        terminal = _run_prompt(client, "turn-1", "q1")
+
+    assert terminal["failed"] == {"reason": "RuntimeStartFailed", "message": "runtime failed to start", "retryable": False}
+    assert "private-key" not in caplog.text
+
+
+def test_orka_runtime_build_failure_preserves_configuration_guidance():
+    class FailingFactory:
+        def build_runtime(self, spec: AgentSpec) -> RuntimeSession:
+            raise orka_module.AgentBuildError("required model env var is missing")
+
+    app = create_orka_app(_spec(), FailingFactory(), auth_token="test-token")
+    with TestClient(app) as client:
+        terminal = _run_prompt(client, "turn-1", "q1")
+
+    assert terminal["failed"] == {
+        "reason": "AgentBuildError",
+        "message": "required model env var is missing",
+        "retryable": False,
+    }
+
+
+def test_orka_history_survives_runtime_capacity_eviction():
+    first = ScriptedRuntime("a1")
+    other = ScriptedRuntime("b1")
+    reopened = ScriptedRuntime("a2")
+    app = create_orka_app(_spec(), ScriptedFactory(first, other, reopened), auth_token="test-token", max_runtime_sessions=1)
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-2", "o1", runtime_session_id="runtime-session-2")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-3", "q2")["type"] == "TurnCompleted"
+
+    assert first.closed
+    assert reopened.requests[0].history == (
+        ConversationTurn(role="user", text="q1"),
+        ConversationTurn(role="assistant", text="a1"),
+    )
+
+
+def test_orka_session_history_retention_is_bounded():
+    app = create_orka_app(
+        _spec(),
+        ScriptedFactory(ScriptedRuntime("a1"), ScriptedRuntime("b1"), reopened := ScriptedRuntime("a2")),
+        auth_token="test-token",
+        max_runtime_sessions=1,
+        max_session_histories=1,
+    )
+
+    with TestClient(app) as client:
+        assert _run_prompt(client, "turn-1", "q1")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-2", "o1", runtime_session_id="runtime-session-2")["type"] == "TurnCompleted"
+        assert _run_prompt(client, "turn-3", "q2")["type"] == "TurnCompleted"
+
+    assert reopened.requests[0].history == ()
+
+
+def test_orka_session_history_drops_oldest_turns_over_byte_budget():
+    session = ScriptedRuntime("a1", "a2", "a3", "a4")
+    app = create_orka_app(_spec(), ScriptedFactory(session), auth_token="test-token", max_session_history_bytes=10)
+
+    with TestClient(app) as client:
+        for index in (1, 2, 3, 4):
+            assert _run_prompt(client, f"turn-{index}", f"q{index}")["type"] == "TurnCompleted"
+        stored = tuple(client.app.state.session_histories["runtime-session-1"])
+
+    def turns(*numbers: int) -> tuple[ConversationTurn, ...]:
+        return tuple(
+            turn
+            for number in numbers
+            for turn in (ConversationTurn(role="user", text=f"q{number}"), ConversationTurn(role="assistant", text=f"a{number}"))
+        )
+
+    # Each completed turn is 4 bytes; a third stored turn would exceed 10 bytes.
+    assert [request.history for request in session.requests] == [(), turns(1), turns(1, 2), turns(2, 3)]
+    assert stored == turns(3, 4)
+
+
+def test_orka_session_history_limit_never_drops_live_sessions():
+    runtimes = [ScriptedRuntime(text) for text in ("a1", "b1", "c1")]
+    app = create_orka_app(_spec(), ScriptedFactory(*runtimes), auth_token="test-token", max_runtime_sessions=2, max_session_histories=1)
+
+    with TestClient(app) as client:
+        for index in (1, 2, 3):
+            session = f"runtime-session-{index}"
+            assert _run_prompt(client, f"turn-{index}", f"q{index}", runtime_session_id=session)["type"] == "TurnCompleted"
+        retained = list(client.app.state.session_histories)
+        live = set(client.app.state.active_runtimes)
+
+    # The limit rises to the runtime session limit; the evicted session goes.
+    assert retained == ["runtime-session-2", "runtime-session-3"]
+    assert live == set(retained)

@@ -12,7 +12,8 @@ license = { text = "MIT" }
 authors = [{ name = "AgentKit" }]
 dependencies = [
     "langchain>=1.2,<2",
-    "langgraph>=1.1,<2",
+    # langgraph-prebuilt 1.0.13 allows langgraph 1.1.0 but needs 1.1.5 APIs.
+    "langgraph>=1.1.5,<2",
     "langchain-openai>=1.0,<2",
     "langchain-mcp-adapters>=0.2,<1",
     "mcp>=1.24,<2.0.0a0",

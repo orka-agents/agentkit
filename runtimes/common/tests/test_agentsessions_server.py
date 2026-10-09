@@ -39,7 +39,7 @@ async def _running_server(binding_file):
 
     gate = _CleanupGate()
 
-    async def runner(binding, request):
+    async def runner(binding, request, exchange):
         gate.entered.set()
         try:
             await asyncio.Future()
@@ -92,9 +92,17 @@ async def _assert_transport_stopped(stub):
 
     # A rejected native RPC proves transport shutdown has taken effect without
     # relying on a scheduling sleep or inspecting the service's owner tasks.
-    with pytest.raises(grpc.aio.AioRpcError) as failure:
-        await stub.Describe(h.DescribeRequest(), timeout=_TIMEOUT)
-    assert failure.value.code() in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED}
+    # Native stop runs in an owner task, so an RPC sent right after stop() is
+    # scheduled can still be admitted; only a timely rejection is required.
+    async def rejected() -> grpc.aio.AioRpcError:
+        while True:
+            try:
+                await stub.Describe(h.DescribeRequest(), timeout=_TIMEOUT)
+            except grpc.aio.AioRpcError as exc:
+                return exc
+
+    failure = await asyncio.wait_for(rejected(), _TIMEOUT)
+    assert failure.code() in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED}
 
 
 def test_create_server_stop_waits_for_runner_cleanup(binding_file):

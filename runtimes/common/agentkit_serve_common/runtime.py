@@ -46,16 +46,38 @@ class AgentRunError(Exception):
 
     The server maps this to the OpenAI error envelope WITHOUT importing any
     framework or model-SDK type — keeping ``server.py`` framework-agnostic. The
-    optional ``code`` lets an adapter preserve the ORIGINAL framework exception's
-    class name in the envelope's ``error.code`` field (e.g. pydantic-ai's
-    ``ModelHTTPError``); when ``None``, the server falls back to this class name
-    (``AgentRunError``).
+    message and optional ``code`` are runtime-owned and reach clients verbatim, so
+    they must never carry framework or upstream text; when ``code`` is ``None``,
+    the server falls back to this class name (``AgentRunError``). ``fatal`` marks
+    a runtime session that cannot serve another run, such as one whose stdio MCP
+    subprocess exited.
     """
 
-    def __init__(self, message: str, status: int = 502, code: str | None = None) -> None:
+    def __init__(self, message: str, status: int = 502, code: str | None = None, *, fatal: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.fatal = fatal
+
+
+class RuntimeHealth:
+    """Liveness of a protocol skin's long-lived runtime session.
+
+    Skins record each run failure; once a fatal one is seen, their health probes
+    fail so the platform replaces the container instead of routing more requests
+    to a runtime that cannot recover in place.
+    """
+
+    def __init__(self) -> None:
+        self.failure_code: str | None = None
+
+    @property
+    def healthy(self) -> bool:
+        return self.failure_code is None
+
+    def record(self, exc: BaseException) -> None:
+        if isinstance(exc, AgentRunError) and exc.fatal and self.failure_code is None:
+            self.failure_code = exc.code or exc.__class__.__name__
 
 
 @dataclass(frozen=True)

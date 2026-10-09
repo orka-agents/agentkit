@@ -108,8 +108,10 @@ Run the shared offline/live entrypoint from the AgentKit checkout:
 scripts/orka-harness-v2-e2e.sh offline
 scripts/orka-harness-v2-e2e.sh offline microsoft-agent-framework
 
-# Live uses Microsoft Agent Framework and existing local Vekil authentication.
-VEKIL_CACHE_DIR="$HOME/.config/vekil" scripts/orka-harness-v2-e2e.sh live
+# Live defaults to all three adapters against a bundled local AIKit model.
+scripts/orka-harness-v2-e2e.sh live
+scripts/orka-harness-v2-e2e.sh live pydantic-ai
+scripts/orka-harness-v2-e2e.sh live langgraph
 ```
 
 Run in a Linux shell on the Docker daemon's host so the runner and daemon share
@@ -146,15 +148,22 @@ A passing offline run requires these observable results:
 - wrong authentication, fences, model, or config identity start no unauthorized
   provider/tool work, and session cleanup removes the child and private paths.
 
-Live mode uses Copilot through
-`ghcr.io/sozercan/vekil:v0.14.10@sha256:656eb73f6eeea2ca0c1277cdd7bb8eede72efc5cac2450cdc30a3b94bda44d4b`.
-Supply `COPILOT_GITHUB_TOKEN` through the environment, or leave it unset and use
-`VEKIL_CACHE_DIR` for an existing local auth cache. The live assertions require a
-real model response, an MCP tool receipt, and a second successful prompt in the
-same session. Offline scenarios remain the deterministic lifecycle checks.
-Configured authentication, readiness, and inference errors fail the live run.
-CI reports an explicit skip when repository secret access is unavailable; that
-skip is not evidence of live coverage.
+Live mode runs `ghcr.io/kaito-project/aikit/qwen3.5:2b`, pinned by digest in
+`scripts/aikit-e2e-common.sh`, directly on the run-owned Docker network.
+It requires no provider credentials and makes no external inference calls.
+`test/aikit-e2e/model.yaml` configures bounded CPU inference, greedy sampling,
+and native tool templates. The runner warms the model before the timed turns.
+Both modes accept an optional adapter argument; `maf` aliases
+`microsoft-agent-framework`. Each live adapter must produce a real model response,
+return an exact MCP tool receipt, continue the same session with a second
+successful prompt, and cancel during a blocking tool.
+The live provider bridge removes the OpenAI `strict` tool-schema hint because
+LocalAI 4.10 treats it as forced tool-only generation even with automatic tool
+choice. Tool definitions and parameters, provider history, and v2 assertions
+remain unchanged. Offline scenarios remain the deterministic failure and
+deadline checks.
+Readiness and inference errors fail the live run; CI does not skip live coverage
+based on repository secrets.
 
 Set `ARTIFACT_DIR` to retain sanitized JSON results, for example:
 
@@ -202,6 +211,26 @@ emits Orka-native `HarnessEventFrame` SSE frames and exactly one terminal frame
 servers continue to execute inside the runtime; Orka observes the run and remains
 responsible for policy, approvals, trust tiers, Tool CRDs, idempotency, and
 side-effect governance.
+
+Orka sends only the new prompt for each turn. AgentKit keeps the completed
+user/assistant turns of each `runtimeSessionID` and passes them to the runtime as
+history, so every runtime adapter continues a session the same way. Failed and
+cancelled turns are not added. If a run reports a fatal runtime failure, such as
+an MCP tool session closing, the next turn in that runtime session builds a
+fresh runtime with the same history. History is kept apart from runtimes, so a
+session also keeps it when its runtime is evicted for capacity
+(`AGENTKIT_ORKA_MAX_RUNTIME_SESSIONS`, default 64) or fails to restart. AgentKit
+keeps the history of up to `AGENTKIT_ORKA_MAX_SESSION_HISTORIES` sessions
+(default 256, never fewer than the runtime session limit) and drops the least
+recently used session without a live runtime first. Each session's history is
+capped at `AGENTKIT_ORKA_MAX_SESSION_HISTORY_BYTES` of text (default 1 MiB);
+past that, the oldest completed turns are dropped.
+
+Runtimes start lazily on a session's first turn. If one fails to start, for
+example because a remote MCP tool rejects its credential, the turn fails with
+`RuntimeStartFailed`. Tool clients put credential-bearing URLs and upstream
+bodies in startup errors, so the AgentKit log records only the exception types.
+Configuration errors such as a missing env var keep their own message.
 
 Current AgentKit Serve Orka support is **observed mode by default**. The default
 capability response intentionally omits `brokeredToolClasses` and
@@ -386,6 +415,17 @@ AgentKit responds with Orka `CancelTurnResponse`:
   "message": "cancel accepted"
 }
 ```
+
+Rejected requests use Orka's native error body, `{"error": "<message>"}`.
+Starting a turn whose `turnID` is still running returns 409
+`turn already exists`; a retained terminal turn returns 409
+`turn already completed`; and a start while another turn runs returns 409
+`maximum concurrent turns reached`. Orka's client matches these exact messages.
+
+CI runs Orka's own AgentKit conformance suite
+(`internal/harness/conformance`, `TestExternalAgentKitServe*`) at the pinned
+`test/orka-harness-v2/orka-revision` against this checkout's
+`create_orka_app`.
 
 ## Offline smoke coverage
 

@@ -52,6 +52,7 @@ from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AgentBuildError,
     declared_tool_env,
+    mcp_tool_protocol_error,
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
@@ -60,10 +61,10 @@ from agentkit_serve_common.adapter_support import (
     same_origin_mcp_httpx_client_factory,
     split_tool_command,
 )
+from agentkit_serve_common.agentsessions import ExecutionExchange, VerifiedAgentsessionsBinding
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
-    AgentRunError,
     OfflineEchoRuntimeFactory,
     RunResult,
     RuntimeSession,
@@ -119,11 +120,11 @@ async def _process_mcp_tool_call(ctx: Any, call_tool: Any, name: str, args: dict
         _, remaining = exc.split(ToolError)
         if remaining is None:
             raise ModelRetry("MCP tool execution failed") from None
-        raise AgentRunError("MCP tool protocol failed") from None
-    except Exception:
+        raise mcp_tool_protocol_error(remaining) from None
+    except Exception as exc:
         # Recent Pydantic AI versions also retry JSON-RPC errors by default.
         # Authorization, protocol and transport failures must end this run.
-        raise AgentRunError("MCP tool protocol failed") from None
+        raise mcp_tool_protocol_error(exc) from None
 
 
 def build_tool_server(tool: ToolSpec) -> Any:
@@ -190,21 +191,23 @@ def build_tool_server(tool: ToolSpec) -> Any:
 
 
 def build_agent(spec: AgentSpec) -> Agent:
-    """Assemble the pydantic-ai agent: model + system prompt + stdio MCP toolsets."""
+    """Assemble the pydantic-ai agent: model + stdio MCP toolsets.
+
+    The baked system prompt is sent per run by :class:`PydanticRuntime` instead of
+    as pydantic-ai ``instructions``, which the OpenAI model inserts after any
+    leading client system messages.
+    """
     model = build_model(spec)
     toolsets = [build_tool_server(t) for t in spec.tools]
-    return Agent(
-        model,
-        instructions=spec.instructions,
-        toolsets=toolsets,
-    )
+    return Agent(model, toolsets=toolsets)
 
 
 class PydanticRuntime:
     """RuntimeSession Adapter around a pydantic-ai Agent."""
 
-    def __init__(self, agent: Agent) -> None:
+    def __init__(self, agent: Agent, instructions: str = "") -> None:
         self.agent = agent
+        self.instructions = instructions
 
     async def __aenter__(self) -> RuntimeSession:
         await self.agent.__aenter__()
@@ -219,7 +222,7 @@ class PydanticRuntime:
         return await self.agent.__aexit__(exc_type, exc, tb)
 
     async def run(self, request: RunRequest) -> RunResult:
-        return await run_agent(self.agent, request)
+        return await run_agent(self.agent, request, instructions=self.instructions)
 
 
 def supports_brokered_read() -> bool:
@@ -246,14 +249,74 @@ def build_runtime(spec: AgentSpec) -> RuntimeSession:
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
     validate_supported_spec(spec)
-    return PydanticRuntime(build_agent(spec))
+    return PydanticRuntime(build_agent(spec), instructions=spec.instructions)
 
 
-def _to_message_history(request: RunRequest) -> list:
+async def run_agentsessions(
+    binding: VerifiedAgentsessionsBinding, request: RunRequest, exchange: ExecutionExchange,
+) -> None:
+    """Fresh text-only SDK execution bound exclusively to the local host bridge.
+
+    Config remains opaque on RunRequest; this policy does not interpret it.
+    The controller owns model OUTPUT and usage, so return None, not RunResult.
+    """
+    import httpx
+    from openai import AsyncOpenAI
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    from agentkit_serve_common.agentsessions.bridge import loopback_bridge
+
+    # Unlike the other protocols' conversion, empty turns are authoritative.
+    history = [
+        ModelRequest(parts=[UserPromptPart(content=turn.text)])
+        if turn.role == "user" else ModelResponse(parts=[TextPart(content=turn.text)])
+        for turn in request.history
+    ]
+    prompt = request.prompt if exchange.input_count else None
+    if prompt is None:
+        # SDK run(None) may adopt an existing assistant response. An empty
+        # request forces an invocation without manufacturing an empty user turn.
+        history.append(ModelRequest(parts=[]))
+    async with loopback_bridge(exchange) as local:
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as http:
+            async with AsyncOpenAI(
+                base_url=local.base_url, api_key=local.token,
+                organization="", project="", http_client=http,
+                # Explicit Authorization excludes ambient OPENAI_CUSTOM_HEADERS
+                # overrides, including differently cased authorization names.
+                default_headers={"Authorization": "Bearer " + local.token},
+                # The host owns effect completion/cancellation, not an
+                # unjournaled wall-clock read deadline. Bound loopback connect.
+                max_retries=0, timeout=httpx.Timeout(None, connect=5),
+            ) as client:
+                model = OpenAIChatModel(
+                    binding.spec.model.name,
+                    provider=OpenAIProvider(openai_client=client),
+                    profile={
+                        "openai_chat_streaming_requires_finish_reason": True,
+                        "openai_system_prompt_role": "system",
+                    },
+                )
+                agent = Agent(model, instructions=binding.spec.instructions, retries=0)
+                async with agent:
+                    async with agent.iter(prompt, message_history=history) as run:
+                        async for node in run:
+                            if agent.is_call_tools_node(node):
+                                # The full SDK model request has completed. The
+                                # host already owns its validated text OUTPUT,
+                                # including empty text. Do not enter framework
+                                # output validation/retry or tool execution.
+                                break
+                        else:
+                            raise AgentRunError("agentsessions model execution failed")
+    return None
+
+
+def _to_message_history(request: RunRequest, instructions: str = "") -> list:
     """Map a neutral RunRequest to a pydantic-ai message_history list.
 
-    The agent's own ``instructions`` are applied by pydantic-ai; this function
-    handles only prior conversation turns.
+    The agent's baked ``instructions`` lead, followed by prior conversation turns,
+    so a client system message never precedes the agent's own system prompt.
     """
     # Imported lazily so config-only consumers don't pull the messages module.
     from pydantic_ai.messages import (
@@ -265,6 +328,8 @@ def _to_message_history(request: RunRequest) -> list:
     )
 
     out: list = []
+    if instructions:
+        out.append(ModelRequest(parts=[SystemPromptPart(content=instructions)]))
     for turn in request.history:
         if not turn.text or turn.role not in FORWARDED_ROLES:
             continue
@@ -303,9 +368,9 @@ def _result_usage(result: object) -> dict[str, int]:
     }
 
 
-async def run_agent(agent: Agent, request: RunRequest) -> RunResult:
+async def run_agent(agent: Agent, request: RunRequest, *, instructions: str = "") -> RunResult:
     """Run the pydantic-ai agent and return the neutral result shape."""
-    message_history = _to_message_history(request)
+    message_history = _to_message_history(request, instructions)
     run_options: dict[str, Any] = {"message_history": message_history}
     on_tool_event = request.on_tool_event
     if on_tool_event is not None:

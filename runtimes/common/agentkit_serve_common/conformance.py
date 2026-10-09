@@ -237,26 +237,23 @@ def test_auth_gate_enforced(make_client):
 
 
 def test_run_failure_error_envelope(make_failing_client):
-    """A run failure returns the OpenAI error envelope with status, type, and a
-    code that PRESERVES the adapter's original framework exception class name.
+    """A run failure returns the OpenAI error envelope with a runtime-owned code.
 
     ``make_failing_client(exc)`` wires the offline double to raise ``exc`` from the
-    agent run. The runtime session normalizes it to an ``AgentRunError`` whose
-    ``code`` carries the original class name (e.g. ``RuntimeError`` here), so
-    ``error.code`` is NOT the generic neutral class name — locking the behavior the
-    shared-core refactor must preserve.
+    agent run. Framework exception text can carry upstream bodies and echoed
+    credentials, and its class name differs per adapter, so the envelope reports
+    the same neutral code and message for every adapter.
     """
-    boom = RuntimeError("upstream exploded")
+    boom = RuntimeError("upstream exploded with sk-private-upstream-value")
     with make_failing_client(boom) as c:
         r = c.post(
             "/v1/chat/completions",
             json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
         )
         assert r.status_code == 502  # default for a non-HTTP framework error
-        err = r.json()["error"]
-        assert err["type"] == "agent_error"
-        assert err["code"] == "RuntimeError"  # original class, not "AgentRunError"
-        assert "agent run failed" in err["message"]
+        assert r.json() == {
+            "error": {"message": "agent run failed", "type": "agent_error", "code": "AgentRunFailed"}
+        }
 
 
 def _imported_roots(path: Path) -> set[str]:

@@ -10,12 +10,17 @@ on:
     paths-ignore:
       - ".codex/**"
       - ".claude/**"
+  # Runtime dependencies float within their declared ranges, so a nightly run
+  # surfaces upstream releases that change behavior without blaming a PR.
+  schedule:
+    - cron: "23 7 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # The event name keeps a nightly run on main from cancelling a push run.
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -39,12 +44,20 @@ jobs:
       - name: Validate GitHub Actions and shell syntax
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
-          bash -n scripts/live-copilot-agent-e2e.sh
+          bash -n scripts/live-aikit-agent-e2e.sh
+          bash -n scripts/aikit-e2e-common.sh
+          shellcheck -x scripts/live-aikit-agent-e2e.sh scripts/aikit-e2e-common.sh
           bash -n scripts/orka-harness-v2-e2e.sh
-          shellcheck scripts/orka-harness-v2-e2e.sh
+          shellcheck -x scripts/orka-harness-v2-e2e.sh
+          bash -n scripts/parity-container-smoke.sh
+          shellcheck scripts/parity-container-smoke.sh
           bash -n scripts/generate-agentsessions-stubs.sh
           shellcheck scripts/generate-agentsessions-stubs.sh
+          bash -n scripts/agentsessions-e2e.sh
+          shellcheck scripts/agentsessions-e2e.sh
+          test -z "$(gofmt -l test/agentsessions/*.go)"
           test -z "$(gofmt -l test/orka-harness-v2/probe/*.go)"
+          go test test/orka-harness-v2/probe/localai.go test/orka-harness-v2/probe/localai_test.go
           for script in \
             deploy/foundry/doctor.sh \
             deploy/foundry/toolbox/setup.sh \
@@ -205,6 +218,69 @@ jobs:
       - name: Build Python wheel
         working-directory: ${{ matrix.path }}
         run: .venv/bin/python -m build --wheel
+
+  # Images and the job above install the newest releases in each declared range;
+  # this proves the declared lower bounds still work, parity suite included.
+  python-lowest:
+    name: Python lowest dependencies (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: common
+            path: runtimes/common
+          - package: pydantic-ai adapter
+            path: runtimes/pydantic-ai
+          - package: microsoft-agent-framework adapter
+            path: runtimes/microsoft-agent-framework
+          - package: langgraph adapter
+            path: runtimes/langgraph
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Setup Go for common wire interoperability
+        if: matrix.path == 'runtimes/common'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: test/agentsessions/go.mod
+          cache-dependency-path: test/agentsessions/go.sum
+
+      - name: Install lowest declared direct dependencies
+        working-directory: ${{ matrix.path }}
+        run: |
+          set -euxo pipefail
+          uv venv --python 3.12 .venv
+          # One resolution, so the shared core's own lower bounds apply too.
+          packages=()
+          if [ "${{ matrix.path }}" != "runtimes/common" ]; then
+            packages+=(-e ../common)
+          fi
+          prerelease_args=()
+          if [ "${{ matrix.path }}" = "runtimes/microsoft-agent-framework" ]; then
+            prerelease_args+=(--prerelease=allow)
+          fi
+          uv pip install --python .venv/bin/python --resolution lowest-direct \
+            "${prerelease_args[@]}" "${packages[@]}" -e ".[dev]"
+          uv pip list --python .venv/bin/python
+
+      - name: Run Python tests
+        working-directory: ${{ matrix.path }}
+        run: .venv/bin/python -m pytest -q
 
   container-build:
     name: Container build and offline smoke
@@ -418,50 +494,47 @@ jobs:
           smoke agentkit-smoke-langgraph langgraph-agent:ci 18082
           orka_smoke agentkit-smoke-orka hello-agent:ci 18083
 
-  live-copilot-e2e:
-    name: Live Vekil/Copilot E2E
+      - name: Setup Go for agentsessions replay proof
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: test/agentsessions/go.mod
+          cache-dependency-path: test/agentsessions/go.sum
+
+      - name: Prove keyless agentsessions journal and replay
+        run: |
+          set -euo pipefail
+          make build-test-agent TAG=ci BUILDER= \
+            FIXTURE=test/agentsessions/Agentkitfile.yaml \
+            AGENT_IMAGE=agentkit-agentsessions-text:ci
+          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
+            scripts/agentsessions-e2e.sh --skip-build
+          cd test/agentsessions
+          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
+            go test -v -count=1 -run '^TestRunnerSignalCleanup$' ./...
+
+      - name: Container parity smoke
+        env:
+          TAG: ci
+          BUILDER: ""
+          PLATFORM: linux/amd64
+        run: bash scripts/parity-container-smoke.sh
+
+  live-aikit-e2e:
+    name: Live AIKit E2E (${{ matrix.adapter }})
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [pydantic-ai, microsoft-agent-framework, langgraph]
     env:
-      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-      VEKIL_IMAGE: ghcr.io/sozercan/vekil:v0.14.10@sha256:656eb73f6eeea2ca0c1277cdd7bb8eede72efc5cac2450cdc30a3b94bda44d4b
+      PLATFORM: linux/amd64
+      BUILDER: ""
     steps:
-      - name: Decide whether live Vekil/Copilot E2E can run
-        id: gate
-        env:
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Vekil/Copilot E2E for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "${ACTOR}" = "dependabot[bot]" ] && [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Vekil/Copilot E2E for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live Vekil/Copilot E2E because COPILOT_GITHUB_TOKEN is not configured for this run." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
-      - name: Explain skipped live Vekil/Copilot E2E
-        if: steps.gate.outputs.run != 'true'
-        run: echo "${{ steps.gate.outputs.reason }}"
-
       - name: Checkout
-        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Free disk space for Docker-heavy live E2E
-        if: steps.gate.outputs.run == 'true'
         run: |
           set -euxo pipefail
           echo "Disk usage before cleanup"
@@ -483,14 +556,12 @@ jobs:
           docker system df || true
 
       - name: Setup Go
-        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Setup Docker daemon with containerd image store
-        if: steps.gate.outputs.run == 'true'
         uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
         with:
           daemon-config: |
@@ -501,15 +572,57 @@ jobs:
             }
 
       - name: Configure Docker Buildx daemon builder
-        if: steps.gate.outputs.run == 'true'
         run: |
           docker buildx version
           docker buildx inspect --bootstrap
           echo "BUILDER=" >> "$GITHUB_ENV"
 
-      - name: Run live Vekil-backed AgentKit E2E
-        if: steps.gate.outputs.run == 'true'
-        run: bash scripts/live-copilot-agent-e2e.sh
+      - name: Run live AIKit-backed AgentKit E2E
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+        run: bash scripts/live-aikit-agent-e2e.sh "$ADAPTER"
+
+  orka-v1-conformance:
+    name: Orka harness v1 conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Read pinned Orka revision
+        id: orka
+        run: |
+          revision="$(cat test/orka-harness-v2/orka-revision)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned Orka
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: orka-agents/orka
+          ref: ${{ steps.orka.outputs.revision }}
+          path: orka
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: orka/go.mod
+          cache-dependency-path: orka/go.sum
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      # Orka's suite starts this checkout's create_orka_app with uv and drives
+      # observed and brokered turns through Orka's own harness client.
+      - name: Run Orka's AgentKit conformance suite
+        working-directory: orka
+        env:
+          AGENTKIT_SERVE_ROOT: ${{ github.workspace }}
+        run: go test ./internal/harness/conformance -run 'TestExternalAgentKitServe' -count=1 -v
 
   orka-v2-offline:
     name: Harness v2 E2E (${{ matrix.adapter }})
@@ -559,54 +672,27 @@ jobs:
           retention-days: 7
 
   orka-v2-live:
-    name: Live harness v2 E2E (microsoft-agent-framework)
+    name: Live AIKit harness v2 E2E (${{ matrix.adapter }})
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [pydantic-ai, microsoft-agent-framework, langgraph]
     env:
       PLATFORM: linux/amd64
       BUILDER: ""
     steps:
-      - name: Decide whether live harness v2 E2E can run
-        id: gate
-        env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$IS_FORK" = true ]; then
-            echo 'run=false' >> "$GITHUB_OUTPUT"
-            echo 'reason=Skipped live harness v2 E2E for a fork pull request; repository secrets are unavailable. No live scenarios executed.' >> "$GITHUB_OUTPUT"
-          elif [ "$ACTOR" = 'dependabot[bot]' ] && [ -z "$COPILOT_GITHUB_TOKEN" ]; then
-            echo 'run=false' >> "$GITHUB_OUTPUT"
-            echo 'reason=Skipped live harness v2 E2E for Dependabot; repository secrets are unavailable. No live scenarios executed.' >> "$GITHUB_OUTPUT"
-          elif [ -z "$COPILOT_GITHUB_TOKEN" ]; then
-            echo 'run=false' >> "$GITHUB_OUTPUT"
-            echo 'reason=Skipped live harness v2 E2E because COPILOT_GITHUB_TOKEN is not configured. No live scenarios executed.' >> "$GITHUB_OUTPUT"
-          else
-            echo 'run=true' >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Explain skipped live harness v2 coverage
-        if: steps.gate.outputs.run != 'true'
-        env:
-          SKIP_REASON: ${{ steps.gate.outputs.reason }}
-        run: |
-          printf '%s\n' "$SKIP_REASON"
-          printf '%s\n' "$SKIP_REASON" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Checkout
-        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Go
-        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: test/orka-harness-v2/probe/go.mod
           cache: true
 
       - name: Setup Docker daemon with containerd image store
-        if: steps.gate.outputs.run == 'true'
         uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
         with:
           daemon-config: |
@@ -617,18 +703,17 @@ jobs:
             }
 
       - name: Run live composed harness v2 E2E
-        if: steps.gate.outputs.run == 'true'
         timeout-minutes: 65
         env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          ADAPTER: ${{ matrix.adapter }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentkit-orka-v2-live
-        run: bash scripts/orka-harness-v2-e2e.sh live
+        run: bash scripts/orka-harness-v2-e2e.sh live "$ADAPTER"
 
       - name: Upload safe live harness v2 results
-        if: always() && steps.gate.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: orka-v2-live-microsoft-agent-framework
+          name: orka-v2-live-${{ matrix.adapter }}
           path: ${{ runner.temp }}/agentkit-orka-v2-live
           if-no-files-found: warn
           retention-days: 7
