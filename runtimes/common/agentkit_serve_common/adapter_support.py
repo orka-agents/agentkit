@@ -39,6 +39,8 @@ NO_AUTH_API_KEY = "not-needed"
 MODEL_API_ENV = "AGENTKIT_MODEL_API"
 MODEL_APIS = ("chat_completions", "responses")
 ModelAPI = Literal["chat_completions", "responses"]
+MODEL_API_CHOICES = (*MODEL_APIS, "auto")
+ModelAPISelection = Literal["chat_completions", "responses", "auto"]
 
 
 MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
@@ -54,14 +56,14 @@ class AgentBuildError(Exception):
 
 def resolve_model_api(
     *, supported: Collection[str] | None = None, runtime: str = "this runtime",
-) -> ModelAPI:
+) -> ModelAPISelection:
     """Resolve the startup-only model protocol, never per-turn environment data."""
     value = os.environ.get(MODEL_API_ENV, "chat_completions")
-    if value not in MODEL_APIS:
-        raise AgentBuildError(f"{MODEL_API_ENV} must be chat_completions or responses")
+    if value not in MODEL_API_CHOICES:
+        raise AgentBuildError(f"{MODEL_API_ENV} must be chat_completions, responses, or auto")
     if supported is not None and value not in supported:
         raise AgentBuildError(f"{runtime} does not support {MODEL_API_ENV}={value}")
-    return cast(ModelAPI, value)
+    return cast(ModelAPISelection, value)
 
 
 def _attach_secondary_error(

@@ -29,6 +29,8 @@ or LangGraph.
 - `adapter_support.py` — API-key resolution, declared-only tool env projection,
   remote MCP URL/header/auth resolution, MCP HTTP client factories, MCP timeout
   parsing, and framework exception normalization.
+- `model_api_auto.py` defines the authoritative initial rejection classifier,
+  first-real-request negotiation, API cache, and resource cleanup before fallback.
 - `conformance.py` — shared HTTP behavior tests imported by adapter test suites.
 
 ## Adapter seam
@@ -47,8 +49,21 @@ This keeps framework dependency lock-in inside each adapter's `agent_factory.py`
 `AGENTKIT_PROTOCOL=openai` serves Chat Completions and Responses together. Both
 routes use the same runtime session, baked tools, auth, health state, and app
 lifespan. `AGENTKIT_MODEL_API` selects only the upstream model API:
-`chat_completions` by default or explicit `responses`, with no `auto` or fallback.
-It neither selects nor disables either client route.
+`chat_completions` by default, explicit `responses`, or opt-in `auto`. It neither
+selects nor disables either client route. Explicit selectors never fall back.
+
+Use `AGENTKIT_MODEL_API=auto` to send the first real request to Responses, without
+a separate probe. Only a recognized initial unsupported endpoint/API rejection
+permits one Chat retry. Unknown 404s, missing models, 401/403/429, timeouts, and
+generic 5xx errors do not trigger fallback. Auto caches the concrete API for the
+runtime/backend/model lifetime. Once any Responses HTTP request is accepted,
+including streaming or malformed/incomplete output, no later switch is allowed.
+A permitted retry closes the rejected Responses runtime and tool resources
+before starting Chat, preserves history and tools, and keeps upstream Responses
+`store: false`. See [the rejection rules](../../docs/runtime-adapters.md#model-endpoint-compatibility).
+
+Foundry brokered auto persists the concrete API and restores it for
+continuations. Explicit API mismatch protections remain unchanged.
 
 `POST /v1/responses` accepts text `input` or a message array ending in a user
 message. It supports system/developer/user/assistant roles, `input_text` and

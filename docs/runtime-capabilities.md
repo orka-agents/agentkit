@@ -95,17 +95,29 @@ hooks have matching conformance coverage.
 
 `AGENTKIT_MODEL_API` is a shared startup selector for the upstream model API.
 All three runtime adapters and the Foundry brokered model loop support
-`chat_completions`, the default, and `responses`. This choice is independent of
-local/container deployment, inbound HTTP/ACP protocol, and MAF model auth mode.
+`chat_completions`, the default, explicit `responses`, and opt-in `auto`.
+This choice is independent of local/container deployment, inbound HTTP/ACP
+protocol, and MAF model auth mode.
 MAF supports both APIs with API keys, token hooks, and its Azure project-credential
 fallback. LangGraph explicitly sets its SDK transport so ambient LangChain
 settings cannot override this selector.
 
-Responses requires a backend that implements `/responses`; Chat requires
-`/chat/completions`. There is no `auto` value; AgentKit does not probe or silently
-switch APIs. Both inbound routes remain available with either selector. Invalid
-selector values fail before client/auth initialization. The separate
-`agentsessions` host-mediated model contract remains Chat-only. Native Anthropic
+Explicit Responses requires a backend that implements `/responses`; explicit
+Chat requires `/chat/completions`. Neither explicit selector falls back. Use
+`AGENTKIT_MODEL_API=auto` to send the first real request to Responses without a
+separate probe. Only a recognized initial endpoint/API rejection allows one
+Chat retry. The concrete choice is cached per runtime/backend/model lifetime;
+acceptance locks Responses even if a stream or output later fails. Unknown
+404s, missing models, auth/rate-limit errors, timeouts, and generic 5xx failures
+never trigger fallback. History, tools, and upstream Responses `store: false`
+are preserved, and rejected Responses resources close before Chat starts.
+See [the exact rejection rules](runtime-adapters.md#model-endpoint-compatibility).
+
+Foundry brokered auto persists the concrete API for continuation and restores
+it on resume. Explicit mismatch protections remain in place. Both inbound
+routes remain available with every selector. Invalid selector values fail
+before client/auth initialization. The separate `agentsessions` host-mediated
+model contract remains Chat-only. Native Anthropic
 Messages is not supported. This selector does not change the agent.yaml model
 ABI or the endpoints AgentKit exposes.
 

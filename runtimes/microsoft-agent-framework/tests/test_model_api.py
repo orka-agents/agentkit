@@ -1,4 +1,4 @@
-"""Startup model API selection across non-brokered MAF auth paths."""
+"""Model API selection and auto-runtime wiring across MAF auth paths."""
 
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import RunRequest
 
 
-def _spec(*, workload_identity: bool = False) -> AgentSpec:
+def _spec(*, workload_identity: bool = False, api_key: bool = False) -> AgentSpec:
     model = {
         "provider": "openai-compatible",
         "baseURL": "https://example.services.ai.azure.com/api/projects/test/openai/v1",
         "name": "test-model",
     }
+    if api_key:
+        model["apiKeyEnv"] = "OPENAI_API_KEY"
     if workload_identity:
         model["auth"] = {"type": "workload-identity-token", "audience": "https://ai.azure.com/.default"}
     return AgentSpec.model_validate({
@@ -32,7 +34,7 @@ def _spec(*, workload_identity: bool = False) -> AgentSpec:
     })
 
 
-@pytest.fixture(params=["api-key", "model-token", "generic-token", "foundry"])
+@pytest.fixture(params=["no-auth", "api-key", "model-token", "generic-token", "generic-token-command", "foundry"])
 def auth_path(monkeypatch, request):
     for name in (
         "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
@@ -43,6 +45,8 @@ def auth_path(monkeypatch, request):
     if request.param == "model-token":
         monkeypatch.setenv("AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN", "test-token")
     elif request.param == "generic-token":
+        monkeypatch.setenv("AGENTKIT_WORKLOAD_IDENTITY_TOKEN", "test-token")
+    elif request.param == "generic-token-command":
         monkeypatch.setenv("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND", "/unused/token-command")
     return request.param
 
@@ -66,13 +70,13 @@ def model_dependencies(monkeypatch):
     return dependencies
 
 
-@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses", "invalid-api"])
+@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses", "auto", "invalid-api"])
 def test_build_client_honors_auth_path_api_capability(monkeypatch, model_api, auth_path, model_dependencies):
     monkeypatch.delenv("AGENTKIT_MODEL_API", raising=False)
     if model_api is not None:
         monkeypatch.setenv("AGENTKIT_MODEL_API", model_api)
-    spec = _spec(workload_identity=auth_path != "api-key")
-    effective = model_api or "chat_completions"
+    spec = _spec(workload_identity=auth_path not in {"no-auth", "api-key"}, api_key=auth_path == "api-key")
+    effective = "responses" if model_api == "auto" else model_api or "chat_completions"
     deps = model_dependencies
     if effective == "invalid-api":
         with pytest.raises(agent_factory.AgentBuildError, match="AGENTKIT_MODEL_API"):
@@ -100,7 +104,7 @@ def test_build_client_honors_auth_path_api_capability(monkeypatch, model_api, au
             assert client.project_client is deps.foundry.return_value.project_client
     else:
         assert client is selected.return_value
-        key = deps.api_key.return_value if auth_path == "api-key" else deps.token_provider.return_value
+        key = deps.api_key.return_value if auth_path in {"no-auth", "api-key"} else deps.token_provider.return_value
         selected.assert_called_once_with(model="test-model", base_url=spec.model.base_url, api_key=key)
         deps.credential.assert_not_called()
         deps.foundry.assert_not_called()
@@ -362,3 +366,294 @@ def test_responses_does_not_execute_tools_from_an_unfinished_result(monkeypatch,
     asyncio.run(run())
     assert calls == []
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("model_api", ["responses", "chat_completions"])
+def test_build_client_wraps_only_sdk_responses_resource(
+    monkeypatch, model_api, auth_path, model_dependencies,
+):
+    # The concrete candidate is selected by the runtime, not a later env read.
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "invalid-api")
+    spec = _spec(workload_identity=auth_path not in {"no-auth", "api-key"}, api_key=auth_path == "api-key")
+    deps = model_dependencies
+    selected = deps.responses if model_api == "responses" else deps.chat
+    if auth_path == "foundry":
+        sdk_client = deps.foundry.return_value.client
+        selected.return_value.client = sdk_client
+        project_client = deps.foundry.return_value.project_client
+    else:
+        sdk_client = selected.return_value.client
+    resource = sdk_client.responses
+    proxy = object()
+    state = SimpleNamespace(selected=None, wrap_responses=mock.Mock(return_value=proxy))
+
+    client = agent_factory.build_client(spec, model_api=model_api, auto_state=state)
+
+    state.wrap_responses.assert_called_once_with(resource, client=sdk_client)
+    assert client.client is sdk_client
+    assert sdk_client.responses is proxy
+    assert state.selected is None
+    assert os.environ["AGENTKIT_MODEL_API"] == "invalid-api"
+    if auth_path == "foundry":
+        assert client.project_client is project_client
+        assert deps.foundry.return_value.client is sdk_client
+    (deps.chat if model_api == "responses" else deps.responses).assert_not_called()
+
+
+@pytest.mark.parametrize("model_api", ["responses", "chat_completions"])
+@pytest.mark.parametrize("prebuilt_client", [False, True])
+def test_build_agent_forwards_auto_state_preserving_context_and_store(
+    monkeypatch, model_api, prebuilt_client,
+):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "invalid-api")
+    spec = _spec()
+    state = SimpleNamespace(wrap_responses=mock.Mock())
+    client = SimpleNamespace(STORES_BY_DEFAULT=model_api == "responses")
+    client_builder = mock.Mock(return_value=client)
+    constructor = mock.Mock()
+    monkeypatch.setattr(agent_factory, "build_client", client_builder)
+    monkeypatch.setattr(agent_factory, "Agent", constructor)
+    context = object()
+
+    agent = agent_factory.build_agent(
+        spec,
+        client=client if prebuilt_client else None,
+        context_providers=[context],
+        model_api=model_api,
+        auto_state=state,
+    )
+
+    assert agent is constructor.return_value
+    if prebuilt_client:
+        client_builder.assert_not_called()
+    else:
+        client_builder.assert_called_once_with(spec, model_api=model_api, auto_state=state)
+    state.wrap_responses.assert_not_called()
+    options = constructor.call_args.kwargs
+    assert options["client"] is client
+    assert options["default_options"] == ({"store": False} if model_api == "responses" else None)
+    assert isinstance(options["context_providers"][0], agent_factory._RequestHistoryProvider)
+    assert options["context_providers"][1:] == [context]
+
+
+def test_auto_build_runtime_supplies_concrete_candidates_without_env_mutation(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+    monkeypatch.setattr(agent_factory, "offline_orka_echo_enabled", lambda: False)
+    candidate = mock.Mock()
+    wrapper = mock.Mock()
+    monkeypatch.setattr(agent_factory, "MAFRuntime", candidate)
+    monkeypatch.setattr(agent_factory, "AutoModelRuntime", wrapper)
+    spec = _spec()
+    state = object()
+    environment = dict(os.environ)
+
+    runtime = agent_factory.build_runtime(spec)
+
+    assert runtime is wrapper.return_value
+    candidate.assert_not_called()
+    factory = wrapper.call_args.args[0]
+    factory("responses", state)
+    factory("chat_completions", None)
+    assert candidate.call_args_list == [
+        mock.call(spec, model_api="responses", auto_state=state),
+        mock.call(spec, model_api="chat_completions", auto_state=None),
+    ]
+    assert dict(os.environ) == environment
+
+
+@pytest.mark.parametrize("model_api", ["responses", "chat_completions"])
+def test_runtime_forwards_concrete_selection_and_auto_state(monkeypatch, model_api):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "invalid-api")
+    state = object()
+    runtime = agent_factory.MAFRuntime(_spec(), model_api=model_api, auto_state=state)
+    contexts = [object()]
+    client = object()
+    monkeypatch.setattr(runtime, "_build_context_providers", mock.AsyncMock(return_value=contexts))
+    monkeypatch.setattr(runtime, "_build_model_fallback_client", mock.AsyncMock(return_value=client))
+    agent = mock.MagicMock()
+    builder = mock.Mock(return_value=agent)
+    monkeypatch.setattr(agent_factory, "build_agent", builder)
+
+    async def run():
+        async with runtime:
+            builder.assert_called_once_with(
+                runtime.spec,
+                context_providers=contexts,
+                stack=runtime.stack,
+                client=client,
+                model_api=model_api,
+                auto_state=state,
+            )
+
+    asyncio.run(run())
+    agent.__aenter__.assert_awaited_once()
+    agent.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.parametrize("model_api", ["responses", "chat_completions"])
+@pytest.mark.parametrize("fail_at", [None, "project", "model", "agent"])
+def test_auto_project_candidate_preserves_owned_resource_cleanup(monkeypatch, model_api, fail_at):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+    for name in (
+        "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
+        "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
+        "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    events = []
+    resources = {}
+    startup_error = RuntimeError("partial enter failed")
+    proxy = object()
+    state = SimpleNamespace(selected=None, wrap_responses=mock.Mock(return_value=proxy))
+
+    class Credential:
+        def close(self):
+            events.append("credential-close")
+
+    class Resource:
+        def __init__(self, name):
+            self.name = name
+            resources[name] = self
+
+        async def __aenter__(self):
+            events.append(f"{self.name}-enter")
+            if fail_at == self.name:
+                raise startup_error
+            return self
+
+        async def __aexit__(self, *args):
+            events.append(f"{self.name}-exit")
+
+    class FoundryClient:
+        STORES_BY_DEFAULT = True
+
+        def __init__(self, **kwargs):
+            self.client = Resource("model")
+            self.client.responses = object()
+            self.project_client = Resource("project")
+
+    class ChatClient:
+        STORES_BY_DEFAULT = False
+
+        def __init__(self, *, model, async_client):
+            self.client = async_client
+
+    constructor = mock.Mock(side_effect=lambda **kwargs: Resource("agent"))
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", Credential)
+    monkeypatch.setattr("agent_framework.foundry.FoundryChatClient", FoundryClient)
+    monkeypatch.setattr(agent_factory, "OpenAIChatCompletionClient", ChatClient)
+    monkeypatch.setattr(agent_factory, "Agent", constructor)
+
+    async def run():
+        runtime = agent_factory.MAFRuntime(
+            _spec(workload_identity=True), model_api=model_api, auto_state=state,
+        )
+
+        async def build_contexts():
+            return [await runtime._enter_owned_async_context(Resource("context"))]
+
+        monkeypatch.setattr(runtime, "_build_context_providers", build_contexts)
+        async with runtime:
+            client = constructor.call_args.kwargs["client"]
+            assert client.client is resources["model"]
+            assert client.project_client is resources["project"]
+            assert client.client.responses is proxy
+            assert constructor.call_args.kwargs["context_providers"][1:] == [resources["context"]]
+
+    if fail_at is None:
+        asyncio.run(run())
+    else:
+        with pytest.raises(RuntimeError) as error:
+            asyncio.run(run())
+        assert error.value is startup_error
+    order = ["context", "project", "model", "agent"]
+    entered = order if fail_at is None else order[:order.index(fail_at) + 1]
+    assert events == [
+        *[f"{name}-enter" for name in entered],
+        *[f"{name}-exit" for name in reversed(entered[1:])],
+        "credential-close", "context-exit",
+    ]
+    state.wrap_responses.assert_called_once()
+    assert os.environ["AGENTKIT_MODEL_API"] == "auto"
+
+
+def test_auto_runtime_first_request_uses_real_responses_client_for_each_auth(monkeypatch, auth_path):
+    import json
+
+    import httpx
+    from openai import AsyncOpenAI
+
+    from agentkit_serve_common.model_api_auto import AutoModelRuntime
+
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    token_hook = mock.Mock(return_value="test-token")
+    monkeypatch.setattr(agent_factory, "resolve_workload_identity_token", token_hook)
+    chat_constructor = mock.Mock(side_effect=AssertionError("Responses is supported"))
+    monkeypatch.setattr(agent_factory, "OpenAIChatCompletionClient", chat_constructor)
+    spec = _spec(workload_identity=auth_path not in {"no-auth", "api-key"}, api_key=auth_path == "api-key")
+    requests = []
+    sdk_clients = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "id": "resp_test", "object": "response", "created_at": 1,
+            "model": "test-model", "status": "completed",
+            "output": [{"type": "message", "id": "msg_test", "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}],
+        })
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            def sdk_client(**kwargs):
+                kwargs.setdefault("http_client", http)
+                client = AsyncOpenAI(**kwargs, max_retries=0)
+                sdk_clients.append(client)
+                return client
+
+            monkeypatch.setattr("agent_framework_openai._shared.AsyncOpenAI", sdk_client)
+            if auth_path == "foundry":
+                class Project:
+                    def __init__(self, **kwargs):
+                        pass
+
+                    def get_openai_client(self, **kwargs):
+                        return sdk_client(api_key="test-token", base_url=spec.model.base_url, **kwargs)
+
+                monkeypatch.setattr("agent_framework_foundry._chat_client.AIProjectClient", Project)
+                monkeypatch.setattr(
+                    "agent_framework_foundry._chat_client.create_foundry_feature_usage_http_client",
+                    lambda: http,
+                    raising=False,
+                )
+                monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: object())
+            environment = dict(os.environ)
+            try:
+                async with agent_factory.build_runtime(spec) as runtime:
+                    assert isinstance(runtime, AutoModelRuntime)
+                    assert runtime.state.selected is None
+                    assert requests == []
+                    assert len(sdk_clients) == 1
+                    for _ in range(2):
+                        result = await runtime.run(RunRequest(prompt="Hello."))
+                        assert result.text == "Done."
+                        assert runtime.state.selected == "responses"
+                    assert dict(os.environ) == environment
+            finally:
+                for client in sdk_clients:
+                    await client.close()
+
+    asyncio.run(run())
+    chat_constructor.assert_not_called()
+    assert len(sdk_clients) == 1
+    assert len(requests) == 2
+    expected_key = "test-key" if auth_path == "api-key" else "not-needed" if auth_path == "no-auth" else "test-token"
+    for request in requests:
+        assert request.url.path.endswith("/responses")
+        assert request.headers["authorization"] == f"Bearer {expected_key}"
+        assert json.loads(request.content)["store"] is False
+    if auth_path in {"generic-token", "generic-token-command"}:
+        assert token_hook.call_args_list == [mock.call("https://ai.azure.com/.default")] * 2
+    else:
+        token_hook.assert_not_called()

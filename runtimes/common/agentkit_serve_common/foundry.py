@@ -2570,7 +2570,9 @@ async def _handle_brokered_continuation(
             code="brokered_model_loop_unavailable",
         )
     if state.model_messages is not None and model_loop is not None:
-        if (state.model_api or "chat_completions") != model_loop.model_api:
+        if model_loop.model_api_selection == "auto":
+            model_loop = model_loop.for_model_api(state.model_api or "chat_completions")
+        elif (state.model_api or "chat_completions") != model_loop.model_api:
             return _error(
                 "pending response requires the model API it started with",
                 status=409, code="brokered_model_api_mismatch",

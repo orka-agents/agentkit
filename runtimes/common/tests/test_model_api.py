@@ -41,7 +41,7 @@ def test_default_api_is_chat_completions():
     assert resolve_model_api() == "chat_completions"
 
 
-@pytest.mark.parametrize("value", ["", "chat", "auto", "anthropic_messages", " responses ", "private-invalid-value"])
+@pytest.mark.parametrize("value", ["", "chat", "automatic", "anthropic_messages", " responses ", "private-invalid-value"])
 def test_invalid_api_is_rejected_without_echoing_value(monkeypatch, value):
     monkeypatch.setenv(MODEL_API_ENV, value)
     with pytest.raises(AgentBuildError) as error:

@@ -3,7 +3,8 @@
 Verified against modern pydantic-ai (1.107.x through 2.x). Key facts baked in here:
 
 * Direct upstream connections use ``OpenAIChatModel`` or ``OpenAIResponsesModel``
-  selected at startup; both take base_url/api_key from an ``OpenAIProvider``.
+  selected at startup, or negotiated on the first request in automatic mode.
+  Both take base_url/api_key from an ``OpenAIProvider``.
 * stdio MCP servers are passed to the agent as ``toolsets`` (the old
   ``mcp_servers=`` kwarg is gone). pydantic-ai 1.x exposes ``MCPServerStdio``;
   pydantic-ai 2.x uses ``MCPToolset(StdioTransport(...))``.
@@ -23,7 +24,7 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import TracebackType
 from typing import Any, AsyncIterable, AsyncIterator, cast
 
@@ -63,6 +64,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AgentBuildError,
+    AsyncExitStackLifecycle,
+    ModelAPI,
     declared_tool_env,
     mcp_tool_protocol_error,
     normalize_agent_run_error,
@@ -76,6 +79,7 @@ from agentkit_serve_common.adapter_support import (
 from agentkit_serve_common.agentsessions import ExecutionExchange, VerifiedAgentsessionsBinding
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
+from agentkit_serve_common.model_api_auto import AutoModelAPIState, AutoModelRuntime
 from agentkit_serve_common.runtime import (
     OfflineEchoRuntimeFactory,
     RunResult,
@@ -228,14 +232,21 @@ class _CompletedResponsesModel(OpenAIResponsesModel):
             self._require_completed(response.get())
 
 
-def build_model(spec: AgentSpec) -> OpenAIChatModel | OpenAIResponsesModel:
-    """Select the direct upstream API independently of the serving protocol."""
-    model_api = resolve_model_api()
+def build_model(
+    spec: AgentSpec,
+    *,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+) -> OpenAIChatModel | OpenAIResponsesModel:
+    """Build a concrete model; automatic negotiation belongs to build_runtime."""
+    selection = model_api if model_api is not None else resolve_model_api()
     provider = OpenAIProvider(
         base_url=spec.model.base_url,
         api_key=resolve_api_key(spec),
     )
-    if model_api == "responses":
+    if selection in {"responses", "auto"}:
+        if auto_state is not None:
+            provider.client.responses = auto_state.wrap_responses(provider.client.responses, client=provider.client)
         # Each request carries authoritative history; never depend on upstream
         # response storage or a provider-managed conversation.
         return _CompletedResponsesModel(
@@ -334,14 +345,23 @@ def build_tool_server(tool: ToolSpec) -> Any:
     ).prefixed(tool.name)
 
 
-def build_agent(spec: AgentSpec) -> Agent:
+def build_agent(
+    spec: AgentSpec,
+    *,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+) -> Agent:
     """Assemble the pydantic-ai agent: model + stdio MCP toolsets.
 
     The baked system prompt is sent per run by :class:`PydanticRuntime` instead of
     as pydantic-ai ``instructions``, which the OpenAI model inserts after any
     leading client system messages.
     """
-    model = build_model(spec)
+    model = (
+        build_model(spec)
+        if model_api is None and auto_state is None
+        else build_model(spec, model_api=model_api, auto_state=auto_state)
+    )
     toolsets = [build_tool_server(t) for t in spec.tools]
     return Agent(model, toolsets=toolsets)
 
@@ -352,10 +372,17 @@ class PydanticRuntime:
     def __init__(self, agent: Agent, instructions: str = "") -> None:
         self.agent = agent
         self.instructions = instructions
+        self.stack = AsyncExitStack()
+        self.lifecycle = AsyncExitStackLifecycle(self.stack)
 
     async def __aenter__(self) -> RuntimeSession:
-        await self.agent.__aenter__()
-        return self
+        async def start() -> RuntimeSession:
+            # Agent unwinds its own partial entry. Register only after success,
+            # and keep MCP cancel-scope entry and exit on the lifecycle task.
+            await self.stack.enter_async_context(self.agent)
+            return self
+
+        return await self.lifecycle.enter(start)
 
     async def __aexit__(
         self,
@@ -363,7 +390,7 @@ class PydanticRuntime:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> bool | None:
-        return await self.agent.__aexit__(exc_type, exc, tb)
+        return await self.lifecycle.exit(exc_type, exc, tb)
 
     async def run(self, request: RunRequest) -> RunResult:
         return await run_agent(self.agent, request, instructions=self.instructions)
@@ -388,12 +415,27 @@ def supports_acp_http_mcp() -> bool:
     )
 
 
-def build_runtime(spec: AgentSpec) -> RuntimeSession:
+def build_runtime(
+    spec: AgentSpec,
+    *,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
     validate_supported_spec(spec)
-    return PydanticRuntime(build_agent(spec), instructions=spec.instructions)
+    selection = model_api if model_api is not None else resolve_model_api()
+    if selection == "auto":
+        return AutoModelRuntime(
+            lambda api, state: build_runtime(spec, model_api=api, auto_state=state),
+        )
+    agent = (
+        build_agent(spec)
+        if model_api is None and auto_state is None
+        else build_agent(spec, model_api=model_api, auto_state=auto_state)
+    )
+    return PydanticRuntime(agent, instructions=spec.instructions)
 
 
 async def run_agentsessions(

@@ -109,14 +109,25 @@ agentkit-serve --config /agent/agent.yaml --protocol acp
 ```
 
 `AGENTKIT_MODEL_API` separately selects the upstream model API for Pydantic AI,
-Microsoft Agent Framework, and LangGraph. It defaults to `chat_completions`;
-set it to `responses` to use a Responses-compatible model backend. This works
-with standalone/local Docker agents and the OpenAI, Foundry, Orka, and ACP
-serving protocols. It does not require Foundry hosting or Foundry credentials.
-The configured model backend must implement the selected API; AgentKit does not
-silently fall back to Chat when Responses is unavailable. There is no `auto`
-value or separate Responses serving protocol. With `AGENTKIT_PROTOCOL=openai`,
-both client routes are available regardless of the upstream selector.
+Microsoft Agent Framework, and LangGraph. It defaults to `chat_completions`.
+Explicit `chat_completions` and `responses` never switch APIs. Opt in with
+`AGENTKIT_MODEL_API=auto` to prefer Responses and allow one Chat retry only when
+the first real Responses request gets a recognized unsupported endpoint/API
+rejection. Auto sends no separate probe and caches the concrete API for that
+runtime/backend/model lifetime.
+
+Unknown 404s, missing models, 401/403/429, timeouts, and generic 5xx errors do not
+trigger fallback. Once a Responses HTTP request is accepted, auto never switches,
+even if a stream fails or output is malformed or incomplete. A permitted retry
+preserves history and tools, closes the rejected Responses runtime and tool
+resources before starting Chat, and keeps upstream Responses `store: false`.
+See [model endpoint compatibility](docs/runtime-adapters.md#model-endpoint-compatibility)
+for the rejection rules.
+
+This works with standalone/container agents and the OpenAI, Foundry, Orka, and
+ACP serving protocols. It does not require Foundry hosting or credentials.
+With `AGENTKIT_PROTOCOL=openai`, both client routes remain available regardless
+of the upstream selector. There is no separate Responses serving protocol.
 
 For example, the same standalone image can accept either Chat Completions or
 Responses requests while calling the model through Responses:
@@ -133,10 +144,17 @@ docker run --rm \
 
 The local Makefile workflow also forwards this selector:
 `make run-test-agent AGENTKIT_MODEL_API=responses`, with `RUNTIME=maf` or
-`RUNTIME=langgraph` when needed.
+`RUNTIME=langgraph` when needed. To negotiate instead, replace the Docker env
+setting above with `-e AGENTKIT_MODEL_API=auto`, or run:
 
-This is startup configuration, not a per-turn override. The separate
-`agentsessions` host-mediated model contract remains Chat-only.
+```sh
+make run-test-agent AGENTKIT_MODEL_API=auto
+```
+
+This is startup configuration, not a per-turn override. Foundry brokered auto
+persists the concrete API and restores it for continuations; explicit API
+mismatch protections are unchanged. The separate `agentsessions` host-mediated
+model contract remains Chat-only.
 See [model-driven tool workflows](docs/foundry-hosted-brokered.md#model-driven-tool-workflows)
 for brokered continuation rules.
 

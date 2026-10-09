@@ -8,11 +8,15 @@ encoders; no model, provider-managed conversation, or external service is used.
 tool, then answers with its receipt. ``history:<marker>`` reports the text turns
 received and ``api:<selection>`` reports the upstream API actually used.
 ``auth-echo`` returns a 401 that echoes the presented credential.
+The task-only ``PARITY_DISABLE_RESPONSES=1`` flag rejects Responses with a known
+route 404 before reading the body or executing model/tool work.
+``GET /parity/requests`` exposes only request counts for smoke assertions.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from agentkit_serve_common.parity import (
@@ -26,7 +30,10 @@ from agentkit_serve_common.parity import (
     _tool_results,
 )
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+
+
+_request_counts = {"chat_completions": 0, "responses": 0, "responses_rejected": 0}
 
 
 def echo(value: str) -> str:
@@ -62,6 +69,10 @@ def _script_reply(body: dict[str, Any], model_api: str, presented: str) -> _Repl
 
 
 async def _model_response(request: Request, model_api: str) -> Response:
+    _request_counts[model_api] += 1
+    if model_api == "responses" and os.environ.get("PARITY_DISABLE_RESPONSES") == "1":
+        _request_counts["responses_rejected"] += 1
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     body = await request.json()
     reply = _script_reply(body, model_api, request.headers.get("authorization", ""))
     content_type, payload = _model_wire_response(body, reply, model_api)
@@ -76,6 +87,10 @@ async def responses(request: Request) -> Response:
     return await _model_response(request, "responses")
 
 
+async def request_counts(request: Request) -> Response:
+    return JSONResponse(_request_counts.copy())
+
+
 def create_server() -> Any:
     # The common fixture tests need no MCP dependency. The adapter image already
     # ships FastMCP, and registers these same handlers when run as the fixture.
@@ -85,6 +100,7 @@ def create_server() -> Any:
     server.tool()(echo)
     server.custom_route("/v1/chat/completions", methods=["POST"])(chat_completions)
     server.custom_route("/v1/responses", methods=["POST"])(responses)
+    server.custom_route("/parity/requests", methods=["GET"])(request_counts)
     return server
 
 

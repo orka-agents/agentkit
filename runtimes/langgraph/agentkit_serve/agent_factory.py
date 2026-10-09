@@ -48,6 +48,7 @@ from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AsyncExitStackLifecycle,
     AgentBuildError,
+    ModelAPI,
     declared_tool_env,
     mcp_tool_protocol_error,
     normalize_agent_run_error,
@@ -61,6 +62,7 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
+from agentkit_serve_common.model_api_auto import AutoModelAPIState, AutoModelRuntime
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -155,7 +157,7 @@ def _validated_response_result(value: Any) -> Any:
             return _validated_response_result(await value)
 
         return resolve()
-    if isinstance(value, (Stream, AsyncStream)):
+    if isinstance(value, (Stream, AsyncStream)) or callable(getattr(value, "__aiter__", None)):
         return _ValidatedResponsesStream(value)
     if callable(getattr(value, "parse", None)):
         # with_raw_response returns an SDK response whose parse() yields the
@@ -184,9 +186,16 @@ class _ValidatedResponsesResource:
         return value
 
 
-def build_model(spec: AgentSpec) -> ChatOpenAI:
-    """Select the startup-only upstream API independently of the serving protocol."""
-    model_api = resolve_model_api()
+def build_model(
+    spec: AgentSpec,
+    *,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+) -> ChatOpenAI:
+    """Build a concrete model; auto negotiation belongs to the runtime."""
+    if model_api is None:
+        selection = resolve_model_api()
+        model_api = "responses" if selection == "auto" else selection
     model = ChatOpenAI(
         model=spec.model.name,
         base_url=spec.model.base_url,
@@ -198,7 +207,11 @@ def build_model(spec: AgentSpec) -> ChatOpenAI:
     )
     if model_api == "responses":
         for client in (model.root_client, model.root_async_client):
-            client.responses = _ValidatedResponsesResource(client.responses)
+            responses = client.responses
+            if client is model.root_async_client and auto_state is not None:
+                # Accept successful SDK calls before validation can reject output.
+                responses = auto_state.wrap_responses(responses, client=client)
+            client.responses = _ValidatedResponsesResource(responses)
     return model
 
 
@@ -294,8 +307,16 @@ class LangGraphRuntime:
     so stdio MCP sessions stay warm across requests and close on shutdown.
     """
 
-    def __init__(self, spec: AgentSpec) -> None:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        *,
+        model_api: ModelAPI | None = None,
+        auto_state: AutoModelAPIState | None = None,
+    ) -> None:
         self.spec = spec
+        self.model_api = model_api
+        self.auto_state = auto_state
         self.stack = AsyncExitStack()
         self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.graph: Any | None = None
@@ -303,7 +324,10 @@ class LangGraphRuntime:
 
     async def __aenter__(self) -> RuntimeSession:
         async def start() -> RuntimeSession:
-            model = build_model(self.spec)
+            if self.model_api is None and self.auto_state is None:
+                model = build_model(self.spec)
+            else:
+                model = build_model(self.spec, model_api=self.model_api, auto_state=self.auto_state)
             tools = await self._load_tools()
             self.graph = create_agent(
                 model=model,
@@ -388,6 +412,10 @@ def build_runtime(spec: AgentSpec) -> RuntimeSession:
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
     validate_supported_spec(spec)
+    if resolve_model_api() == "auto":
+        return AutoModelRuntime(
+            lambda model_api, state: LangGraphRuntime(spec, model_api=model_api, auto_state=state),
+        )
     return LangGraphRuntime(spec)
 
 

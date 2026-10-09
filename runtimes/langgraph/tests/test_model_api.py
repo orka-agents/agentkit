@@ -7,6 +7,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from functools import partial, wraps
+from types import SimpleNamespace
 from unittest import mock
 
 import httpx
@@ -169,7 +170,7 @@ def _history(payload, model_api):
     return messages
 
 
-@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses"])
+@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses", "auto"])
 def test_build_model_selects_upstream_api_explicitly(monkeypatch, model_api):
     _select(monkeypatch, model_api)
     model = mock.Mock()
@@ -181,23 +182,128 @@ def test_build_model_selects_upstream_api_explicitly(monkeypatch, model_api):
         model="test-model",
         base_url=_BASE_URL,
         api_key="not-needed",
-        use_responses_api=model_api == "responses",
-        store=False if model_api == "responses" else None,
+        use_responses_api=model_api in {"responses", "auto"},
+        store=False if model_api in {"responses", "auto"} else None,
     )
 
 
+@pytest.mark.parametrize("model_api", ["chat_completions", "responses"])
+def test_build_model_uses_concrete_auto_candidate_and_wraps_only_async(monkeypatch, model_api):
+    _select(monkeypatch, "invalid-after-startup")
+    resolver = mock.Mock(side_effect=AssertionError("candidate must not resolve the environment"))
+    constructor = mock.Mock()
+    monkeypatch.setattr(agent_factory, "resolve_model_api", resolver)
+    monkeypatch.setattr(agent_factory, "ChatOpenAI", constructor)
+    model = constructor.return_value
+    sync_responses = model.root_client.responses
+    async_responses = model.root_async_client.responses
+    state = mock.Mock(spec=agent_factory.AutoModelAPIState)
+
+    assert agent_factory.build_model(_spec(), model_api=model_api, auto_state=state) is model
+
+    resolver.assert_not_called()
+    constructor.assert_called_once_with(
+        model="test-model",
+        base_url=_BASE_URL,
+        api_key=_API_KEY,
+        use_responses_api=model_api == "responses",
+        store=False if model_api == "responses" else None,
+    )
+    if model_api == "responses":
+        # Validation stays outside negotiation; only async SDK calls select an API.
+        assert isinstance(model.root_client.responses, agent_factory._ValidatedResponsesResource)
+        assert model.root_client.responses._resource is sync_responses
+        state.wrap_responses.assert_called_once_with(async_responses, client=model.root_async_client)
+        assert isinstance(model.root_async_client.responses, agent_factory._ValidatedResponsesResource)
+        assert model.root_async_client.responses._resource is state.wrap_responses.return_value
+    else:
+        state.wrap_responses.assert_not_called()
+        assert model.root_client.responses is sync_responses
+        assert model.root_async_client.responses is async_responses
+
+
 @pytest.mark.parametrize("model_api", [None, "chat_completions", "responses"])
+def test_runtime_forwards_candidate_or_preserves_default_model_call(monkeypatch, model_api):
+    _select(monkeypatch, None)
+    spec = _spec()
+    state = agent_factory.AutoModelAPIState() if model_api == "responses" else None
+    model = SimpleNamespace(use_responses_api=model_api == "responses")
+    build = mock.Mock(return_value=model)
+    graph = mock.Mock()
+    load_tools = mock.AsyncMock(return_value=[])
+    monkeypatch.setattr(agent_factory, "build_model", build)
+    monkeypatch.setattr(agent_factory, "create_agent", graph)
+    monkeypatch.setattr(agent_factory.LangGraphRuntime, "_load_tools", load_tools)
+    runtime = agent_factory.LangGraphRuntime(spec, model_api=model_api, auto_state=state)
+
+    async def exercise():
+        async with runtime as entered:
+            assert entered is runtime
+            assert entered.graph is graph.return_value
+
+    asyncio.run(exercise())
+
+    if model_api is None:
+        build.assert_called_once_with(spec)
+    else:
+        build.assert_called_once_with(spec, model_api=model_api, auto_state=state)
+    assert graph.call_args.kwargs["model"] is model
+    assert graph.call_args.kwargs["middleware"][0].responses_api is (model_api == "responses")
+    load_tools.assert_awaited_once_with()
+    assert runtime.graph is None
+
+
+@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses"])
+def test_build_runtime_preserves_explicit_and_default_constructor_calls(monkeypatch, model_api):
+    _select(monkeypatch, model_api)
+    spec = _spec()
+    concrete = mock.Mock()
+    auto = mock.Mock()
+    monkeypatch.setattr(agent_factory, "LangGraphRuntime", concrete)
+    monkeypatch.setattr(agent_factory, "AutoModelRuntime", auto)
+
+    assert agent_factory.build_runtime(spec) is concrete.return_value
+
+    concrete.assert_called_once_with(spec)
+    auto.assert_not_called()
+
+
+def test_build_runtime_auto_delegates_concrete_candidate_construction(monkeypatch):
+    _select(monkeypatch, "auto")
+    spec = _spec()
+    concrete = mock.Mock()
+    auto = mock.Mock()
+    monkeypatch.setattr(agent_factory, "LangGraphRuntime", concrete)
+    monkeypatch.setattr(agent_factory, "AutoModelRuntime", auto)
+
+    assert agent_factory.build_runtime(spec) is auto.return_value
+
+    concrete.assert_not_called()
+    factory, = auto.call_args.args
+    auto.assert_called_once_with(factory)
+    state = agent_factory.AutoModelAPIState()
+    assert state.selected is None
+    assert factory("responses", state) is concrete.return_value
+    concrete.assert_called_once_with(spec, model_api="responses", auto_state=state)
+    concrete.reset_mock()
+    assert factory("chat_completions", None) is concrete.return_value
+    concrete.assert_called_once_with(spec, model_api="chat_completions", auto_state=None)
+    assert os.environ["AGENTKIT_MODEL_API"] == "auto"
+
+
+@pytest.mark.parametrize("model_api", [None, "chat_completions", "responses", "auto"])
 @pytest.mark.parametrize("output_version", ["v0", "responses/v1"])
 def test_real_agent_uses_selected_wire_format_and_preserves_history(monkeypatch, model_api, output_version):
     _select(monkeypatch, model_api)
+    upstream_api = "responses" if model_api == "auto" else model_api
     monkeypatch.setenv("LC_OUTPUT_VERSION", output_version)
     requests = []
 
     def handle(request):
-        payload = _payload(request, model_api)
-        assert _history(payload, model_api) == _MESSAGES
+        payload = _payload(request, upstream_api)
+        assert _history(payload, upstream_api) == _MESSAGES
         requests.append(request)
-        return httpx.Response(200, json=_reply(model_api))
+        return httpx.Response(200, json=_reply(upstream_api))
 
     async def exercise():
         async with _mock_upstream(monkeypatch, handle):
@@ -209,6 +315,31 @@ def test_real_agent_uses_selected_wire_format_and_preserves_history(monkeypatch,
     assert result.text == "offline reply"
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("include_headers", [False, True])
+def test_auto_selects_responses_before_output_validation_rejects_it(monkeypatch, include_headers):
+    _select(monkeypatch, "auto")
+    requests = []
+    state = agent_factory.AutoModelAPIState()
+
+    def handle(request):
+        _payload(request, "responses")
+        requests.append(request)
+        response = _reply("responses")
+        response["output"][0]["status"] = "in_progress"
+        return httpx.Response(200, json=response)
+
+    async def exercise():
+        async with _mock_upstream(monkeypatch, handle, include_response_headers=include_headers):
+            model = agent_factory.build_model(_spec(), model_api="responses", auto_state=state)
+            with pytest.raises(AgentRunError, match="agent run failed"):
+                await model.ainvoke("hello")
+            assert state.selected == "responses"
+
+    asyncio.run(exercise())
+    assert len(requests) == 1
+    assert os.environ["AGENTKIT_MODEL_API"] == "auto"
 
 
 @pytest.mark.parametrize("model_api", ["", "chat", "Responses", "invalid-api"])
@@ -711,10 +842,13 @@ def test_sync_model_validates_raw_response_items(monkeypatch, item_status, strea
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("model_api", ["responses", "auto"])
 @pytest.mark.parametrize("include_headers", [False, True])
 @pytest.mark.parametrize("cancel", [False, True])
-def test_validated_response_stream_closes_on_item_rejection_or_cancellation(monkeypatch, include_headers, cancel):
-    _select(monkeypatch, "responses")
+def test_validated_response_stream_closes_on_item_rejection_or_cancellation(
+    monkeypatch, model_api, include_headers, cancel,
+):
+    _select(monkeypatch, model_api)
     responses = []
     streams = []
     tool_calls = []
@@ -776,6 +910,8 @@ def test_validated_response_stream_closes_on_item_rejection_or_cancellation(monk
                 # Verify SDK stream cleanup before closing the runtime/HTTP client.
                 assert len(responses) == 1 and responses[0].is_closed
                 assert streams[0].closes == 1
+                if model_api == "auto":
+                    assert runtime.state.selected == "responses"
 
     asyncio.run(exercise())
     assert not tool_calls

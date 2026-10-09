@@ -223,9 +223,23 @@ forwarded to runtime adapters for provider-neutral session/memory correlation;
 it does not retain or replace the client-supplied transcript.
 
 `AGENTKIT_MODEL_API` independently selects the upstream model transport:
-`chat_completions` by default or explicit `responses`. Neither client route
-forces an upstream API, and there is no `auto`, fallback, new protocol, or ABI
-field for this choice.
+`chat_completions` by default, explicit `responses`, or opt-in `auto`. Neither
+client route forces an upstream API, and no new protocol or ABI field is needed.
+Both inbound endpoints remain available. Explicit selectors never fall back.
+
+For example, pass `-e AGENTKIT_MODEL_API=auto` to the container. Auto makes the
+first real Responses request without a separate probe and caches the concrete
+API for that runtime/backend/model lifetime. Only a recognized initial
+unsupported endpoint/API rejection permits one Chat retry. Unknown 404s,
+model-missing errors, 401/403/429, timeouts, and generic 5xx failures do not.
+Once any Responses HTTP request is accepted, including streams and
+malformed/incomplete output, auto never switches APIs. A permitted retry closes
+Responses runtime/tool resources before Chat starts and preserves request
+history and tools; upstream Responses calls keep `store: false`.
+See [model endpoint compatibility](runtime-adapters.md#model-endpoint-compatibility).
+
+Foundry brokered auto persists and restores the concrete API for continuations.
+Explicit selector/continuation mismatch protections are unchanged.
 
 Runtime protocol selection happens outside the ABI with `agentkit-serve
 --protocol` or `AGENTKIT_PROTOCOL`; the same `/agent/agent.yaml` file is reused by

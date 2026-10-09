@@ -18,6 +18,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from agentkit_serve import agent_factory
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import ConversationTurn, RunRequest
+from agentkit_serve_common.model_api_auto import AutoModelAPIState
 from agentkit_serve_common.orka import ORKA_HARNESS_VERSION, create_orka_app
 from agentkit_serve_common.runtime import AgentRunError
 from agentkit_serve_common.server import create_app
@@ -189,6 +190,155 @@ def test_build_model_rejects_invalid_model_api_before_client_or_auth(monkeypatch
         agent_factory.build_model(_spec())
     auth.assert_not_called()
     provider.assert_not_called()
+
+
+@pytest.mark.parametrize("model_api", ["chat_completions", "responses"])
+@pytest.mark.parametrize("automatic_candidate", [False, True])
+def test_explicit_model_choice_ignores_auto_env_and_wraps_only_responses_candidate(
+    monkeypatch, model_api, automatic_candidate,
+):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+
+    async def run():
+        requests = []
+        state = mock.Mock(spec=AutoModelAPIState) if automatic_candidate else None
+
+        def handle(request):
+            requests.append(request)
+            raise AssertionError("construction must not send a model request")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            _inject_http(monkeypatch, client)
+            model = agent_factory.build_model(_spec(), model_api=model_api, auto_state=state)
+            if model_api == "responses":
+                assert isinstance(model, agent_factory._CompletedResponsesModel)
+                assert model.settings["openai_store"] is False
+            else:
+                assert isinstance(model, OpenAIChatModel)
+                assert model.profile["openai_chat_streaming_requires_finish_reason"] is True
+            if state is not None:
+                if model_api == "responses":
+                    from openai.resources.responses import AsyncResponses
+
+                    state.wrap_responses.assert_called_once()
+                    assert isinstance(state.wrap_responses.call_args.args[0], AsyncResponses)
+                    assert model.client.responses is state.wrap_responses.return_value
+                else:
+                    state.wrap_responses.assert_not_called()
+            assert model.client.api_key == KEY
+        assert requests == []
+        assert os.environ["AGENTKIT_MODEL_API"] == "auto"
+
+    asyncio.run(run())
+
+
+def test_direct_auto_model_helper_builds_only_initial_responses_candidate(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+    monkeypatch.setenv("MODEL_API_TEST_KEY", KEY)
+    wrapper = mock.Mock()
+    provider = mock.Mock()
+    monkeypatch.setattr(agent_factory, "AutoModelRuntime", wrapper)
+    monkeypatch.setattr(agent_factory, "OpenAIProvider", provider)
+    model = mock.Mock()
+    monkeypatch.setattr(agent_factory, "_CompletedResponsesModel", model)
+
+    assert agent_factory.build_model(_spec()) is model.return_value
+
+    model.assert_called_once_with(
+        "local-model", provider=provider.return_value, settings={"openai_store": False},
+    )
+    wrapper.assert_not_called()
+
+
+def test_auto_runtime_factory_is_lazy_and_passes_concrete_api_without_env_mutation(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+    wrapper = mock.Mock()
+    agent = mock.Mock()
+    builder = mock.Mock(return_value=agent)
+    monkeypatch.setattr(agent_factory, "AutoModelRuntime", wrapper)
+    monkeypatch.setattr(agent_factory, "build_agent", builder)
+    spec = _spec()
+
+    assert agent_factory.build_runtime(spec) is wrapper.return_value
+    builder.assert_not_called()
+    factory = wrapper.call_args.args[0]
+    state = AutoModelAPIState()
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "invalid-after-startup")
+
+    responses_runtime = factory("responses", state)
+    chat_runtime = factory("chat_completions", None)
+
+    assert isinstance(responses_runtime, agent_factory.PydanticRuntime)
+    assert isinstance(chat_runtime, agent_factory.PydanticRuntime)
+    assert responses_runtime.instructions == spec.instructions
+    assert chat_runtime.instructions == spec.instructions
+    assert builder.call_args_list == [
+        mock.call(spec, model_api="responses", auto_state=state),
+        mock.call(spec, model_api="chat_completions", auto_state=None),
+    ]
+    assert state.selected is None
+    assert os.environ["AGENTKIT_MODEL_API"] == "invalid-after-startup"
+
+
+@pytest.mark.parametrize("selection", [None, "chat_completions", "responses"])
+def test_explicit_default_build_chain_keeps_no_kwargs_calls(monkeypatch, selection):
+    monkeypatch.delenv("AGENTKIT_MODEL_API", raising=False)
+    if selection is not None:
+        monkeypatch.setenv("AGENTKIT_MODEL_API", selection)
+    model = mock.Mock()
+    agent = mock.Mock()
+    monkeypatch.setattr(agent_factory, "build_model", model)
+    monkeypatch.setattr(agent_factory, "Agent", agent)
+    spec = _spec()
+
+    assert agent_factory.build_agent(spec) is agent.return_value
+    model.assert_called_once_with(spec)
+    builder = mock.Mock(return_value=agent.return_value)
+    monkeypatch.setattr(agent_factory, "build_agent", builder)
+    assert isinstance(agent_factory.build_runtime(spec), agent_factory.PydanticRuntime)
+    builder.assert_called_once_with(spec)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_auto_candidate_hook_marks_responses_without_bypassing_completion_guards(
+    monkeypatch, stream, unfinished,
+):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto")
+
+    async def run():
+        requests = []
+        state = AutoModelAPIState()
+        hook = mock.Mock(wraps=state)
+
+        async def observe(event):
+            raise AssertionError("text-only response must not execute tools")
+
+        def handle(request):
+            requests.append(request)
+            assert str(request.url) == BASE_URL + "/responses"
+            if not unfinished:
+                return _reply("responses", stream=stream)
+            if stream:
+                return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                      content=_responses_events(terminal=None))
+            return httpx.Response(200, json=_responses_body(status="incomplete"))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            _inject_http(monkeypatch, client)
+            async with agent_factory.build_runtime(_spec(), model_api="responses", auto_state=hook) as runtime:
+                request = RunRequest("hello", on_tool_event=observe if stream else None)
+                if unfinished:
+                    with pytest.raises(AgentRunError):
+                        await runtime.run(request)
+                else:
+                    assert (await runtime.run(request)).text == PRIVATE
+        hook.wrap_responses.assert_called_once()
+        assert state.selected == "responses"
+        assert len(requests) == 1
+        assert os.environ["AGENTKIT_MODEL_API"] == "auto"
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("selection", [None, "chat_completions", "responses"])

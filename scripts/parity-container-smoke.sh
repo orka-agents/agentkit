@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 
 # Container parity smoke: run each runtime's built parity agent image under the
-# openai, foundry, and orka protocols with both upstream Chat and Responses APIs
-# against a scripted model and remote MCP tool. OpenAI mode checks both client
-# routes on the same container. Checks upstream API selection, history,
+# openai, foundry, and orka protocols with explicit Chat/Responses and opt-in auto
+# against dual-API and Chat-only scripted backends with a remote MCP tool.
+# OpenAI mode checks both client routes on the same container. Checks upstream API selection, history,
 # a plain answer, a tool round trip, and the normalized response to a
 # 401 that echoes the model key, and that the key never appears in a response or
-# container log. Needs the frontend and adapter images from `make build-agentkit
+# container log. Auto also checks first-real-request selection and a cached API
+# across client calls, with exactly one rejected Responses request on Chat-only
+# backends. Run on the VM or CI, not with local Docker/kind.
+# Needs the frontend and adapter images from `make build-agentkit
 # build-serve build-serve-maf build-serve-langgraph` at the same TAG.
 
 set -Eeuo pipefail
@@ -26,6 +29,7 @@ auth_token="parity-smoke-token"
 request_timeout=120
 network="agentkit-parity-$$"
 fixture="agentkit-parity-fixture-$$"
+fixture_base=""
 containers=()
 
 for command in curl docker jq make; do
@@ -85,16 +89,40 @@ check_history() {
     \$turns[1:] == [[\"system\",\"client system note\"],[\"user\",\"u1 edited\"],[\"assistant\",\"a1 edited\"],[\"user\",\"$prompt\"]]" "$body"
 }
 
+fixture_requests() {
+  curl -fsS --max-time "$request_timeout" "$fixture_base/parity/requests"
+}
+
+check_auto_selection() {
+  local label="$1" expected_api="$2" selector="$3" before="$4" first="$5" out filter comparison='> 1'
+  [[ "$selector" == auto ]] || return 0
+  out="$(fixture_requests)"
+  if [[ "$first" == true ]]; then comparison='== 1'; fi
+  # The initial plain turn needs one real model request, not a separate probe.
+  # Later tools, history, errors, and both OpenAI client routes keep that choice.
+  if [[ "$expected_api" == responses ]]; then
+    filter="(.chat_completions - \$before.chat_completions) == 0 and
+      (.responses_rejected - \$before.responses_rejected) == 0 and
+      (.responses - \$before.responses) $comparison"
+  else
+    filter="(.responses - \$before.responses) == 1 and
+      (.responses_rejected - \$before.responses_rejected) == 1 and
+      (.chat_completions - \$before.chat_completions) $comparison"
+  fi
+  check "$label auto request counts" "$before as \$before | $filter" "$out"
+}
+
 openai_scenarios() {
-  local base="$1" label="$2" model_api="$3" out status endpoint payload token
+  local base="$1" label="$2" expected_api="$3" selector="$4" before="$5" out status endpoint payload token
   local headers=()
   local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"plain:P1"}]}')"
   check "$label Chat plain" '.choices[0].message.content == "parity-answer: P1"' "$out"
+  check_auto_selection "$label first request" "$expected_api" "$selector" "$before" true
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"tool:T1"}]}')"
   check "$label Chat tool" '.choices[0].message.content | contains("receipt-T1")' "$out"
-  out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"api:$model_api\"}]}")"
-  check "$label Chat upstream API" ".choices[0].message.content == \"parity-api: $model_api\"" "$out"
+  out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"api:$expected_api\"}]}")"
+  check "$label Chat upstream API" ".choices[0].message.content == \"parity-api: $expected_api\"" "$out"
   out="$(curl -sS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/chat/completions" \
     -d '{"messages":[{"role":"user","content":"old history"}]}')"
   check "$label Chat initial history" '.choices[0].message.content == "parity-answer: old history"' "$out"
@@ -116,8 +144,8 @@ openai_scenarios() {
     (.usage.total_tokens | type) == "number"' "$out"
   out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d '{"input":"tool:R1"}')"
   check "$label Responses baked tool" '.output[0].content[0].text | contains("receipt-R1")' "$out"
-  out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d "{\"input\":\"api:$model_api\"}")"
-  check "$label Responses upstream API" ".output[0].content[0].text == \"parity-api: $model_api\"" "$out"
+  out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d "{\"input\":\"api:$expected_api\"}")"
+  check "$label Responses upstream API" ".output[0].content[0].text == \"parity-api: $expected_api\"" "$out"
   out="$(curl -fsS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/responses" \
     -d '{"input":"old Responses history"}')"
   check "$label Responses initial history" '.output[0].content[0].text == "parity-answer: old Responses history"' "$out"
@@ -159,14 +187,15 @@ openai_scenarios() {
 }
 
 foundry_scenarios() {
-  local base="$1" label="$2" model_api="$3" out status
+  local base="$1" label="$2" expected_api="$3" selector="$4" before="$5" out status
   local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
   out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"plain:P2"}')"
   check "$label plain" '.output[0].content[0].text == "parity-answer: P2"' "$out"
+  check_auto_selection "$label first request" "$expected_api" "$selector" "$before" true
   out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"tool:T2"}')"
   check "$label tool" '.output[0].content[0].text | contains("receipt-T2")' "$out"
-  out="$(curl -sS "${auth[@]}" "$base/responses" -d "{\"input\":\"api:$model_api\"}")"
-  check "$label upstream API" ".output[0].content[0].text == \"parity-api: $model_api\"" "$out"
+  out="$(curl -sS "${auth[@]}" "$base/responses" -d "{\"input\":\"api:$expected_api\"}")"
+  check "$label upstream API" ".output[0].content[0].text == \"parity-api: $expected_api\"" "$out"
   out="$(curl -sS "${auth[@]}" "$base/responses" \
     -d '{"input":[{"role":"system","content":"client system note"},{"role":"user","content":"u1 edited"},{"role":"assistant","content":"a1 edited"},{"role":"user","content":"history:H2"}]}')"
   check_history "$label history" '.output[0].content[0].text' "$out" history:H2
@@ -192,8 +221,9 @@ orka_turn() {
 }
 
 orka_scenarios() {
-  local base="$1" label="$2" model_api="$3" out
+  local base="$1" label="$2" expected_api="$3" selector="$4" before="$5" out
   check "$label plain" '.type == "TurnCompleted" and .completed.result == "parity-answer: P3"' "$(orka_turn "$base" turn-plain plain:P3)"
+  check_auto_selection "$label first request" "$expected_api" "$selector" "$before" true
   out="$(orka_turn "$base" turn-history history:H3)"
   # $turns is a jq variable, not a shell expansion.
   # shellcheck disable=SC2016
@@ -202,24 +232,25 @@ orka_scenarios() {
     ($turns | length) == 4 and $turns[0][0] == "system" and
     ($turns[0][1] | contains("Follow the scripted parity fixture.")) and
     $turns[1:] == [["user","plain:P3"],["assistant","parity-answer: P3"],["user","history:H3"]])' "$out"
-  check "$label upstream API" ".type == \"TurnCompleted\" and .completed.result == \"parity-api: $model_api\"" "$(orka_turn "$base" turn-api "api:$model_api")"
+  check "$label upstream API" ".type == \"TurnCompleted\" and .completed.result == \"parity-api: $expected_api\"" "$(orka_turn "$base" turn-api "api:$expected_api")"
   check "$label tool" '.type == "TurnCompleted" and (.completed.result | contains("receipt-T3"))' "$(orka_turn "$base" turn-tool tool:T3)"
   check "$label auth-echo" '.type == "TurnFailed" and .failed.reason == "ModelAuthRejected"' "$(orka_turn "$base" turn-auth auth-echo)"
 }
 
 run_protocol() {
-  local runtime="$1" protocol="$2" model_api="$3" image="parity-$1:$tag"
-  local name="agentkit-parity-$runtime-$protocol-$model_api-$$" health base port
+  local runtime="$1" protocol="$2" selector="$3" expected_api="$4" image="parity-$1:$tag"
+  local name="agentkit-parity-$runtime-$protocol-$selector-$$" health base port before
   case "$protocol" in
     openai) health=/healthz ;;
     foundry) health=/readiness ;;
     orka) health=/v1/health ;;
   esac
+  before="$(fixture_requests)"
   containers+=("$name")
   docker run -d --name "$name" --platform "$platform" --network "$network" \
     -p 127.0.0.1::8080 \
     -e AGENTKIT_PROTOCOL="$protocol" \
-    -e AGENTKIT_MODEL_API="$model_api" \
+    -e AGENTKIT_MODEL_API="$selector" \
     -e AGENTKIT_PORT=8080 \
     -e AGENTKIT_BIND=0.0.0.0 \
     -e AGENTKIT_AUTH_TOKEN="$auth_token" \
@@ -228,50 +259,58 @@ run_protocol() {
     "$image" >/dev/null
   port="$(docker port "$name" 8080/tcp | head -n 1)"
   base="http://127.0.0.1:${port##*:}"
-  wait_for "$base$health" || { docker logs "$name" >&2 || true; die "$runtime $protocol $model_api never became healthy"; }
-  log "Checking $runtime under $protocol with upstream $model_api"
-  "${protocol}_scenarios" "$base" "$runtime $protocol $model_api" "$model_api"
-  assert_no_canary "$runtime $protocol $model_api container log" "$(docker logs "$name" 2>&1)"
+  wait_for "$base$health" || { docker logs "$name" >&2 || true; die "$runtime $protocol $selector never became healthy"; }
+  log "Checking $runtime under $protocol with selector $selector, expecting upstream $expected_api"
+  "${protocol}_scenarios" "$base" "$runtime $protocol $selector -> $expected_api" "$expected_api" "$selector" "$before"
+  check_auto_selection "$runtime $protocol cached $expected_api" "$expected_api" "$selector" "$before" false
+  assert_no_canary "$runtime $protocol $selector container log" "$(docker logs "$name" 2>&1)"
   docker rm -f "$name" >/dev/null
 }
 
-main() {
-  local runtime protocol model_api fixture_port
-  docker network create "$network" >/dev/null
-  log "Starting scripted model and MCP fixture"
-  containers+=("$fixture")
-  # The parity Agentkitfiles bake http://parity-fixture:8090 as the model URL.
+start_fixture() {
+  local disable_responses="$1" fixture_port
+  log "Starting scripted model and MCP fixture, PARITY_DISABLE_RESPONSES=$disable_responses"
+  # Restart only this smoke's fixture. Its alias and baked model URL stay fixed.
+  docker rm -f "$fixture" >/dev/null 2>&1 || true
   docker run -d --name "$fixture" --platform "$platform" --network "$network" \
     --network-alias parity-fixture \
     -p 127.0.0.1::8090 \
+    -e PARITY_DISABLE_RESPONSES="$disable_responses" \
     -v "$repo_root/test/parity/fixture.py:/parity/fixture.py:ro" \
     --entrypoint /opt/agentkit/bin/python \
     "agentkit-serve:$tag" /parity/fixture.py >/dev/null
   fixture_port="$(docker port "$fixture" 8090/tcp | head -n 1)"
-  wait_for_fixture "http://127.0.0.1:${fixture_port##*:}" || { docker logs "$fixture" >&2 || true; die "fixture never started"; }
+  fixture_base="http://127.0.0.1:${fixture_port##*:}"
+  wait_for "$fixture_base/parity/requests" || { docker logs "$fixture" >&2 || true; die "fixture never started"; }
+}
+
+main() {
+  local runtime protocol selector expected_api
+  docker network create "$network" >/dev/null
+  containers+=("$fixture")
+  start_fixture 0
 
   for runtime in "${runtimes[@]}"; do
     log "Building parity agent image for $runtime"
     make build-test-agent TAG="$tag" BUILDER="$builder" PLATFORM="$platform" RUNTIME="$runtime" \
       SERVE_IMAGE="$(serve_image "$runtime")" FIXTURE="test/parity/agentkitfile-$runtime.yaml" \
       AGENT_IMAGE="parity-$runtime:$tag"
-    for model_api in chat_completions responses; do
+    for selector in chat_completions responses auto; do
+      expected_api="$selector"
+      if [[ "$selector" == auto ]]; then expected_api=responses; fi
       for protocol in openai foundry orka; do
-        run_protocol "$runtime" "$protocol" "$model_api"
+        run_protocol "$runtime" "$protocol" "$selector" "$expected_api"
       done
     done
   done
-  log "Container parity smoke passed for chat_completions and responses: ${runtimes[*]}"
-}
 
-# The fixture answers only POSTs; any HTTP response means it is listening.
-wait_for_fixture() {
-  local url="$1"
-  for _ in $(seq 1 60); do
-    curl -sS --max-time 5 -o /dev/null "$url/v1/chat/completions" 2>/dev/null && return 0
-    sleep 1
+  start_fixture 1
+  for runtime in "${runtimes[@]}"; do
+    for protocol in openai foundry orka; do
+      run_protocol "$runtime" "$protocol" auto chat_completions
+    done
   done
-  return 1
+  log "Container parity smoke passed for explicit Chat/Responses and auto with dual-API/Chat-only backends: ${runtimes[*]}"
 }
 
 main

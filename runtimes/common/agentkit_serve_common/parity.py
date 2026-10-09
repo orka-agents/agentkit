@@ -40,6 +40,12 @@ __all__ = [
     "pytest_generate_tests",
     "test_parity_model_receives_baked_instructions_then_client_history",
     "test_parity_dual_openai_endpoints_with_sdk",
+    "test_parity_auto_prefers_responses_for_both_client_endpoints",
+    "test_parity_auto_falls_back_once_and_keeps_baked_tools",
+    "test_parity_auto_never_switches_on_auth_model_or_service_errors",
+    "test_parity_auto_never_switches_after_accepted_incomplete_output",
+    "test_parity_auto_never_replays_accepted_malformed_json",
+    "test_parity_auto_never_replays_accepted_body_read_failure",
     "test_parity_responses_tool_roundtrip",
     "test_parity_client_history_is_authoritative_with_session_header",
     "test_parity_orka_turns_carry_runtime_session_history",
@@ -65,6 +71,10 @@ def pytest_generate_tests(metafunc: Any) -> None:
     """Run every inherited parity assertion against both startup API selections."""
     if "model_api" in metafunc.fixturenames:
         metafunc.parametrize("model_api", ["chat_completions", "responses"])
+    if "auto_rejection" in metafunc.fixturenames:
+        metafunc.parametrize("auto_rejection", ["route", "unsupported_endpoint"])
+    if "auto_error" in metafunc.fixturenames:
+        metafunc.parametrize("auto_error", [401, 404, 429, 500])
     if "response_status" in metafunc.fixturenames:
         metafunc.parametrize("response_status", ["incomplete", "failed", "in_progress"])
 
@@ -135,6 +145,8 @@ class _Reply:
     finish: str = "stop"
     body: Any = None
     headers: dict[str, str] = field(default_factory=dict)
+    raw_body: bytes | None = None
+    incomplete_body: bool = False
 
 
 def _answer(text: str) -> _Reply:
@@ -206,6 +218,8 @@ def _tool_definitions(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _model_wire_response(body: dict[str, Any], reply: _Reply, model_api: str) -> tuple[str, bytes]:
     """Encode the bounded script as native JSON or SDK-consumable SSE for either API."""
+    if reply.raw_body is not None:
+        return "application/json", reply.raw_body
     if reply.message is None:
         if (
             model_api == "responses"
@@ -388,6 +402,12 @@ class _ScriptedProvider:
             self.paths.append(handler.path)
         expected_path = "/v1/responses" if self.model_api == "responses" else "/v1/chat/completions"
         if handler.path != expected_path:
+            if getattr(self, "auto_chat_only", False) and handler.path == "/v1/responses":
+                error = {"detail": "Not Found"}
+                if getattr(self, "auto_rejection_code", None):
+                    error = {"error": {"code": self.auto_rejection_code, "message": "Responses not supported"}}
+                self._send(handler, 404, "application/json", json.dumps(error).encode())
+                return
             self._send(handler, 400, "application/json", b'{"error":{"message":"wrong upstream API"}}')
             return
         reply = self.script(body)
@@ -395,7 +415,7 @@ class _ScriptedProvider:
             handler.close_connection = True
             return
         content_type, payload = _model_wire_response(body, reply, self.model_api)
-        self._send(handler, reply.status, content_type, payload, reply.headers)
+        self._send(handler, reply.status, content_type, payload, reply.headers, incomplete_body=reply.incomplete_body)
 
     @staticmethod
     def _send(
@@ -404,14 +424,17 @@ class _ScriptedProvider:
         content_type: str,
         payload: bytes,
         headers: dict[str, str] | None = None,
+        *, incomplete_body: bool = False,
     ) -> None:
         handler.send_response(status)
         for name, value in (headers or {}).items():
             handler.send_header(name, value)
         handler.send_header("content-type", content_type)
-        handler.send_header("content-length", str(len(payload)))
+        handler.send_header("content-length", str(len(payload) + (128 if incomplete_body else 0)))
         handler.end_headers()
         handler.wfile.write(payload)
+        if incomplete_body:
+            handler.close_connection = True
 
 
 # --------------------------------------------------------------------------- #
@@ -441,9 +464,10 @@ def _canary_env(model_api: str) -> Iterator[None]:
 
 @contextmanager
 def _harness(
-    *, model_api: str, tools: bool = False, rejecting_remote_tool: bool = False
+    *, model_api: str, tools: bool = False, rejecting_remote_tool: bool = False, selector: str | None = None,
 ) -> Iterator[tuple[_ScriptedProvider, AgentSpec]]:
-    with tempfile.TemporaryDirectory() as tmp, _ScriptedProvider(model_api) as provider, _canary_env(model_api):
+    with tempfile.TemporaryDirectory() as tmp, _ScriptedProvider(model_api) as provider, _canary_env(selector or model_api):
+        provider.auto_chat_only = selector == "auto" and model_api == "chat_completions"
         tool_specs: list[dict[str, Any]] = []
         if tools:
             server = os.path.join(tmp, "parity_mcp_server.py")
@@ -479,7 +503,10 @@ def _harness(
         )
         yield provider, spec
         expected_path = "/v1/responses" if model_api == "responses" else "/v1/chat/completions"
-        assert provider.paths == [expected_path] * len(provider.requests)
+        if provider.auto_chat_only:
+            assert provider.paths == ["/v1/responses"] + [expected_path] * (len(provider.requests) - 1)
+        else:
+            assert provider.paths == [expected_path] * len(provider.requests)
         if model_api == "responses":
             for body in provider.bodies():
                 assert "messages" not in body
@@ -658,6 +685,85 @@ def test_parity_dual_openai_endpoints_with_sdk(model_api, openai_client_factory)
     for body in provider.bodies():
         assert body["model"] == _MODEL_NAME
         assert _conversation(body) == _EXPECTED_CONVERSATION
+
+
+def test_parity_auto_prefers_responses_for_both_client_endpoints():
+    """Auto uses the real initial request, then caches Responses for either facade."""
+    with _harness(model_api="responses", selector="auto") as (provider, spec), _openai(spec) as client:
+        chat = _chat(client, [{"role": "user", "content": "first"}])
+        response = client.post("/v1/responses", json={"input": "second", "store": False})
+        assert chat.status_code == response.status_code == 200
+        assert chat.json()["choices"][0]["message"]["content"] == "parity-answer"
+        assert response.json()["output"][0]["content"][0]["text"] == "parity-answer"
+    assert len(provider.requests) == 2
+    assert _conversation(provider.bodies()[0]) == [("system", _INSTRUCTIONS), ("user", "first")]
+    assert _conversation(provider.bodies()[1]) == [("system", _INSTRUCTIONS), ("user", "second")]
+
+
+def test_parity_auto_falls_back_once_and_keeps_baked_tools(auto_rejection):
+    with _harness(model_api="chat_completions", selector="auto", tools=True) as (provider, spec), _openai(spec) as client:
+        provider.auto_rejection_code = auto_rejection if auto_rejection != "route" else None
+        provider.script = _call_then_answer(("probe_echo", json.dumps({"value": "AUTO"})))
+        response = client.post("/v1/responses", json={"input": "use the tool", "store": False})
+        assert response.status_code == 200, response.text
+        assert response.json()["output"][0]["content"][0]["text"] == "parity-final"
+        assert "receipt-AUTO" in _tool_results(provider.bodies()[-1])["call_parity_0"]
+        assert len(provider.requests) == 3
+        provider.script = lambda body: _answer("cached")
+        assert _chat(client, [{"role": "user", "content": "next"}]).json()["choices"][0]["message"]["content"] == "cached"
+    assert provider.paths == ["/v1/responses"] + ["/v1/chat/completions"] * 3
+    assert [auth for auth, _ in provider.requests] == [f"Bearer {_MODEL_KEY}"] * 4
+
+
+def test_parity_auto_never_switches_on_auth_model_or_service_errors(auto_error):
+    with _harness(model_api="responses", selector="auto") as (provider, spec), _openai(spec) as client:
+        provider.script = lambda body: _Reply(status=auto_error, body={
+            "error": {"code": "model_not_found", "message": f"private {_MODEL_KEY}"},
+        })
+        response = client.post("/v1/responses", json={"input": "hi"})
+        assert response.status_code == (502 if auto_error == 404 else 503), response.text
+        _assert_no_canary(response.text)
+    assert provider.requests
+    assert set(provider.paths) == {"/v1/responses"}
+
+
+def test_parity_auto_never_switches_after_accepted_incomplete_output():
+    with _harness(model_api="responses", selector="auto") as (provider, spec), _openai(spec) as client:
+        incomplete = _responses_body(_MODEL_NAME, {"role": "assistant", "content": "partial"})
+        incomplete["status"] = "incomplete"
+        provider.script = lambda body: _Reply(body=incomplete)
+        first = client.post("/v1/responses", json={"input": "first"})
+        assert first.status_code == 502, first.text
+        provider.script = lambda body: _Reply(status=404, body={"detail": "Not Found"})
+        second = _chat(client, [{"role": "user", "content": "second"}])
+        assert second.status_code == 502, second.text
+    assert provider.paths == ["/v1/responses"] * 2
+
+
+def test_parity_auto_never_replays_accepted_malformed_json():
+    """A bare decoder failure still pins the API at HTTP header acceptance."""
+    with _harness(model_api="responses", selector="auto") as (provider, spec), _openai(spec) as client:
+        provider.script = lambda body: _Reply(raw_body=b'{"truncated":')
+        first = client.post("/v1/responses", json={"input": "first"})
+        assert first.status_code == 502, first.text
+        assert provider.paths == ["/v1/responses"]
+        provider.script = lambda body: _Reply(status=404, body={"detail": "Not Found"})
+        second = _chat(client, [{"role": "user", "content": "second"}])
+        assert second.status_code == 502, second.text
+    assert provider.paths == ["/v1/responses"] * 2
+
+
+def test_parity_auto_never_replays_accepted_body_read_failure():
+    """200 headers followed by EOF must neither replay nor allow Chat fallback."""
+    with _harness(model_api="responses", selector="auto") as (provider, spec), _openai(spec) as client:
+        provider.script = lambda body: _Reply(raw_body=b'{"partial":', incomplete_body=True)
+        first = client.post("/v1/responses", json={"input": "first"})
+        assert first.status_code == 502, first.text
+        assert provider.paths == ["/v1/responses"]
+        provider.script = lambda body: _Reply(status=404, body={"detail": "Not Found"})
+        second = _chat(client, [{"role": "user", "content": "second"}])
+        assert second.status_code == 502, second.text
+    assert provider.paths == ["/v1/responses"] * 2
 
 
 def test_parity_client_history_is_authoritative_with_session_header(model_api):

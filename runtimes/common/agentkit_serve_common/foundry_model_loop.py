@@ -6,7 +6,8 @@ itself. The loop exposes only static safe brokered schemas to the model, convert
 one model tool request at a time into a hosted Responses function_call, and
 resumes with Orka's function_call_output until the assistant finishes.
 
-AGENTKIT_MODEL_API selects Chat Completions by default or Responses explicitly.
+AGENTKIT_MODEL_API selects Chat Completions by default, Responses explicitly, or
+auto negotiation on the first real request.
 The retained transcript stays chat-shaped and is translated for the selected API.
 Responses turns preserve phase and encrypted reasoning in output order; the API
 choice remains fixed for each pending hosted continuation.
@@ -21,6 +22,8 @@ import os
 import random
 import time
 import uuid
+from asyncio import Lock
+from copy import copy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from email.utils import mktime_tz, parsedate_tz
@@ -28,9 +31,10 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
-from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, resolve_model_api, resolve_workload_identity_token
+from .adapter_support import AgentBuildError, ModelAPI, NO_AUTH_API_KEY, resolve_api_key, resolve_model_api, resolve_workload_identity_token
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
+from .model_api_auto import is_unsupported_responses_response
 from .model_errors import normalized_model_http_error as _normalized_model_http_error
 from .runtime import AgentRunError, BrokeredToolDefinition
 from .skills import SkillCatalog
@@ -39,6 +43,10 @@ from .tool_errors import orka_tool_error_details
 _MAX_ARGUMENT_DEPTH = 128
 _MAX_RATE_LIMIT_RETRIES = 2
 _MAX_RETRY_AFTER_SECONDS = 60
+
+
+class _UnsupportedResponsesEndpoint(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -72,7 +80,10 @@ class BrokeredChatModelLoop:
         max_tool_calls: int = 16,
     ) -> None:
         self.spec = spec
-        self.model_api = resolve_model_api()
+        self.model_api_selection = resolve_model_api()
+        self.model_api: ModelAPI = "responses" if self.model_api_selection == "auto" else self.model_api_selection
+        self._auto_api_selected = self.model_api_selection != "auto"
+        self._first_request_lock = Lock()
         self.tools = list(tools)
         self.http_client = http_client
         self.max_argument_bytes = max_argument_bytes
@@ -84,6 +95,13 @@ class BrokeredChatModelLoop:
         self.skills = SkillCatalog.from_spec(spec)
         if self.skills and "load_skill" in self.tools_by_name:
             raise AgentBuildError("load_skill is reserved for packaged skills")
+
+    def for_model_api(self, model_api: ModelAPI) -> BrokeredChatModelLoop:
+        """Pin a trusted continuation without changing other turns' cached API."""
+        pinned = copy(self)
+        pinned.model_api = model_api
+        pinned._auto_api_selected = True
+        return pinned
 
     async def start(self, request: RunRequest, *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
         return await self._advance(self._initial_messages(request), call_id=call_id)
@@ -249,6 +267,24 @@ class BrokeredChatModelLoop:
         tools: Sequence[Mapping[str, Any]],
         tool_choice: str,
     ) -> dict[str, Any]:
+        if not self._auto_api_selected:
+            async with self._first_request_lock:
+                # Another first request may have selected Chat while we waited.
+                try:
+                    return await self._request_response(messages, tools=self._tool_payloads(), tool_choice=tool_choice)
+                except _UnsupportedResponsesEndpoint:
+                    self.model_api = "chat_completions"
+                    self._auto_api_selected = True
+                    return await self._request_response(messages, tools=self._tool_payloads(), tool_choice=tool_choice)
+        return await self._request_response(messages, tools=tools, tool_choice=tool_choice)
+
+    async def _request_response(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        tools: Sequence[Mapping[str, Any]],
+        tool_choice: str,
+    ) -> dict[str, Any]:
         # The full transcript is resent each round, so the provider need not retain it.
         if self.model_api == "responses":
             payload: dict[str, Any] = {"model": self.spec.model.name, "input": _responses_input(messages), "store": False}
@@ -280,6 +316,14 @@ class BrokeredChatModelLoop:
                     if response.status_code == 429 and retry < _MAX_RATE_LIMIT_RETRIES:
                         retry_delay = _rate_limit_retry_delay(response.headers, retry=retry)
                     if retry_delay is None:
+                        if response.is_success:
+                            # Acceptance pins the API even if reading or validation fails.
+                            self._auto_api_selected = True
+                        elif not self._auto_api_selected and response.status_code in {400, 404, 405, 501}:
+                            # Other failures cannot negotiate an API; leave their bodies unread.
+                            error_body = await _read_response_body_bounded(response, max_bytes=self.max_response_bytes)
+                            if is_unsupported_responses_response(response.status_code, bytes(error_body)):
+                                raise _UnsupportedResponsesEndpoint
                         response.raise_for_status()
                         response_body = await _read_response_body_bounded(
                             response,
@@ -292,7 +336,7 @@ class BrokeredChatModelLoop:
                 headers = await self._auth_headers()
         except httpx.HTTPStatusError as exc:
             raise _normalized_model_http_error(exc.response.status_code) from exc
-        except AgentRunError:
+        except (AgentRunError, _UnsupportedResponsesEndpoint):
             raise
         except Exception as exc:  # noqa: BLE001 - normalize transport/model failures without leaking request URLs.
             raise AgentRunError(
