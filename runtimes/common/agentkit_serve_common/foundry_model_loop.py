@@ -522,6 +522,8 @@ def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
     for item in output:
         if not isinstance(item, Mapping):
             raise AgentRunError("model response output item must be an object", status=502, code="InvalidModelResponse")
+        if item.get("status") not in (None, "completed"):
+            raise AgentRunError("model response output item did not complete", status=502, code="InvalidModelResponse")
         item_type = item.get("type")
         if item_type == "function_call":
             call = {"type": "function", "function": {"name": item.get("name"), "arguments": item.get("arguments")}}

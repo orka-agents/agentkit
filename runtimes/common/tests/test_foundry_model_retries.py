@@ -12,16 +12,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agentkit_serve_common import foundry_model_loop
+from _foundry_model_api_cases import (
+    model_api as model_api,
+    _assert_model_request,
+    _chat_response,
+    _tool_response,
+)
 from test_foundry_brokered_protocol import (
-    responses_model_api,
     CONTINUATION_AUTH,
     _app,
     _call,
-    _chat_response,
     _continuation,
     _spec,
 )
-from test_foundry_streaming import _created, _event, _exchange, _tool_response
+from test_foundry_streaming import _created, _event, _exchange
 
 
 class RejectedBody(httpx.AsyncByteStream):
@@ -38,6 +42,7 @@ class RejectedBody(httpx.AsyncByteStream):
 
 
 def _reject(request, bodies, *, headers=None):
+    _assert_model_request(request)
     body = RejectedBody()
     bodies.append(body)
     return httpx.Response(
@@ -91,7 +96,7 @@ async def _payload(client, *, continuation):
 @pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("completion", ["text", "tool", "exhausted"])
 def test_hosted_rate_limit_retries_keep_one_ack_and_unchanged_model_input(
-    continuation, completion, monkeypatch, caplog
+    model_api, continuation, completion, monkeypatch, caplog
 ):
     bodies, requests, credentials = [], [], []
     waits = _capture_waits(monkeypatch, bodies)
@@ -104,6 +109,7 @@ def test_hosted_rate_limit_retries_keep_one_ack_and_unchanged_model_input(
     monkeypatch.setattr(foundry_model_loop.BrokeredChatModelLoop, "_auth_headers", auth)
 
     def model(request):
+        _assert_model_request(request)
         requests.append(request)
         if len(requests) < first_attempt:
             return httpx.Response(200, request=request, json=_tool_response())
@@ -190,13 +196,14 @@ def test_hosted_rate_limit_retries_keep_one_ack_and_unchanged_model_input(
     ],
 )
 def test_model_retry_respects_server_delay_and_never_shortens_long_windows(
-    headers, expected, monkeypatch
+    model_api, headers, expected, monkeypatch
 ):
     monkeypatch.setattr(foundry_model_loop.time, "time", lambda: 1_700_000_000)
     bodies, requests = [], []
     waits = _capture_waits(monkeypatch, bodies)
 
     def model(request):
+        _assert_model_request(request)
         requests.append(request)
         if len(requests) == 1:
             return _reject(request, bodies, headers=headers)
@@ -227,7 +234,7 @@ def test_model_retry_respects_server_delay_and_never_shortens_long_windows(
 
 @pytest.mark.parametrize("header", [None, "invalid", "nan", "inf", "-1"])
 def test_model_missing_or_malformed_retry_header_uses_bounded_backoff(
-    header, monkeypatch
+    model_api, header, monkeypatch
 ):
     bodies = []
     waits = _capture_waits(monkeypatch, bodies)
@@ -236,6 +243,7 @@ def test_model_missing_or_malformed_retry_header_uses_bounded_backoff(
     )
 
     def model(request):
+        _assert_model_request(request)
         return _reject(request, bodies, headers=headers)
 
     app = _app(
@@ -256,7 +264,7 @@ def test_model_missing_or_malformed_retry_header_uses_bounded_backoff(
     "failure", [400, 401, 403, 408, 409, 500, 503, "connect", "read", "json"]
 )
 def test_model_does_not_retry_other_rejections_or_ambiguous_failures(
-    failure, monkeypatch
+    model_api, failure, monkeypatch
 ):
     requests = []
     waits = _capture_waits(monkeypatch, [])
@@ -267,6 +275,7 @@ def test_model_does_not_retry_other_rejections_or_ambiguous_failures(
             raise httpx.ReadError("private-upstream-detail")
 
     def model(request):
+        _assert_model_request(request)
         requests.append(request)
         if failure == "connect":
             raise httpx.ConnectError("private-upstream-detail", request=request)
@@ -294,7 +303,7 @@ def test_model_does_not_retry_other_rejections_or_ambiguous_failures(
 
 @pytest.mark.parametrize("continuation", [False, True])
 def test_hosted_disconnect_during_real_rate_limit_wait_stops_retry_and_releases_state(
-    continuation, tmp_path
+    model_api, continuation, tmp_path
 ):
     async def exercise():
         requests, handlers = [], set()
@@ -306,6 +315,8 @@ def test_hosted_disconnect_during_real_rate_limit_wait_stops_retry_and_releases_
             handlers.add(handler)
             try:
                 headers = await reader.readuntil(b"\r\n\r\n")
+                path = "/v1/responses" if model_api == "responses" else "/v1/chat/completions"
+                assert headers.split(b"\r\n", 1)[0] == f"POST {path} HTTP/1.1".encode()
                 length = next(
                     int(line.split(b":", 1)[1])
                     for line in headers.splitlines()

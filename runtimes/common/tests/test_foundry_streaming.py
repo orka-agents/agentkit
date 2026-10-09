@@ -10,8 +10,12 @@ import httpx
 import pytest
 from agentkit_serve_common.foundry import create_foundry_app
 from agentkit_serve_common.runtime import AgentRunError, RunResult
+from _foundry_model_api_cases import (
+    model_api as model_api,
+    _assert_model_request,
+    _model_response,
+)
 from test_foundry_brokered_protocol import (
-    responses_model_api,
     CONTINUATION_AUTH,
     _app,
     _call,
@@ -43,8 +47,9 @@ def _tool_response():
 
 
 class HeldModel(httpx.AsyncBaseTransport):
-    def __init__(self, result="text", *, continuation=False):
+    def __init__(self, result="text", *, continuation=False, model_api=None):
         self.result = result
+        self.model_api = model_api
         self.held_call = 2 if continuation else 1
         self.calls = 0
         self.started = asyncio.Event()
@@ -52,9 +57,11 @@ class HeldModel(httpx.AsyncBaseTransport):
         self.cancelled = asyncio.Event()
 
     async def handle_async_request(self, request):
+        if self.model_api is not None:
+            _assert_model_request(request, model_api=self.model_api)
         self.calls += 1
         if self.calls < self.held_call:
-            return httpx.Response(200, request=request, json=_tool_response())
+            return self._response(request, _tool_response())
         if self.calls == self.held_call:
             self.started.set()
             try:
@@ -73,6 +80,11 @@ class HeldModel(httpx.AsyncBaseTransport):
             if self.result == "tool"
             else _chat_response({"role": "assistant", "content": "Verified response."})
         )
+        return self._response(request, payload)
+
+    def _response(self, request, payload):
+        if self.model_api is not None:
+            payload = _model_response(payload, model_api=self.model_api)
         return httpx.Response(200, request=request, json=payload)
 
 
@@ -153,14 +165,14 @@ async def _event(outgoing):
 @pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("result", ["text", "tool"])
 def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
-    continuation, result, monkeypatch, tmp_path
+    model_api, continuation, result, monkeypatch, tmp_path
 ):
     clock = [1_700_000_000]
     monkeypatch.setattr("agentkit_serve_common.foundry.time.time", lambda: clock[0])
     state_file = tmp_path / "responses.json"
 
     async def exercise():
-        model = HeldModel(result, continuation=continuation)
+        model = HeldModel(result, continuation=continuation, model_api=model_api)
         async with httpx.AsyncClient(transport=model) as upstream:
             app = _app(
                 _spec(),
@@ -263,9 +275,9 @@ def test_brokered_stream_ack_precedes_model_and_matches_completion_and_replay(
 
 
 @pytest.mark.parametrize("continuation", [False, True])
-def test_brokered_stream_error_retains_acknowledged_identity(continuation):
+def test_brokered_stream_error_retains_acknowledged_identity(model_api, continuation):
     async def exercise():
-        model = HeldModel("error", continuation=continuation)
+        model = HeldModel("error", continuation=continuation, model_api=model_api)
         async with httpx.AsyncClient(transport=model) as upstream:
             app = _app(
                 _spec(),
@@ -317,10 +329,10 @@ def test_brokered_stream_error_retains_acknowledged_identity(continuation):
 
 @pytest.mark.parametrize("continuation", [False, True])
 def test_brokered_stream_disconnect_cancels_model_and_releases_initial_or_resume_state(
-    continuation,
+    model_api, continuation,
 ):
     async def exercise():
-        model = HeldModel(continuation=continuation)
+        model = HeldModel(continuation=continuation, model_api=model_api)
         async with httpx.AsyncClient(transport=model) as upstream:
             app = _app(
                 _spec(),
@@ -366,9 +378,9 @@ def test_brokered_stream_disconnect_cancels_model_and_releases_initial_or_resume
     asyncio.run(exercise())
 
 
-def test_brokered_stream_disconnect_before_created_is_delivered_starts_no_model_work():
+def test_brokered_stream_disconnect_before_created_is_delivered_starts_no_model_work(model_api):
     async def exercise():
-        model = HeldModel()
+        model = HeldModel(model_api=model_api)
         async with httpx.AsyncClient(transport=model) as upstream:
             app = _app(
                 _spec(),
@@ -395,9 +407,9 @@ def test_brokered_stream_disconnect_before_created_is_delivered_starts_no_model_
     asyncio.run(exercise())
 
 
-def test_brokered_stream_validation_failure_keeps_http_error_without_ack():
+def test_brokered_stream_validation_failure_keeps_http_error_without_ack(model_api):
     async def exercise():
-        model = HeldModel()
+        model = HeldModel(model_api=model_api)
         async with httpx.AsyncClient(transport=model) as upstream:
             app = _app(
                 _spec(),

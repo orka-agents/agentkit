@@ -11,10 +11,14 @@ from fastapi.testclient import TestClient
 import agentkit_serve_common.foundry as foundry_module
 import agentkit_serve_common.skills as skills_module
 from agentkit_serve_common.config import AgentSpec
-from test_foundry_brokered_protocol import (
-    responses_model_api,
-    CONTINUATION_AUTH,
+from _foundry_model_api_cases import (
+    model_api as model_api,
     _FakeChatTransport,
+    _model_input,
+    _model_tools,
+)
+from test_foundry_brokered_protocol import (
+    CONTINUATION_AUTH,
     _call,
     _chat_response,
     _continuation,
@@ -61,8 +65,13 @@ def packaged_skill(tmp_path, monkeypatch):
     return AgentSpec.model_validate(data), document, text
 
 
-@pytest.mark.parametrize("trailing_commentary", [False, True])
-def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill, trailing_commentary):
+@pytest.mark.parametrize(
+    ("model_api", "trailing_commentary"),
+    [(None, False), ("responses", False), ("responses", True)],
+    indirect=["model_api"],
+    ids=["default-chat", "responses", "responses-commentary"],
+)
+def test_hosted_skills_load_locally_between_governed_tool_rounds(model_api, packaged_skill, trailing_commentary):
     spec, document, text = packaged_skill
     fake = _FakeChatTransport([
         _tool("load_skill", {"skill_name": "inspection"}),
@@ -95,10 +104,10 @@ def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill,
         assert _message_text(final.json()) == "Incident INC-17 explains the signal loss."
         assert final.json()["usage"] == {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10}
 
-    advertised = {tool["name"] for tool in fake.requests[0]["tools"]}
+    advertised = {tool["name"] for tool in _model_tools(fake.requests[0])}
     assert advertised == {"load_skill", "check-network-telemetry", "get-active-incidents"}
-    assert "inspection" in fake.requests[0]["input"][1]["content"]
-    items = fake.requests[-1]["input"]
+    assert "inspection" in _model_input(fake.requests[0])[1]["content"]
+    items = _model_input(fake.requests[-1])
     calls = [item for item in items if item["type"] == "function_call"]
     outputs = [item for item in items if item["type"] == "function_call_output"]
     assert len(calls) == len({call["call_id"] for call in calls}) == 4
@@ -122,7 +131,7 @@ def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill,
     {"skill_name": "inspection", "path": "/etc/passwd"},
     {"skill_name": 42},
 ])
-def test_hosted_skill_load_rejects_unadvertised_input(packaged_skill, arguments):
+def test_hosted_skill_load_rejects_unadvertised_input(model_api, packaged_skill, arguments):
     spec, _, _ = packaged_skill
     fake = _FakeChatTransport([_tool("load_skill", arguments)])
     with TestClient(_model_loop_app(spec, fake)) as client:
@@ -132,7 +141,7 @@ def test_hosted_skill_load_rejects_unadvertised_input(packaged_skill, arguments)
         assert len(fake.requests) == 1
 
 
-def test_hosted_local_skill_calls_share_the_tool_budget(packaged_skill):
+def test_hosted_local_skill_calls_share_the_tool_budget(model_api, packaged_skill):
     spec, _, _ = packaged_skill
     fake = _FakeChatTransport([_tool("load_skill", {"skill_name": "inspection"}) for _ in range(17)])
     with TestClient(_model_loop_app(spec, fake)) as client:
@@ -145,7 +154,7 @@ def test_hosted_local_skill_calls_share_the_tool_budget(packaged_skill):
 
 
 @pytest.mark.parametrize("denied", [False, True])
-def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(tmp_path, denied):
+def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(model_api, tmp_path, denied):
     state_file = tmp_path / "responses.json"
     spec = _multi_tool_spec()
     fake = _FakeChatTransport([
@@ -168,7 +177,7 @@ def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(tmp_p
         assert _call(second)["name"] == "get-active-incidents"
         assert client.post("/responses", json=first_result, headers=CONTINUATION_AUTH).json() == second
         assert len(fake.requests) == 2
-        assert json.loads(fake.requests[1]["input"][-1]["output"]) == first_output
+        assert json.loads(_model_input(fake.requests[1])[-1]["output"]) == first_output
     # Capacity is per workflow, so advancing remains possible with one entry.
     assert len(json.loads(state_file.read_text())["states"]) == 1
     resumed_model = _FakeChatTransport([_chat_response({"role": "assistant", "content": "Incident INC-17 explains the outage."})])
@@ -187,11 +196,11 @@ def test_chained_tool_calls_keep_pairing_replay_and_results_across_restart(tmp_p
         assert client.post("/responses", json=first_result, headers=CONTINUATION_AUTH).json() == second
         assert client.post("/responses", json=second_result, headers=CONTINUATION_AUTH).json() == completed.json()
         assert len(resumed_model.requests) == 1
-        returned = [json.loads(item["output"]) for item in resumed_model.requests[0]["input"] if item["type"] == "function_call_output"]
+        returned = [json.loads(item["output"]) for item in _model_input(resumed_model.requests[0]) if item["type"] == "function_call_output"]
         assert returned == [first_output, {"approved": True, "output": {"incident": "INC-17"}}]
 
 
-def test_every_new_round_validates_tool_and_arguments_before_export():
+def test_every_new_round_validates_tool_and_arguments_before_export(model_api):
     fake = _FakeChatTransport([
         _tool("check-network-telemetry", {"site": "site-a"}),
         _tool("check-network-telemetry", {"site": 42}),
@@ -208,7 +217,7 @@ def test_every_new_round_validates_tool_and_arguments_before_export():
         assert _call(retried.json())["name"] == "get-active-incidents"
 
 
-def test_chained_round_write_failure_retries_cached_transition_without_model_work(tmp_path, monkeypatch):
+def test_chained_round_write_failure_retries_cached_transition_without_model_work(model_api, tmp_path, monkeypatch):
     fake = _FakeChatTransport([_tool("conformance_read"), _tool("conformance_read")])
     original = foundry_module._FoundryResponseStateStore._persist
     fail = False
@@ -231,7 +240,7 @@ def test_chained_round_write_failure_retries_cached_transition_without_model_wor
         assert len(fake.requests) == 2
 
 
-def test_earlier_round_replays_after_later_capacity_failure_and_restart(tmp_path):
+def test_earlier_round_replays_after_later_capacity_failure_and_restart(model_api, tmp_path):
     state_file = tmp_path / "responses.json"
     fake = _FakeChatTransport([
         _tool("conformance_read"),
@@ -266,7 +275,7 @@ def test_earlier_round_replays_after_later_capacity_failure_and_restart(tmp_path
         assert not restarted.requests
 
 
-def test_brokered_workflow_has_a_finite_tool_budget():
+def test_brokered_workflow_has_a_finite_tool_budget(model_api):
     fake = _FakeChatTransport([_tool("conformance_read") for _ in range(17)])
     with TestClient(_model_loop_app(_spec(), fake, max_pending_responses=1)) as client:
         response = client.post("/responses", json={"input": "Keep reading"})
@@ -279,7 +288,7 @@ def test_brokered_workflow_has_a_finite_tool_budget():
         assert fake.requests[-1]["tools"] == fake.requests[0]["tools"]
 
 
-def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_path):
+def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(model_api, tmp_path):
     state_file = tmp_path / "responses.json"
     fake = _FakeChatTransport([
         _chat_response({"role": "assistant", "content": "I will inspect site-a."}),
@@ -295,7 +304,7 @@ def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_p
         request["agent_session_id"] = "session-a"
         completed = client.post("/responses", json=request, headers=CONTINUATION_AUTH)
         assert completed.status_code == 200, completed.text
-        context = fake.requests[1]["input"]
+        context = _model_input(fake.requests[1])
         assert context[-3:] == [
             {"type": "message", "role": "user", "content": "My site is site-a"},
             {"type": "message", "role": "assistant", "content": "I will inspect site-a."},
@@ -314,14 +323,14 @@ def test_hosted_followups_retain_dialogue_without_tool_data_across_restart(tmp_p
         followup = client.post("/responses", json=payload)
         assert followup.status_code == 200, followup.text
         assert _message_text(followup.json()) == "INC-17 is the incident at site-a."
-        items = restarted.requests[0]["input"]
+        items = _model_input(restarted.requests[0])
         assert any(item.get("content") == "Site-a has incident INC-17." for item in items)
         assert all(item["type"] == "message" for item in items)
         assert "tool-data-only" not in json.dumps(items)
         assert len(restarted.requests) == 1
 
 
-def test_hosted_followup_with_unknown_history_fails_closed():
+def test_hosted_followup_with_unknown_history_fails_closed(model_api):
     fake = _FakeChatTransport([])
     with TestClient(_model_loop_app(_spec(), fake)) as client:
         response = client.post("/responses", json={"input": "Continue", "agent_session_id": "session-a", "previous_response_id": "unknown-response"})
@@ -331,7 +340,7 @@ def test_hosted_followup_with_unknown_history_fails_closed():
 
 
 @pytest.mark.parametrize("session_id", [None, "session-a", "session-b"])
-def test_expired_hosted_history_rejects_followup_even_without_session_id(session_id):
+def test_expired_hosted_history_rejects_followup_even_without_session_id(model_api, session_id):
     fake = _FakeChatTransport([
         _chat_response({"role": "assistant", "content": "Your site is site-a."}),
         _chat_response({"role": "assistant", "content": "Must not run without the expired context."}),

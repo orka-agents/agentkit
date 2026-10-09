@@ -10,15 +10,19 @@ from fastapi.testclient import TestClient
 
 from agentkit_serve_common import foundry_model_loop
 from agentkit_serve_common.runtime import AgentRunError
+from _foundry_model_api_cases import (
+    model_api as model_api,
+    _assert_model_request,
+    _response_function,
+    _tool_response,
+)
 from test_foundry_brokered_protocol import (
-    responses_model_api,
     CONTINUATION_AUTH,
     _app,
     _call,
     _continuation,
     _spec,
 )
-from test_foundry_streaming import _tool_response
 
 
 def _response_error(app, *, continuation, stream=True, status=400):
@@ -78,13 +82,13 @@ def _response_error(app, *, continuation, stream=True, status=400):
     ],
 )
 def test_model_tool_validation_never_reflects_names_keys_or_paths(
-    continuation, stream, kind, code, message, caplog
+    model_api, continuation, stream, kind, code, message, caplog
 ):
     calls = 0
     marker = "private-upstream-detail"
     spec = _spec()
     payload = _tool_response()
-    function = payload["output"][0]
+    function = _response_function(payload)
     if kind == "unknown-name":
         function["name"] = marker
     elif kind == "duplicate-key":
@@ -98,6 +102,7 @@ def test_model_tool_validation_never_reflects_names_keys_or_paths(
         function["arguments"] = json.dumps({marker: {"api_key": "synthetic-value"}})
 
     def model(request):
+        _assert_model_request(request)
         nonlocal calls
         calls += 1
         result = _tool_response() if continuation and calls == 1 else payload
@@ -129,11 +134,12 @@ def test_model_tool_validation_never_reflects_names_keys_or_paths(
     ],
 )
 def test_model_http_error_retains_only_normalized_code_and_status(
-    continuation, status, code, message, caplog
+    model_api, continuation, status, code, message, caplog
 ):
     calls = 0
 
     def model(request):
+        _assert_model_request(request)
         nonlocal calls
         calls += 1
         if continuation and calls == 1:
@@ -161,10 +167,11 @@ def test_model_http_error_retains_only_normalized_code_and_status(
 
 @pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("kind", ["transport", "invalid-json"])
-def test_non_http_model_failures_have_no_upstream_status(continuation, kind):
+def test_non_http_model_failures_have_no_upstream_status(model_api, continuation, kind):
     calls = 0
 
     def model(request):
+        _assert_model_request(request)
         nonlocal calls
         calls += 1
         if continuation and calls == 1:
@@ -213,7 +220,7 @@ def _raise_model_error(monkeypatch, *, continuation, error):
     ],
 )
 def test_known_model_codes_use_fixed_messages_and_do_not_trust_status_attributes(
-    continuation, code, message, monkeypatch, caplog
+    model_api, continuation, code, message, monkeypatch, caplog
 ):
     error = AgentRunError("private-upstream-detail", status=999, code=code)
     error.upstream_status = 401
@@ -228,7 +235,7 @@ def test_known_model_codes_use_fixed_messages_and_do_not_trust_status_attributes
 @pytest.mark.parametrize("continuation", [False, True])
 @pytest.mark.parametrize("upstream_status", [True, "401", 401.0, 399, 600, None])
 def test_normalized_http_error_rejects_invalid_upstream_status(
-    continuation, upstream_status, monkeypatch
+    model_api, continuation, upstream_status, monkeypatch
 ):
     error = foundry_model_loop._normalized_model_http_error(401)
     error.upstream_status = upstream_status
@@ -251,7 +258,7 @@ def test_normalized_http_error_rejects_invalid_upstream_status(
     ],
 )
 def test_unknown_model_codes_and_statuses_are_sanitized(
-    continuation, code, status, monkeypatch, caplog
+    model_api, continuation, code, status, monkeypatch, caplog
 ):
     error = AgentRunError("private-upstream-detail", status=status, code=code)
     error.upstream_status = 401
@@ -264,7 +271,7 @@ def test_unknown_model_codes_and_statuses_are_sanitized(
 
 
 @pytest.mark.parametrize("continuation", [False, True])
-def test_unexpected_model_exception_remains_generic(continuation, monkeypatch, caplog):
+def test_unexpected_model_exception_remains_generic(model_api, continuation, monkeypatch, caplog):
     app = _raise_model_error(
         monkeypatch,
         continuation=continuation,

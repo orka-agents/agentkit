@@ -3800,6 +3800,30 @@ def test_foundry_brokered_model_loop_rejects_responses_that_did_not_complete(sta
     assert response.json()["error"]["code"] == "InvalidModelResponse"
 
 
+@pytest.mark.parametrize("status", ["incomplete", "in_progress", "failed", "cancelled"])
+@pytest.mark.parametrize("item_type", ["message", "function_call", "reasoning"])
+def test_foundry_brokered_model_loop_rejects_unfinished_output_items(status, item_type):
+    if item_type == "function_call":
+        item = _function_call_item()
+    elif item_type == "reasoning":
+        item = {"type": "reasoning", "summary": [], "encrypted_content": "opaque-test-state"}
+    else:
+        item = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Partial"}]}
+    item["status"] = status
+    output = [item]
+    if item_type == "reasoning":
+        output.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done"}]})
+    fake = _FakeChatTransport([{"object": "response", "status": "completed", "output": output, "usage": {}}])
+    app = _model_loop_app(_spec(tool_name="check-network-telemetry"), fake)
+
+    with TestClient(app) as client:
+        response = client.post("/responses", json={"input": "Check telemetry"})
+
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
+    assert len(fake.requests) == 1
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
