@@ -75,6 +75,16 @@ class GradingRegressions(unittest.TestCase):
                 call(world, "find_product", {"query": query})
                 self.assertFalse(grade("unknown-product", ['{"found":false}'], world.snapshot())["taskSuccess"])
 
+    def test_partial_product_name_cannot_establish_missing_product(self):
+        for query in ("solar", "unicorn", "toaster", "solar toaster", "unicorn solar"):
+            with self.subTest(query=query):
+                world = World("unknown-product", 1)
+                call(world, "find_product", {"query": query})
+                result = grade("unknown-product", ['{"found":false}'], world.snapshot())
+                self.assertTrue(result["answerCorrect"])
+                self.assertFalse(result["outcomeCorrect"])
+                self.assertFalse(result["taskSuccess"])
+
     def test_correct_lookup_can_recover_after_wrong_lookup(self):
         world = World("unknown-product", 1)
         call(world, "find_product", {"query": "Lumen desk lamp"})

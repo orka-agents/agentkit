@@ -205,7 +205,7 @@ def _missing_product_query(query: Any) -> bool:
         for word in re.findall(r"[a-z]+", query.lower())
         if word not in {"a", "an", "the", "please", "find", "search", "for", "product"}
     ]
-    return bool(words) and set(words).issubset({"unicorn", "solar", "toaster"})
+    return set(words) == {"unicorn", "solar", "toaster"}
 
 
 def _asserted_product_identity(value: Any, product_context: bool = False) -> bool:
