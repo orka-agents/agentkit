@@ -415,10 +415,12 @@ AGENTKIT_MODEL_API=responses
 ```
 
 This setting controls the upstream model connection, not AgentKit's hosted
-`/responses` endpoint. Direct Pydantic AI and LangGraph clients are Chat-only.
-Microsoft Agent Framework API-key/token-hook clients are Chat-only; its Foundry
-project-credential fallback is Responses-only and requires explicit selection.
-Unsupported combinations fail before SDK/auth initialization. Chat mode sends `messages` to
+`/responses` endpoint. Both APIs are also available through the direct Pydantic
+AI, Microsoft Agent Framework, and LangGraph adapters, including standalone
+Docker runs. MAF supports both APIs with API-key, token-hook, or Foundry
+project-credential auth. The model backend must support the selected API;
+AgentKit does not silently switch to the other one. Invalid selections fail
+before SDK/auth initialization. In this brokered loop, Chat mode sends `messages` to
 `<model.baseURL>/chat/completions`; Responses mode sends `input` items to
 `<model.baseURL>/responses`. Both expose the same safe static `brokeredTools`
 and preserve Orka's sequential approval and continuation contract. A base URL

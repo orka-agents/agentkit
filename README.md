@@ -84,15 +84,35 @@ docker run \
 agentkit-serve --config /agent/agent.yaml --protocol acp
 ```
 
-`AGENTKIT_MODEL_API` separately selects the upstream model API. It defaults to
-`chat_completions`; set `responses` for the Foundry brokered model loop when its
-model requires Responses. Direct Pydantic AI and LangGraph paths are Chat-only.
-Microsoft Agent Framework supports Chat through API-key/token-hook clients and
-Responses through its existing Foundry project-credential fallback. Unsupported
-API/auth combinations fail explicitly. This is startup configuration, not a
-per-turn override.
+`AGENTKIT_MODEL_API` separately selects the upstream model API for Pydantic AI,
+Microsoft Agent Framework, and LangGraph. It defaults to `chat_completions`;
+set it to `responses` to use a Responses-compatible model backend. This works
+with standalone/local Docker agents and the OpenAI, Foundry, Orka, and ACP
+serving protocols. It does not require Foundry hosting or Foundry credentials.
+The configured model backend must implement the selected API; AgentKit does not
+silently fall back to Chat when Responses is unavailable.
+
+For example, the same standalone image can accept Chat Completions requests
+while calling the model through Responses:
+
+```sh
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -e AGENTKIT_BIND=0.0.0.0 \
+  -e AGENTKIT_AUTH_TOKEN=dev-token \
+  -e AGENTKIT_MODEL_API=responses \
+  -e OPENAI_API_KEY \
+  url-summarizer:latest
+```
+
+The local Makefile workflow also forwards this selector:
+`make run-test-agent AGENTKIT_MODEL_API=responses`, with `RUNTIME=maf` or
+`RUNTIME=langgraph` when needed.
+
+This is startup configuration, not a per-turn override. The separate
+`agentsessions` host-mediated model contract remains Chat-only.
 See [model-driven tool workflows](docs/foundry-hosted-brokered.md#model-driven-tool-workflows)
-for the supported paths and continuation rules.
+for brokered continuation rules.
 
 Protocol endpoints:
 

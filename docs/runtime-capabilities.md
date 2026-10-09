@@ -84,16 +84,20 @@ are validated through the offline echo/conformance runtime, while real model
 adapters should only enable those gates after their native pause/resume/tool-output
 hooks have matching conformance coverage.
 
-`AGENTKIT_MODEL_API` is a shared startup selector. Its default is
-`chat_completions`; the Foundry brokered model loop also supports `responses`.
-Direct Pydantic AI and LangGraph model paths support Chat Completions only;
-LangGraph's SDK transport is explicitly pinned to Chat even when its own settings
-would otherwise infer Responses. Microsoft Agent Framework API-key and token-hook
-paths support Chat Completions, while its existing Foundry project-credential
-fallback is Responses-only and requires explicit `AGENTKIT_MODEL_API=responses`.
-Each path rejects unsupported choices before client/auth initialization. Native
-Anthropic Messages is not supported. This selector does not change hosted HTTP protocol selection or the
-agent.yaml model ABI.
+`AGENTKIT_MODEL_API` is a shared startup selector for the upstream model API.
+All three runtime adapters and the Foundry brokered model loop support
+`chat_completions`, the default, and `responses`. This choice is independent of
+local/container deployment, inbound HTTP/ACP protocol, and MAF model auth mode.
+MAF supports both APIs with API keys, token hooks, and its Azure project-credential
+fallback. LangGraph explicitly sets its SDK transport so ambient LangChain
+settings cannot override this selector.
+
+Responses requires a backend that implements `/responses`; Chat requires
+`/chat/completions`. AgentKit does not probe or silently switch APIs. Invalid
+selector values fail before client/auth initialization. The separate
+`agentsessions` host-mediated model contract remains Chat-only. Native Anthropic
+Messages is not supported. This selector does not change the agent.yaml model
+ABI or the endpoints AgentKit exposes.
 
 ## Brokered runtime feasibility decisions
 

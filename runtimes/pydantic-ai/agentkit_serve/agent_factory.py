@@ -2,8 +2,8 @@
 
 Verified against modern pydantic-ai (1.107.x through 2.x). Key facts baked in here:
 
-* The OpenAI-compatible model class is ``OpenAIChatModel`` (``OpenAIModel`` is a
-  deprecated alias); its base_url/api_key come from an ``OpenAIProvider``.
+* Direct upstream connections use ``OpenAIChatModel`` or ``OpenAIResponsesModel``
+  selected at startup; both take base_url/api_key from an ``OpenAIProvider``.
 * stdio MCP servers are passed to the agent as ``toolsets`` (the old
   ``mcp_servers=`` kwarg is gone). pydantic-ai 1.x exposes ``MCPServerStdio``;
   pydantic-ai 2.x uses ``MCPToolset(StdioTransport(...))``.
@@ -23,10 +23,17 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Any, AsyncIterable
+from typing import Any, AsyncIterable, AsyncIterator, cast
 
-from pydantic_ai import Agent, ModelRetry
+from openai import AsyncStream
+from openai.types import responses
+from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models import ModelRequestParameters, StreamedResponse
+from pydantic_ai.settings import ModelSettings
 
 try:  # pydantic-ai 1.x
     from pydantic_ai.mcp import MCPServerStdio
@@ -45,7 +52,12 @@ try:
 except ImportError:  # pragma: no cover - older dependency set without FastMCP transports
     StdioTransport = None  # type: ignore[assignment]
     StreamableHttpTransport = None  # type: ignore[assignment]
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIResponsesModel,
+    OpenAIResponsesModelSettings,
+    OpenAIResponsesStreamedResponse,
+)
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from agentkit_serve_common.adapter_support import (
@@ -90,15 +102,147 @@ def validate_supported_spec(spec: AgentSpec) -> None:
         raise AgentBuildError("pydantic-ai runtime does not support context providers")
 
 
-def build_model(spec: AgentSpec) -> OpenAIChatModel:
-    """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
-    resolve_model_api(supported={"chat_completions"}, runtime="pydantic-ai runtime")
+class _ValidatedResponsesStream:
+    """Validate decoded native events before Pydantic AI drops item statuses.
+
+    The OpenAI SDK still owns SSE decoding, HTTP errors and transport cleanup.
+    This proxy supplies the async-iteration/close interface its model consumes.
+    """
+
+    def __init__(
+        self, source: AsyncStream[responses.ResponseStreamEvent], model: _CompletedResponsesModel,
+    ) -> None:
+        self._source = source
+        self._iterator = aiter(source)
+        self._model = model
+        self._unfinished: set[int] = set()
+        self.response = source.response
+
+    def __aiter__(self) -> AsyncIterator[responses.ResponseStreamEvent]:
+        return self
+
+    async def __anext__(self) -> responses.ResponseStreamEvent:
+        event = await anext(self._iterator)
+        if event.type == "response.output_item.added":
+            if getattr(event.item, "status", None) == "incomplete":
+                self._model._raise_incomplete()
+            # Omitted optional status is not evidence that an added item finished.
+            self._unfinished.add(event.output_index)
+        elif event.type == "response.output_item.done":
+            self._model._require_finished_item(event.item)
+            self._unfinished.discard(event.output_index)
+        elif event.type in {"response.failed", "response.incomplete", "error"}:
+            self._model._raise_incomplete()
+        elif event.type == "response.completed":
+            self._model._require_raw_completed(event.response)
+            self._unfinished.difference_update(range(len(event.response.output)))
+            if self._unfinished:
+                self._model._raise_incomplete()
+        return event
+
+    async def close(self) -> None:
+        await self._source.close()
+
+
+class _CompletedResponsesModel(OpenAIResponsesModel):
+    """Use the SDK's Responses model, but fail closed on unfinished output.
+
+    Pydantic AI accepts Responses EOF and, in older supported versions, failed or
+    incomplete terminal events as partial model output. Check before the agent
+    can commit text or execute tools, matching the Chat stream policy. Raw
+    output-item status checks run before the SDK loses that completion evidence.
+    """
+
+    def _raise_incomplete(self) -> None:
+        raise ModelAPIError(
+            model_name=self.model_name,
+            message="Responses API response did not complete",
+        )
+
+    def _require_finished_item(self, item: Any) -> None:
+        # Function-call and reasoning status fields are optional in the native
+        # schema. Reject explicit unfinished evidence, not legitimate omission.
+        if getattr(item, "status", None) in {"in_progress", "incomplete"}:
+            self._raise_incomplete()
+
+    def _require_raw_completed(self, response: responses.Response) -> None:
+        if response.status != "completed":
+            self._raise_incomplete()
+        for item in response.output:
+            self._require_finished_item(item)
+
+    def _process_response(
+        self,
+        response: responses.Response,
+        model_settings: OpenAIResponsesModelSettings,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        self._require_raw_completed(response)
+        return super()._process_response(response, model_settings, model_request_parameters)
+
+    async def _process_streamed_response(
+        self,
+        response: AsyncStream[responses.ResponseStreamEvent],
+        model_settings: OpenAIResponsesModelSettings,
+        model_request_parameters: ModelRequestParameters,
+        *,
+        expected_model_name: str | None = None,
+        expected_response_id: str | None = None,
+    ) -> OpenAIResponsesStreamedResponse:
+        # This SDK hook retains native decoded items on both supported dependency
+        # versions. Its consumer needs only iteration, response and close.
+        validated = cast(
+            AsyncStream[responses.ResponseStreamEvent], _ValidatedResponsesStream(response, self),
+        )
+        return await super()._process_streamed_response(
+            validated, model_settings, model_request_parameters,
+            expected_model_name=expected_model_name, expected_response_id=expected_response_id,
+        )
+
+    def _require_completed(self, response: ModelResponse) -> None:
+        if (response.provider_details or {}).get("finish_reason") != "completed":
+            self._raise_incomplete()
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        response = await super().request(messages, model_settings, model_request_parameters)
+        self._require_completed(response)
+        return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        async with super().request_stream(
+            messages, model_settings, model_request_parameters, run_context=run_context,
+        ) as response:
+            yield response
+            self._require_completed(response.get())
+
+
+def build_model(spec: AgentSpec) -> OpenAIChatModel | OpenAIResponsesModel:
+    """Select the direct upstream API independently of the serving protocol."""
+    model_api = resolve_model_api()
     provider = OpenAIProvider(
         base_url=spec.model.base_url,
         api_key=resolve_api_key(spec),
     )
+    if model_api == "responses":
+        # Each request carries authoritative history; never depend on upstream
+        # response storage or a provider-managed conversation.
+        return _CompletedResponsesModel(
+            spec.model.name, provider=provider, settings={"openai_store": False},
+        )
     # EOF alone must not commit partial text or execute partial tool calls.
-    # Without this, pydantic-ai (>=2.53) treats a stream that ends without a
+    # Without this, pydantic-ai treats a stream that ends without a
     # finish_reason as 'stop'.
     return OpenAIChatModel(
         spec.model.name,
@@ -257,6 +401,8 @@ async def run_agentsessions(
 ) -> None:
     """Fresh text-only SDK execution bound exclusively to the local host bridge.
 
+    The host bridge has a fixed Chat RPC contract. AGENTKIT_MODEL_API selects
+    direct upstream connections only and does not change this mediated path.
     Config remains opaque on RunRequest; this policy does not interpret it.
     The controller owns model OUTPUT and usage, so return None, not RunResult.
     """

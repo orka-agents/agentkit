@@ -38,7 +38,7 @@ from agent_framework import (
     MiddlewareTermination,
     SkillsProvider,
 )
-from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
 from httpx import AsyncClient, URL
 from mcp.types import CallToolResult
 from agentkit_serve_common.adapter_support import (
@@ -262,15 +262,10 @@ async def _close_resource(resource: object) -> None:
         await result
 
 
-def _validate_model_api(spec: AgentSpec) -> None:
-    # The project-credential Foundry client is Responses-based despite its name.
-    supported = {"responses"} if _uses_model_workload_identity_fallback(spec) else {"chat_completions"}
-    resolve_model_api(supported=supported, runtime="Microsoft Agent Framework model client")
-
-
 def build_client(spec: AgentSpec, *, workload_identity_credential: object | None = None):
-    """Construct the chat client for the configured model auth mode."""
-    _validate_model_api(spec)
+    """Construct the selected model API client for the configured auth mode."""
+    model_api = resolve_model_api()
+    client_type = OpenAIChatClient if model_api == "responses" else OpenAIChatCompletionClient
     auth = spec.model.auth
     if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
         if (
@@ -278,7 +273,7 @@ def build_client(spec: AgentSpec, *, workload_identity_credential: object | None
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
         ):
-            return OpenAIChatCompletionClient(
+            return client_type(
                 model=spec.model.name,
                 base_url=spec.model.base_url,
                 api_key=_model_workload_api_key_provider(auth.audience or _DEFAULT_FOUNDRY_AUDIENCE),
@@ -295,13 +290,20 @@ def build_client(spec: AgentSpec, *, workload_identity_credential: object | None
             if workload_identity_credential is not None
             else DefaultAzureCredential()
         )
-        return FoundryChatClient(
+        foundry_client = FoundryChatClient(
             project_endpoint=_project_endpoint_from_openai_base_url(spec.model.base_url),
             model=spec.model.name,
             credential=credential,
         )
+        if model_api == "responses":
+            return foundry_client
+        # Azure project discovery/auth is shared by both APIs. Keep ownership of
+        # its project client on the existing runtime lifecycle stack.
+        chat_client = client_type(model=spec.model.name, async_client=foundry_client.client)
+        chat_client.project_client = foundry_client.project_client
+        return chat_client
 
-    return OpenAIChatCompletionClient(
+    return client_type(
         model=spec.model.name,
         base_url=spec.model.base_url,
         api_key=resolve_api_key(spec),
@@ -484,6 +486,19 @@ class _ModelMessageMiddleware(ChatMiddleware):
         for message in context.messages:
             message.author_name = None
         await call_next()
+        if not context.stream and getattr(context.client, "STORES_BY_DEFAULT", False) is True:
+            # Responses can contain complete-looking calls in a failed or
+            # truncated result. Stop before MAF's function loop executes them.
+            raw = getattr(context.result, "raw_representation", None)
+            unfinished_item = any(
+                getattr(item, "status", None) in {"in_progress", "incomplete"}
+                for item in getattr(raw, "output", ()) or ()
+            )
+            if getattr(raw, "status", None) != "completed" or unfinished_item:
+                error = AgentRunError("model service returned an invalid response", status=502, code="InvalidModelResponse")
+                context.result = None
+                _fail_run_with(error)
+                raise MiddlewareTermination(str(error))
 
 
 def build_agent(
@@ -496,7 +511,7 @@ def build_agent(
     """Assemble the MAF agent: client + system prompt + tools + context."""
     instructions = spec.instructions
     if client is None:
-        _validate_model_api(spec)
+        resolve_model_api()
     tools = [build_tool(t, stack=stack) for t in spec.tools]
     if spec._packaged_skill_catalog:
         skills = spec._packaged_skill_catalog
@@ -518,7 +533,7 @@ def build_agent(
         context_providers=[_RequestHistoryProvider(), *(context_providers or [])],
         middleware=[_ModelMessageMiddleware(), _MCPFailureMiddleware()],
         # Each run already carries the full request history. A client that
-        # stores responses by default (the Foundry Responses API) would also
+        # stores responses by default (the Responses API) would also
         # chain the stored conversation and repeat that history. Other
         # OpenAI-compatible servers may reject an unknown store field.
         default_options={"store": False} if getattr(chat_client, "STORES_BY_DEFAULT", False) else None,
@@ -542,7 +557,7 @@ class MAFRuntime:
 
     async def __aenter__(self) -> RuntimeSession:
         async def start() -> RuntimeSession:
-            _validate_model_api(self.spec)
+            resolve_model_api()
             context_providers = await self._build_context_providers()
             client = await self._build_model_fallback_client()
             self.agent = build_agent(
@@ -662,7 +677,7 @@ class MAFRuntime:
     async def _build_model_fallback_client(self):
         if not _uses_model_workload_identity_fallback(self.spec):
             return None
-        resolve_model_api(supported={"responses"}, runtime="Microsoft Agent Framework Foundry-project credential path")
+        resolve_model_api()
         try:
             from azure.identity import DefaultAzureCredential
         except ImportError as exc:  # pragma: no cover - dependency guard.

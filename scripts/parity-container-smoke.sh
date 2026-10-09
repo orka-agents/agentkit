@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Container parity smoke: run each runtime's built parity agent image under the
-# openai, foundry, and orka protocols against a scripted model and remote MCP
-# tool. Checks a plain answer, a tool round trip, the normalized response to a
+# openai, foundry, and orka protocols with both upstream Chat and Responses APIs
+# against a scripted model and remote MCP tool. Checks API selection, history,
+# a plain answer, a tool round trip, and the normalized response to a
 # 401 that echoes the model key, and that the key never appears in a response or
 # container log. Needs the frontend and adapter images from `make build-agentkit
 # build-serve build-serve-maf build-serve-langgraph` at the same TAG.
@@ -75,13 +76,29 @@ check() {
   jq -e "$filter" >/dev/null <<<"$body" || die "$label: unexpected response: $body"
 }
 
+check_history() {
+  local label="$1" field="$2" body="$3" prompt="$4"
+  check "$label" "($field | ltrimstr(\"parity-history: \" ) | fromjson) as \$turns |
+    (\$turns | length) == 5 and
+    \$turns[0][0] == \"system\" and (\$turns[0][1] | contains(\"Follow the scripted parity fixture.\")) and
+    \$turns[1:] == [[\"system\",\"client system note\"],[\"user\",\"u1 edited\"],[\"assistant\",\"a1 edited\"],[\"user\",\"$prompt\"]]" "$body"
+}
+
 openai_scenarios() {
-  local base="$1" label="$2" out status
+  local base="$1" label="$2" model_api="$3" out status
   local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"plain:P1"}]}')"
   check "$label plain" '.choices[0].message.content == "parity-answer: P1"' "$out"
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"tool:T1"}]}')"
   check "$label tool" '.choices[0].message.content | contains("receipt-T1")' "$out"
+  out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"api:$model_api\"}]}")"
+  check "$label upstream API" ".choices[0].message.content == \"parity-api: $model_api\"" "$out"
+  out="$(curl -sS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/chat/completions" \
+    -d '{"messages":[{"role":"user","content":"old history"}]}')"
+  check "$label initial history" '.choices[0].message.content == "parity-answer: old history"' "$out"
+  out="$(curl -sS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/chat/completions" \
+    -d '{"messages":[{"role":"system","content":"client system note"},{"role":"user","content":"u1 edited"},{"role":"assistant","content":"a1 edited"},{"role":"user","content":"history:H1"}]}')"
+  check_history "$label history" '.choices[0].message.content' "$out" history:H1
   out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"auth-echo"}]}')"
   status="${out##*$'\n'}"
   [[ "$status" == 503 ]] || die "$label auth-echo returned HTTP $status"
@@ -89,12 +106,17 @@ openai_scenarios() {
 }
 
 foundry_scenarios() {
-  local base="$1" label="$2" out status
+  local base="$1" label="$2" model_api="$3" out status
   local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
   out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"plain:P2"}')"
   check "$label plain" '.output[0].content[0].text == "parity-answer: P2"' "$out"
   out="$(curl -sS "${auth[@]}" "$base/responses" -d '{"input":"tool:T2"}')"
   check "$label tool" '.output[0].content[0].text | contains("receipt-T2")' "$out"
+  out="$(curl -sS "${auth[@]}" "$base/responses" -d "{\"input\":\"api:$model_api\"}")"
+  check "$label upstream API" ".output[0].content[0].text == \"parity-api: $model_api\"" "$out"
+  out="$(curl -sS "${auth[@]}" "$base/responses" \
+    -d '{"input":[{"role":"system","content":"client system note"},{"role":"user","content":"u1 edited"},{"role":"assistant","content":"a1 edited"},{"role":"user","content":"history:H2"}]}')"
+  check_history "$label history" '.output[0].content[0].text' "$out" history:H2
   out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/responses" -d '{"input":"auth-echo"}')"
   status="${out##*$'\n'}"
   [[ "$status" == 503 ]] || die "$label auth-echo returned HTTP $status"
@@ -117,15 +139,24 @@ orka_turn() {
 }
 
 orka_scenarios() {
-  local base="$1" label="$2"
+  local base="$1" label="$2" model_api="$3" out
   check "$label plain" '.type == "TurnCompleted" and .completed.result == "parity-answer: P3"' "$(orka_turn "$base" turn-plain plain:P3)"
+  out="$(orka_turn "$base" turn-history history:H3)"
+  # $turns is a jq variable, not a shell expansion.
+  # shellcheck disable=SC2016
+  check "$label history" '.type == "TurnCompleted" and
+    ((.completed.result | ltrimstr("parity-history: ") | fromjson) as $turns |
+    ($turns | length) == 4 and $turns[0][0] == "system" and
+    ($turns[0][1] | contains("Follow the scripted parity fixture.")) and
+    $turns[1:] == [["user","plain:P3"],["assistant","parity-answer: P3"],["user","history:H3"]])' "$out"
+  check "$label upstream API" ".type == \"TurnCompleted\" and .completed.result == \"parity-api: $model_api\"" "$(orka_turn "$base" turn-api "api:$model_api")"
   check "$label tool" '.type == "TurnCompleted" and (.completed.result | contains("receipt-T3"))' "$(orka_turn "$base" turn-tool tool:T3)"
   check "$label auth-echo" '.type == "TurnFailed" and .failed.reason == "ModelAuthRejected"' "$(orka_turn "$base" turn-auth auth-echo)"
 }
 
 run_protocol() {
-  local runtime="$1" protocol="$2" image="parity-$1:$tag"
-  local name="agentkit-parity-$runtime-$protocol-$$" health base port
+  local runtime="$1" protocol="$2" model_api="$3" image="parity-$1:$tag"
+  local name="agentkit-parity-$runtime-$protocol-$model_api-$$" health base port
   case "$protocol" in
     openai) health=/healthz ;;
     foundry) health=/readiness ;;
@@ -135,6 +166,7 @@ run_protocol() {
   docker run -d --name "$name" --platform "$platform" --network "$network" \
     -p 127.0.0.1::8080 \
     -e AGENTKIT_PROTOCOL="$protocol" \
+    -e AGENTKIT_MODEL_API="$model_api" \
     -e AGENTKIT_PORT=8080 \
     -e AGENTKIT_BIND=0.0.0.0 \
     -e AGENTKIT_AUTH_TOKEN="$auth_token" \
@@ -143,15 +175,15 @@ run_protocol() {
     "$image" >/dev/null
   port="$(docker port "$name" 8080/tcp | head -n 1)"
   base="http://127.0.0.1:${port##*:}"
-  wait_for "$base$health" || { docker logs "$name" >&2 || true; die "$runtime $protocol never became healthy"; }
-  log "Checking $runtime under $protocol"
-  "${protocol}_scenarios" "$base" "$runtime $protocol"
-  assert_no_canary "$runtime $protocol container log" "$(docker logs "$name" 2>&1)"
+  wait_for "$base$health" || { docker logs "$name" >&2 || true; die "$runtime $protocol $model_api never became healthy"; }
+  log "Checking $runtime under $protocol with upstream $model_api"
+  "${protocol}_scenarios" "$base" "$runtime $protocol $model_api" "$model_api"
+  assert_no_canary "$runtime $protocol $model_api container log" "$(docker logs "$name" 2>&1)"
   docker rm -f "$name" >/dev/null
 }
 
 main() {
-  local runtime protocol fixture_port
+  local runtime protocol model_api fixture_port
   docker network create "$network" >/dev/null
   log "Starting scripted model and MCP fixture"
   containers+=("$fixture")
@@ -170,11 +202,13 @@ main() {
     make build-test-agent TAG="$tag" BUILDER="$builder" PLATFORM="$platform" RUNTIME="$runtime" \
       SERVE_IMAGE="$(serve_image "$runtime")" FIXTURE="test/parity/agentkitfile-$runtime.yaml" \
       AGENT_IMAGE="parity-$runtime:$tag"
-    for protocol in openai foundry orka; do
-      run_protocol "$runtime" "$protocol"
+    for model_api in chat_completions responses; do
+      for protocol in openai foundry orka; do
+        run_protocol "$runtime" "$protocol" "$model_api"
+      done
     done
   done
-  log "Container parity smoke passed for: ${runtimes[*]}"
+  log "Container parity smoke passed for chat_completions and responses: ${runtimes[*]}"
 }
 
 # The fixture answers only POSTs; any HTTP response means it is listening.
