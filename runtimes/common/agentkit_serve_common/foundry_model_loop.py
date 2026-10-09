@@ -6,11 +6,10 @@ itself. The loop exposes only static safe brokered schemas to the model, convert
 one model tool request at a time into a hosted Responses function_call, and
 resumes with Orka's function_call_output until the assistant finishes.
 
-The model is called through the OpenAI Responses API because reasoning models
-can reject function tools on Chat Completions. The retained transcript keeps a
-chat-shaped message list so pending continuation state stays compatible; it is
-translated to Responses input items for each model request. Tool-call turns also
-retain any encrypted reasoning items so the next stateless request can replay them.
+AGENTKIT_MODEL_API selects Chat Completions by default or Responses explicitly.
+The retained transcript stays chat-shaped and is translated for the selected API.
+Responses turns preserve phase and encrypted reasoning in output order; the API
+choice remains fixed for each pending hosted continuation.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
-from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, resolve_workload_identity_token
+from .adapter_support import AgentBuildError, NO_AUTH_API_KEY, resolve_api_key, resolve_model_api, resolve_workload_identity_token
 from .config import AgentSpec
 from .conversation import FORWARDED_ROLES, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition
@@ -89,7 +88,7 @@ class ModelLoopToolRequest:
 
 
 class BrokeredChatModelLoop:
-    """Bounded sequential tool loop over the OpenAI Responses API."""
+    """Bounded sequential tool loop over the selected OpenAI-compatible API."""
 
     def __init__(
         self,
@@ -104,6 +103,7 @@ class BrokeredChatModelLoop:
         max_tool_calls: int = 16,
     ) -> None:
         self.spec = spec
+        self.model_api = resolve_model_api()
         self.tools = list(tools)
         self.http_client = http_client
         self.max_argument_bytes = max_argument_bytes
@@ -150,8 +150,8 @@ class BrokeredChatModelLoop:
         exhausted = tool_count >= self.max_tool_calls
         # At the limit, keep the definitions that match the replayed calls but forbid new calls.
         data = await self._create_response(messages, tools=self._tool_payloads(), tool_choice="none" if exhausted else "auto")
-        message = _output_message(data)
-        usage = _usage(data)
+        message = _output_message(data) if self.model_api == "responses" else _chat_output_message(data)
+        usage = _usage(data, model_api=self.model_api)
         assistant_messages = message["assistant_messages"]
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -268,6 +268,8 @@ class BrokeredChatModelLoop:
         for tool in self.tools:
             description = f"Brokered class: {tool.brokered_class}. {tool.description}".strip()
             definitions.append({"name": tool.name, "description": description, "parameters": dict(tool.parameters)})
+        if self.model_api == "chat_completions":
+            return [{"type": "function", "function": definition} for definition in definitions]
         # Brokered schemas need not satisfy strict mode; AgentKit validates arguments itself.
         return [{"type": "function", **definition, "strict": False} for definition in definitions]
 
@@ -279,7 +281,12 @@ class BrokeredChatModelLoop:
         tool_choice: str,
     ) -> dict[str, Any]:
         # The full transcript is resent each round, so the provider need not retain it.
-        payload: dict[str, Any] = {"model": self.spec.model.name, "input": _responses_input(messages), "store": False}
+        if self.model_api == "responses":
+            payload: dict[str, Any] = {"model": self.spec.model.name, "input": _responses_input(messages), "store": False}
+            url = _responses_url(self.spec.model.base_url)
+        else:
+            payload = {"model": self.spec.model.name, "messages": _chat_input(messages)}
+            url = _chat_completions_url(self.spec.model.base_url)
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = tool_choice
@@ -295,7 +302,7 @@ class BrokeredChatModelLoop:
                 retry_delay = None
                 async with client.stream(
                     "POST",
-                    _responses_url(self.spec.model.base_url),
+                    url,
                     json=payload,
                     headers=headers or None,
                 ) as response:
@@ -423,6 +430,31 @@ def _responses_url(base_url: str) -> str:
     return f"{root}/responses"
 
 
+def _chat_completions_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if root.endswith("/chat/completions"):
+        return root
+    root = root.removesuffix("/responses")
+    return f"{root}/chat/completions"
+
+
+def _chat_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Send only Chat fields, never Responses-only phase or reasoning metadata."""
+    items = []
+    for message in messages:
+        content = message.get("content")
+        calls = message.get("tool_calls")
+        if content is None and not calls:
+            continue
+        item = {"role": message["role"], "content": content}
+        if message["role"] == "assistant" and calls:
+            item["tool_calls"] = calls
+        if message["role"] == "tool":
+            item["tool_call_id"] = message["tool_call_id"]
+        items.append(item)
+    return items
+
+
 def _responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Translate the retained chat-shaped transcript into Responses input items."""
     items: list[dict[str, Any]] = []
@@ -507,6 +539,33 @@ def _model_auth_missing_error() -> AgentRunError:
         status=503,
         code="ModelAuthMissing",
     )
+
+
+def _chat_output_message(data: Mapping[str, Any]) -> dict[str, Any]:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        raise AgentRunError("model response did not include choices", status=502, code="InvalidModelResponse")
+    choice = choices[0]
+    if choice.get("finish_reason") not in ("stop", "tool_calls"):
+        raise AgentRunError("model response did not complete", status=502, code="InvalidModelResponse")
+    message = choice.get("message")
+    if not isinstance(message, Mapping) or message.get("role") != "assistant":
+        raise AgentRunError("model response must include an assistant message", status=502, code="InvalidModelResponse")
+    content = message.get("content")
+    refusal = message.get("refusal")
+    if content is not None and not isinstance(content, str):
+        raise AgentRunError("model response message content is invalid", status=502, code="InvalidModelResponse")
+    if refusal is not None:
+        if not isinstance(refusal, str):
+            raise AgentRunError("model response refusal is invalid", status=502, code="InvalidModelResponse")
+        content = f"{content}\n\n{refusal}" if content else refusal
+    retained = {"role": "assistant", "content": content}
+    result = {"role": "assistant", "content": content, "assistant_messages": [retained]}
+    calls = message.get("tool_calls")
+    if calls:
+        retained["tool_calls"] = calls
+        result["tool_calls"] = calls
+    return result
 
 
 def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -693,10 +752,11 @@ def _usage_token_count(value: Any) -> int:
     return count
 
 
-def _usage(data: Mapping[str, Any]) -> dict[str, int]:
+def _usage(data: Mapping[str, Any], *, model_api: str = "responses") -> dict[str, int]:
     usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
-    prompt_count = _usage_token_count(usage.get("input_tokens", 0))
-    completion_count = _usage_token_count(usage.get("output_tokens", 0))
+    input_key, output_key = ("input_tokens", "output_tokens") if model_api == "responses" else ("prompt_tokens", "completion_tokens")
+    prompt_count = _usage_token_count(usage.get(input_key, 0))
+    completion_count = _usage_token_count(usage.get(output_key, 0))
     total_count = _usage_token_count(usage.get("total_tokens", prompt_count + completion_count))
     return {"prompt_tokens": prompt_count, "completion_tokens": completion_count, "total_tokens": total_count}
 

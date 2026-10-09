@@ -38,6 +38,7 @@ from .acp import (
     load_verified_acp_runtime_binding,
     run_acp_stdio,
 )
+from .adapter_support import AgentBuildError, resolve_model_api
 from .config import ConfigError, load, load_or_exit
 from .foundry import create_foundry_app
 from .orka import create_orka_app
@@ -129,6 +130,10 @@ def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_toke
 def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     """Entry point: serve an agent built by ``factory`` (the adapter's module)."""
     args = _parse_args(argv)
+    try:
+        resolve_model_api()
+    except AgentBuildError as exc:
+        _fail(str(exc))
 
     protocol = _resolve_protocol(args.protocol)
     # Keep the resolved protocol visible to adapter factories for the full server

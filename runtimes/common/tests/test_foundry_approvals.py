@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import agentkit_serve_common.foundry as foundry_module
 from test_foundry_brokered_protocol import (
+    responses_model_api,
     CONTINUATION_AUTH,
     _FakeChatTransport,
     _app,

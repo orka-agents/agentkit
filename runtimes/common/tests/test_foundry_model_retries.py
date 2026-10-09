@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from agentkit_serve_common import foundry_model_loop
 from test_foundry_brokered_protocol import (
+    responses_model_api,
     CONTINUATION_AUTH,
     _app,
     _call,

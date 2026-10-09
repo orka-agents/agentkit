@@ -400,21 +400,44 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
 ## Model-driven tool workflows
 
 Set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` to let the model choose tools and
-work through a task. AgentKit calls the configured model through the OpenAI
-Responses API at `<model.baseURL>/responses` and offers the static
-`brokeredTools` schemas as non-strict function tools. For example, the agent can
-inspect telemetry, use the result to look up an incident, and then explain what
-it found. Reasoning models that reject function tools on Chat Completions
-accept them on Responses with reasoning enabled. A `baseURL` that ends in
-`/chat/completions` is treated as its `/responses` sibling.
+work through a task. `AGENTKIT_MODEL_API` selects the upstream model API:
 
-Each model request resends the transcript as Responses input items with
-`store: false`, so the model provider does not retain the conversation.
-Reasoning items that carry `encrypted_content`, which stateless responses
-include by default, are kept in hosted state with their tool call and replayed
-on the next round. Other reasoning items and provider function-call item IDs are
-not replayed. A model response whose `status` is not `completed`, such as an
-`incomplete` result cut off by a token limit, fails with `InvalidModelResponse`.
+- `chat_completions` is the default, preserving existing Chat-only backends.
+- `responses` explicitly selects the Responses API for models that need it.
+- Other values fail startup validation. No model-name inference, automatic API
+  fallback, or automatic disabling of reasoning is performed.
+
+For a reasoning-model deployment that requires Responses for function tools:
+
+```sh
+AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1
+AGENTKIT_MODEL_API=responses
+```
+
+This setting controls the upstream model connection, not AgentKit's hosted
+`/responses` endpoint. Direct Pydantic AI and LangGraph clients are Chat-only.
+Microsoft Agent Framework API-key/token-hook clients are Chat-only; its Foundry
+project-credential fallback is Responses-only and requires explicit selection.
+Unsupported combinations fail before SDK/auth initialization. Chat mode sends `messages` to
+`<model.baseURL>/chat/completions`; Responses mode sends `input` items to
+`<model.baseURL>/responses`. Both expose the same safe static `brokeredTools`
+and preserve Orka's sequential approval and continuation contract. A base URL
+ending in either API endpoint is normalized to the selected API's sibling;
+the startup setting, not the URL suffix, determines the API.
+
+Each request resends the retained transcript. Responses requests use
+`store: false`, retain replayable encrypted reasoning in its original position,
+and preserve assistant message boundaries, phase, and refusal text. Responses
+results must have `status: "completed"`; Chat results with a truncation or other
+non-completion or missing finish reason are rejected. Model output and tool arguments
+remain bounded and validated in either mode.
+
+The selected API is recorded with new pending model-loop state. Resuming that
+state with a different API returns `brokered_model_api_mismatch` before accepting
+the tool result or making another model request. Unmarked legacy model-loop
+state is treated as Chat Completions. Finish pending turns from Responses-only
+development builds before upgrading, because those builds did not record the API.
+`AGENTKIT_MODEL_API` is startup configuration, not a per-turn `input.env` override.
 
 Each operational tool call returns a `function_call` for Orka to execute. After
 Orka sends the matching `function_call_output`, AgentKit resumes the model. It

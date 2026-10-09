@@ -74,7 +74,7 @@ read/write/coordination and `/continue` behind
 advertise observed mode only. Foundry hosted `/responses` can also exercise a
 deterministic brokered function-call loop from static `brokeredTools`. For
 A4/A5 fallback validation, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` enables a
-lower-level OpenAI Responses API model loop that exposes static safe
+lower-level OpenAI-compatible model loop that exposes static safe
 brokered schemas as function tools, emits hosted Responses `function_call`
 items, and resumes the model with Orka-provided `function_call_output`. Orka
 remains responsible for coordination policy,
@@ -83,6 +83,17 @@ adapter brokered hooks are still intentionally gated: today the brokered profile
 are validated through the offline echo/conformance runtime, while real model
 adapters should only enable those gates after their native pause/resume/tool-output
 hooks have matching conformance coverage.
+
+`AGENTKIT_MODEL_API` is a shared startup selector. Its default is
+`chat_completions`; the Foundry brokered model loop also supports `responses`.
+Direct Pydantic AI and LangGraph model paths support Chat Completions only;
+LangGraph's SDK transport is explicitly pinned to Chat even when its own settings
+would otherwise infer Responses. Microsoft Agent Framework API-key and token-hook
+paths support Chat Completions, while its existing Foundry project-credential
+fallback is Responses-only and requires explicit `AGENTKIT_MODEL_API=responses`.
+Each path rejects unsupported choices before client/auth initialization. Native
+Anthropic Messages is not supported. This selector does not change hosted HTTP protocol selection or the
+agent.yaml model ABI.
 
 ## Brokered runtime feasibility decisions
 

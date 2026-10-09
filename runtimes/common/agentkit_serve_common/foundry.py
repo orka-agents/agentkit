@@ -37,6 +37,7 @@ from typing import Any, Mapping
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from .adapter_support import MODEL_APIS, ModelAPI
 from .brokered import brokered_tool_definitions
 from .config import AgentSpec, _unsafe_brokered_key, _unsafe_brokered_text
 from .foundry_model_loop import (
@@ -464,6 +465,7 @@ class _HostedResponseState:
     final_payload: dict[str, Any] | None = None
     terminal_error: str | None = None
     model_messages: list[dict[str, Any]] | None = None
+    model_api: ModelAPI | None = None
     initial_usage: dict[str, int] = field(default_factory=dict)
     final_persistence_pending: bool = False
     # All rounds share one bounded store entry. A completed round retains its
@@ -576,6 +578,8 @@ def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
         "modelMessages": state.model_messages,
         "initialUsage": dict(state.initial_usage),
     }
+    if state.model_api is not None:
+        payload["modelAPI"] = state.model_api
     if state.terminal_error is not None:
         payload["terminalError"] = state.terminal_error
     if state.response_calls:
@@ -612,6 +616,10 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     final_payload = data.get("finalPayload")
     terminal_error = data.get("terminalError")
     model_messages = data.get("modelMessages")
+    # Unmarked released model-loop state predates Responses support.
+    model_api = data.get("modelAPI", "chat_completions" if model_messages is not None else None)
+    if model_api is not None and model_api not in MODEL_APIS:
+        raise ValueError("stored modelAPI must be chat_completions or responses")
     initial_usage = data.get("initialUsage", {})
     response_calls = data.get("responseCalls", {})
     continuation_payloads = data.get("continuationPayloads", {})
@@ -670,6 +678,7 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         final_payload=final_payload,
         terminal_error=terminal_error,
         model_messages=model_messages,
+        model_api=model_api,
         initial_usage={str(key): int(value or 0) for key, value in initial_usage.items()},
         response_calls=response_calls,
         continuation_payloads=continuation_payloads,
@@ -2581,6 +2590,12 @@ async def _handle_brokered_continuation(
             status=503,
             code="brokered_model_loop_unavailable",
         )
+    if state.model_messages is not None and model_loop is not None:
+        if (state.model_api or "chat_completions") != model_loop.model_api:
+            return _error(
+                "pending response requires the model API it started with",
+                status=409, code="brokered_model_api_mismatch",
+            )
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
@@ -2590,6 +2605,7 @@ async def _handle_brokered_continuation(
             model_loop.validate_static_credentials()
         except AgentRunError as exc:
             return _brokered_model_run_error(exc)
+        state.model_api = model_loop.model_api
         state.accepted_output_digests[call_id] = output_digest
         state.accepted_output_sizes[call_id] = accepted_output_size
         state.status = "resuming"
@@ -3056,6 +3072,7 @@ def create_foundry_app(
                         pending_calls={call_id: call},
                         expires_at=time.time() + response_states.ttl_seconds,
                         model_messages=model_result.messages,
+                        model_api=model_loop.model_api,
                         initial_usage=dict(model_result.usage),
                     )
                     try:

@@ -24,6 +24,12 @@ from agentkit_serve_common.foundry_model_loop import BrokeredChatModelLoop
 from agentkit_serve_common.runtime import AgentRunError, RunResult, RuntimeSession
 
 
+@pytest.fixture(autouse=True)
+def responses_model_api(monkeypatch):
+    """These existing fixtures exercise the explicitly selected Responses transport."""
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
+
+
 CONTINUATION_PROOF = "test-orka-continuation-proof"
 CONTINUATION_AUTH = {"x-agentkit-brokered-continuation-proof": CONTINUATION_PROOF}
 CONTINUATION_PROOF_BODY_FIELD = "brokered_continuation_proof"
@@ -3389,6 +3395,8 @@ def test_foundry_brokered_model_loop_discards_resume_transcript_before_final_sta
 
 def test_foundry_brokered_model_loop_aggregate_state_pressure_is_terminal_for_duplicate(tmp_path):
     state_file = tmp_path / "responses-state.json"
+    # Keep the same pressure point after adding the API marker to both pending states.
+    state_budget = 2_500 + 2 * len(',"modelAPI":"responses"')
     spec = _spec(tool_name="check-network-telemetry")
 
     def tool_request(call_id: str) -> dict[str, Any]:
@@ -3419,7 +3427,7 @@ def test_foundry_brokered_model_loop_aggregate_state_pressure_is_terminal_for_du
         fake,
         response_state_file=state_file,
         max_pending_responses=3,
-        max_response_state_bytes=2_500,
+        max_response_state_bytes=state_budget,
     )
 
     with TestClient(app) as client:
@@ -3438,7 +3446,7 @@ def test_foundry_brokered_model_loop_aggregate_state_pressure_is_terminal_for_du
             restart_fake,
             response_state_file=state_file,
             max_pending_responses=3,
-            max_response_state_bytes=2_500,
+            max_response_state_bytes=state_budget,
         )
     ) as client:
         restarted_duplicate = client.post("/responses", headers=CONTINUATION_AUTH, json=payload)

@@ -48,6 +48,7 @@ from agentkit_serve_common.adapter_support import (
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
+    resolve_model_api,
     resolve_tool_url,
     same_origin_mcp_httpx_client_factory,
     split_tool_command,
@@ -81,10 +82,13 @@ def _resolve_api_key(spec: AgentSpec) -> str:
 
 def build_model(spec: AgentSpec) -> ChatOpenAI:
     """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
+    resolve_model_api(supported={"chat_completions"}, runtime="LangGraph runtime")
     return ChatOpenAI(
         model=spec.model.name,
         base_url=spec.model.base_url,
         api_key=_resolve_api_key(spec),
+        # LC_OUTPUT_VERSION must not override the supported model API.
+        use_responses_api=False,
     )
 
 

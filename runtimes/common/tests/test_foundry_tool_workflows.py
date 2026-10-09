@@ -12,6 +12,7 @@ import agentkit_serve_common.foundry as foundry_module
 import agentkit_serve_common.skills as skills_module
 from agentkit_serve_common.config import AgentSpec
 from test_foundry_brokered_protocol import (
+    responses_model_api,
     CONTINUATION_AUTH,
     _FakeChatTransport,
     _call,

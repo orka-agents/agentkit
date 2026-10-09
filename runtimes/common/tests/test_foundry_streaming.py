@@ -11,6 +11,7 @@ import pytest
 from agentkit_serve_common.foundry import create_foundry_app
 from agentkit_serve_common.runtime import AgentRunError, RunResult
 from test_foundry_brokered_protocol import (
+    responses_model_api,
     CONTINUATION_AUTH,
     _app,
     _call,

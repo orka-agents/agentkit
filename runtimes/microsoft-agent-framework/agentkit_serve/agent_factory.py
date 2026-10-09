@@ -48,6 +48,7 @@ from agentkit_serve_common.adapter_support import (
     normalize_agent_run_error,
     positive_int_env,
     resolve_api_key,
+    resolve_model_api,
     resolve_workload_identity_token,
     resolve_tool_headers,
     resolve_tool_url,
@@ -239,8 +240,15 @@ async def _close_resource(resource: object) -> None:
         await result
 
 
+def _validate_model_api(spec: AgentSpec) -> None:
+    # The project-credential Foundry client is Responses-based despite its name.
+    supported = {"responses"} if _uses_model_workload_identity_fallback(spec) else {"chat_completions"}
+    resolve_model_api(supported=supported, runtime="Microsoft Agent Framework model client")
+
+
 def build_client(spec: AgentSpec, *, workload_identity_credential: object | None = None):
     """Construct the chat client for the configured model auth mode."""
+    _validate_model_api(spec)
     auth = spec.model.auth
     if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
         if (
@@ -436,6 +444,8 @@ def build_agent(
 ) -> Agent:
     """Assemble the MAF agent: client + system prompt + tools + context."""
     instructions = spec.instructions
+    if client is None:
+        _validate_model_api(spec)
     tools = [build_tool(t, stack=stack) for t in spec.tools]
     if spec._packaged_skill_catalog:
         skills = spec._packaged_skill_catalog
@@ -476,6 +486,7 @@ class MAFRuntime:
 
     async def __aenter__(self) -> RuntimeSession:
         async def start() -> RuntimeSession:
+            _validate_model_api(self.spec)
             context_providers = await self._build_context_providers()
             client = await self._build_model_fallback_client()
             self.agent = build_agent(
@@ -605,6 +616,7 @@ class MAFRuntime:
     async def _build_model_fallback_client(self):
         if not _uses_model_workload_identity_fallback(self.spec):
             return None
+        resolve_model_api(supported={"responses"}, runtime="Microsoft Agent Framework Foundry-project credential path")
         try:
             from azure.identity import DefaultAzureCredential
         except ImportError as exc:  # pragma: no cover - dependency guard.

@@ -590,6 +590,7 @@ def test_runtime_owns_memory_provider_project_client_and_sync_credential(monkeyp
 def test_runtime_owns_model_fallback_credential_and_project_client_without_double_closing_framework_client(
     monkeypatch,
 ):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     for name in (
         "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
         "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
@@ -691,6 +692,7 @@ def test_runtime_owns_model_fallback_credential_and_project_client_without_doubl
 
 
 def test_partial_agent_startup_closes_all_runtime_owned_resources_in_dependency_order(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     for name in (
         "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
         "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
@@ -841,6 +843,7 @@ def test_partial_agent_startup_closes_all_runtime_owned_resources_in_dependency_
 
 
 def test_startup_cancellation_waits_for_all_runtime_owned_resource_cleanup(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     for name in (
         "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
         "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
@@ -1005,6 +1008,7 @@ def test_startup_cancellation_waits_for_all_runtime_owned_resource_cleanup(monke
 
 
 def test_runtime_closes_model_fallback_http_client_before_project_and_credential(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     for name in (
         "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN",
         "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",

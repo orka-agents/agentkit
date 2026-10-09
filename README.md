@@ -84,6 +84,16 @@ docker run \
 agentkit-serve --config /agent/agent.yaml --protocol acp
 ```
 
+`AGENTKIT_MODEL_API` separately selects the upstream model API. It defaults to
+`chat_completions`; set `responses` for the Foundry brokered model loop when its
+model requires Responses. Direct Pydantic AI and LangGraph paths are Chat-only.
+Microsoft Agent Framework supports Chat through API-key/token-hook clients and
+Responses through its existing Foundry project-credential fallback. Unsupported
+API/auth combinations fail explicitly. This is startup configuration, not a
+per-turn override.
+See [model-driven tool workflows](docs/foundry-hosted-brokered.md#model-driven-tool-workflows)
+for the supported paths and continuation rules.
+
 Protocol endpoints:
 
 | Protocol | Endpoints | Notes |

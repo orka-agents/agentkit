@@ -226,6 +226,7 @@ def test_status_of_unwraps_maf_wrapped_error():
 
 
 def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     from agentkit_serve_common.config import AgentSpec
 
     calls = {}
