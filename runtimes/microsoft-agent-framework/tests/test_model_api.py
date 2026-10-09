@@ -193,7 +193,12 @@ def test_real_model_client_uses_selected_wire_api(monkeypatch, path):
                 def get_openai_client(self, **kwargs):
                     return openai
             monkeypatch.setattr("agent_framework_foundry._chat_client.AIProjectClient", Project)
-            monkeypatch.setattr("agent_framework_foundry._chat_client.create_foundry_feature_usage_http_client", lambda: http_client)
+            # Older supported SDKs do not allocate a separate feature-usage client.
+            monkeypatch.setattr(
+                "agent_framework_foundry._chat_client.create_foundry_feature_usage_http_client",
+                lambda: http_client,
+                raising=False,
+            )
             monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: object())
         else:
             monkeypatch.setattr(agent_factory, "OpenAIChatCompletionClient", functools.partial(
