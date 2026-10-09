@@ -374,11 +374,11 @@ def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> Ru
         history: list[ConversationTurn] = []
         for item in value:
             role = str(item.get("role") or "")
+            phase = item.get("phase") if role == "assistant" else None
+            if phase not in (None, "commentary", "final_answer"):
+                raise ValueError("Responses assistant phase must be commentary or final_answer")
             text = _responses_content_to_text(item.get("content"))
             if role in FORWARDED_ROLES and text:
-                phase = item.get("phase") if role == "assistant" else None
-                if phase not in (None, "commentary", "final_answer"):
-                    raise ValueError("Responses assistant phase must be commentary or final_answer")
                 history.append(ConversationTurn(role=role, text=text, phase=phase))
         if not history:
             return RunRequest(prompt="", session_id=session_id)

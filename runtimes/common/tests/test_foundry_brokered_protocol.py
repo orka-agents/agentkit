@@ -3667,11 +3667,12 @@ def test_foundry_brokered_model_loop_preserves_assistant_phase_in_input_history(
 
 
 @pytest.mark.parametrize("phase", ["unexpected", 1, [], {}])
-def test_foundry_brokered_model_loop_rejects_invalid_input_history_phase(phase):
+@pytest.mark.parametrize("content", ["", "A previous answer."])
+def test_foundry_brokered_model_loop_rejects_invalid_input_history_phase(phase, content):
     fake = _FakeChatTransport([])
     with TestClient(_model_loop_app(_spec(), fake)) as client:
         response = client.post("/responses", json={"input": [
-            {"role": "assistant", "content": "A previous answer.", "phase": phase},
+            {"role": "assistant", "content": content, "phase": phase},
             {"role": "user", "content": "Continue."},
         ]})
     assert response.status_code == 400, response.text
