@@ -59,7 +59,7 @@ if git -C "$repo_root" diff --quiet HEAD -- 2>/dev/null && [[ -z "$(git -C "$rep
   source_dirty=false
 fi
 
-# shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
 finish() {
   local status="$?" cleanup_failed=false container owned
   trap - EXIT
