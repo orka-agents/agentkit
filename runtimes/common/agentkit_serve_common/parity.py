@@ -640,13 +640,11 @@ def test_parity_model_receives_baked_instructions_then_client_history(model_api)
         assert _conversation(body) == _EXPECTED_CONVERSATION
 
 
-def test_parity_dual_openai_endpoints_with_sdk(model_api):
+def test_parity_dual_openai_endpoints_with_sdk(model_api, openai_client_factory):
     """Both client APIs use the same configured upstream API and baked agent."""
-    from openai import OpenAI
-
     messages = [message for message in _CLIENT_CONVERSATION if message["role"] != "tool"]
     with _harness(model_api=model_api) as (provider, spec), _openai(spec) as client:
-        sdk = OpenAI(
+        sdk = openai_client_factory(
             base_url="http://testserver/v1", api_key="unused", http_client=client,
             _strict_response_validation=True,
         )
