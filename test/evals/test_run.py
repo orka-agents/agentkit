@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -215,6 +216,37 @@ class Lifecycle(unittest.TestCase):
             self.assertFalse(result["taskSuccess"])
             self.assertEqual(result["providerCompletions"], 0)
             self.assertEqual(request.call_args_list[-1].args[0], "http://fixture/eval/settle")
+
+    def test_agent_run_failure_after_inference_keeps_the_suite_incomplete(self):
+        from cases import World
+
+        @contextlib.contextmanager
+        def isolated(*args):
+            yield "fixture", "http://fixture", "agent", "http://agent"
+
+        world = World("stock", 1)
+        world.provider_requests = world.provider_completions = 1
+        error = runner.urllib.error.HTTPError(
+            "http://agent/v1/chat/completions",
+            502,
+            "agent run failed",
+            {},
+            io.BytesIO(json.dumps({"error": {"code": "AgentRunFailed"}}).encode()),
+        )
+        self.addCleanup(error.close)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(runner, "containers", isolated),
+            patch.object(runner, "docker", return_value="sha256:test"),
+            patch.object(runner, "request", side_effect=[error, world.snapshot()]),
+        ):
+            options = args(directory, cases="stock")
+            self.assertEqual(runner.run(options), 2)
+            report = json.loads(options.output.read_text())
+            self.assertFalse(report["complete"])
+            self.assertFalse(report["qualityPassed"])
+            self.assertTrue(report["results"][0]["infrastructureFailure"])
+            self.assertEqual(report["results"][0]["providerCompletions"], 1)
 
     def test_fixture_accounting_timeout_is_infrastructure_not_task_timeout(self):
         from cases import World

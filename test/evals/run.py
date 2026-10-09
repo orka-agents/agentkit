@@ -270,6 +270,7 @@ def is_infrastructure_failure(state: dict[str, Any], error: str | None) -> bool:
         "runtime_protocol_error",
         "runtime_MCPToolProtocolError",
         "runtime_AgentNotInitialized",
+        "runtime_AgentRunFailed",
         "runtime_LangGraphResultError",
         "runtime_ModelAuthRejected",
         "runtime_ModelUnavailable",

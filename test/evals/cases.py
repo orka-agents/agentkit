@@ -114,7 +114,9 @@ class World:
         if name in {"get_stock", "quote_price", "reserve_stock"} and args.get("sku") != self.sku:
             raise ValueError("Unknown SKU. Identify the product before using its SKU.")
         if name == "get_stock":
-            if self.case.id == "recover-tool-error" and sum(c["name"] == name for c in self.calls) == 1:
+            if self.case.id == "recover-tool-error" and (
+                sum(c["name"] == name and c["arguments"].get("sku") == self.sku for c in self.calls) == 1
+            ):
                 raise ValueError("Inventory temporarily unavailable. Retry once.")
             return {"sku": self.sku, "available": self.stock}
         if name in {"quote_price", "reserve_stock"}:
@@ -283,6 +285,15 @@ def grade(case_id: str, answers: list[str], state: dict[str, Any]) -> dict[str, 
     outcome_ok = case.tools.issubset(set(names)) and state["providerRequests"] >= 1
     if not case.tools:
         outcome_ok = outcome_ok and not calls
+    if case_id == "price":
+        outcome_ok = outcome_ok and any(
+            c["name"] == "quote_price"
+            and c["status"] == "completed"
+            and c["arguments"].get("sku") == state["sku"]
+            and type(c["arguments"].get("quantity")) is int
+            and c["arguments"]["quantity"] == 3
+            for c in calls
+        )
     if case_id in {"lookup-stock", "lookup-reserve"}:
         discoveries = [
             index
@@ -306,7 +317,8 @@ def grade(case_id: str, answers: list[str], state: dict[str, Any]) -> dict[str, 
             outcome_ok and "reserve_stock" in names and "get_stock" in names[names.index("reserve_stock") + 1 :]
         )
     if case_id == "recover-tool-error":
-        outcome_ok = outcome_ok and sum(c["name"] == "get_stock" for c in calls) >= 2 and "get_stock" in names
+        stock_calls = [c for c in calls if c["name"] == "get_stock" and c["arguments"].get("sku") == state["sku"]]
+        outcome_ok = outcome_ok and len(stock_calls) >= 2 and any(c["status"] == "completed" for c in stock_calls)
     if case_id == "unknown-product":
         outcome_ok = outcome_ok and any(
             c["name"] == "find_product"

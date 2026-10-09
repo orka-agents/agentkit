@@ -481,6 +481,18 @@ class GradeTests(unittest.TestCase):
         self.assertEqual(trace.world.calls[1]["result"]["available"], trace.world.initial_stock)
         self.assertTrue(trace.grades()["taskSuccess"])
 
+    def test_wrong_sku_does_not_consume_the_controlled_transient_failure(self):
+        trace = Trace("recover-tool-error")
+        with self.assertRaisesRegex(ValueError, "Unknown SKU"):
+            trace.invoke("get_stock", {"sku": "wrong"})
+        with self.assertRaisesRegex(ValueError, "Retry once"):
+            trace.invoke("get_stock", {"sku": trace.world.sku})
+        stock = trace.invoke("get_stock", {"sku": trace.world.sku})
+        trace.answer({"available": stock["available"]})
+        checks = trace.grades()
+        self.assertTrue(checks["taskSuccess"])
+        self.assertFalse(checks["argumentsCorrect"])
+
     def test_recovery_without_retry_cannot_pass_on_a_correct_answer(self):
         successful = successful_trace("recover-tool-error")
         trace = Trace("recover-tool-error")
