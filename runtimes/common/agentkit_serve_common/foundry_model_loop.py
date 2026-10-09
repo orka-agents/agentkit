@@ -140,7 +140,8 @@ class BrokeredChatModelLoop:
                 raise AgentRunError("unknown packaged skill", status=400, code="InvalidToolArguments") from exc
             messages = result.messages
             skill_call_id = f"skill_{uuid.uuid4().hex}"
-            messages[-1]["tool_calls"][0]["id"] = skill_call_id
+            tool_message = next(message for message in reversed(messages) if message.get("tool_calls"))
+            tool_message["tool_calls"][0]["id"] = skill_call_id
             messages.append({"role": "tool", "tool_call_id": skill_call_id, "content": content})
 
     async def _step(self, messages: list[dict[str, Any]], *, call_id: str) -> ModelLoopFinal | ModelLoopToolRequest:
@@ -151,10 +152,11 @@ class BrokeredChatModelLoop:
         data = await self._create_response(messages, tools=self._tool_payloads(), tool_choice="none" if exhausted else "auto")
         message = _output_message(data)
         usage = _usage(data)
+        assistant_messages = message["assistant_messages"]
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             text = _message_text(message, max_bytes=self.max_output_bytes)
-            return ModelLoopFinal(text=text, usage=usage, messages=[*messages, {"role": "assistant", "content": text}])
+            return ModelLoopFinal(text=text, usage=usage, messages=[*messages, *assistant_messages])
         if exhausted:
             raise AgentRunError("model exceeded the tool call limit", status=400, code="tool_loop_limit_exceeded")
         if not isinstance(tool_calls, list) or len(tool_calls) != 1:
@@ -186,20 +188,11 @@ class BrokeredChatModelLoop:
         arguments = _parse_arguments(raw_arguments)
         _validate_argument_unicode(arguments)
         argument_text = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
-        assistant_message = {
-            "role": "assistant",
-            "content": message.get("content"),
-            "tool_calls": [
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": argument_text},
-                }
-            ],
-        }
-        if message.get("reasoning"):
-            assistant_message["reasoning"] = message["reasoning"]
-        return ModelLoopToolRequest(name=name, arguments=arguments, messages=[*messages, assistant_message], usage=usage)
+        call["id"] = call_id
+        function["arguments"] = argument_text
+        return ModelLoopToolRequest(
+            name=name, arguments=arguments, messages=[*messages, *assistant_messages], usage=usage,
+        )
 
     async def resume(
         self,
@@ -263,7 +256,10 @@ class BrokeredChatModelLoop:
             messages.append({"role": "system", "content": self.skills.instructions})
         for turn in request.history:
             if turn.role in FORWARDED_ROLES and turn.text:
-                messages.append({"role": turn.role, "content": turn.text})
+                message = {"role": turn.role, "content": turn.text}
+                if turn.role == "assistant" and turn.phase is not None:
+                    message["phase"] = turn.phase
+                messages.append(message)
         messages.append({"role": "user", "content": request.prompt})
         return messages
 
@@ -438,7 +434,10 @@ def _responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
         if isinstance(content, str) and (content or not tool_calls):
-            items.append({"type": "message", "role": message["role"], "content": content})
+            item = {"type": "message", "role": message["role"], "content": content}
+            if message["role"] == "assistant" and message.get("phase") is not None:
+                item["phase"] = message["phase"]
+            items.append(item)
         for call in tool_calls:
             function = call["function"]
             items.append(
@@ -511,7 +510,7 @@ def _model_auth_missing_error() -> AgentRunError:
 
 
 def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Project Responses output items onto the assistant message shape the loop retains."""
+    """Project Responses output into an ordered, chat-shaped retained transcript."""
     # Incomplete or failed generations can carry truncated text or tool arguments.
     if data.get("status") != "completed":
         raise AgentRunError("model response did not complete", status=502, code="InvalidModelResponse")
@@ -519,49 +518,58 @@ def _output_message(data: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(output, list):
         raise AgentRunError("model response did not include output items", status=502, code="InvalidModelResponse")
     texts: list[str] = []
-    refusals: list[str] = []
+    assistant_messages: list[dict[str, Any]] = []
     tool_calls: list[dict[str, Any]] = []
-    reasoning: list[dict[str, Any]] = []
     for item in output:
         if not isinstance(item, Mapping):
             raise AgentRunError("model response output item must be an object", status=502, code="InvalidModelResponse")
         item_type = item.get("type")
         if item_type == "function_call":
-            tool_calls.append({"type": "function", "function": {"name": item.get("name"), "arguments": item.get("arguments")}})
+            call = {"type": "function", "function": {"name": item.get("name"), "arguments": item.get("arguments")}}
+            tool_calls.append(call)
+            assistant_messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
         elif item_type == "message":
             content = item.get("content")
             if item.get("role") != "assistant" or not isinstance(content, list):
                 raise AgentRunError("model response message must be assistant content", status=502, code="InvalidModelResponse")
+            phase = item.get("phase")
+            if phase not in (None, "commentary", "final_answer"):
+                raise AgentRunError("model response message phase is invalid", status=502, code="InvalidModelResponse")
             parts: list[str] = []
             for part in content:
                 if isinstance(part, Mapping) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
                     parts.append(part["text"])
                 elif isinstance(part, Mapping) and part.get("type") == "refusal" and isinstance(part.get("refusal"), str):
-                    refusals.append(part["refusal"])
+                    parts.append(part["refusal"])
                 else:
                     raise AgentRunError("model response message content is invalid", status=502, code="InvalidModelResponse")
             if parts:
-                texts.append("".join(parts))
+                text = "".join(parts)
+                texts.append(text)
+                # Phase belongs to each message, not to the combined assistant text.
+                assistant = {"role": "assistant", "content": text}
+                if phase is not None:
+                    assistant["phase"] = phase
+                assistant_messages.append(assistant)
         elif item_type == "reasoning":
-            # With store: false, only reasoning that carries its encrypted content can be replayed.
+            # Keep each replayable reasoning item in its original output position.
             encrypted_content = item.get("encrypted_content")
             if isinstance(encrypted_content, str) and encrypted_content:
                 summary = item.get("summary")
                 retained = {"type": "reasoning", "summary": summary if isinstance(summary, list) else [], "encrypted_content": encrypted_content}
                 if isinstance(item.get("id"), str):
                     retained["id"] = item["id"]
-                reasoning.append(retained)
+                assistant_messages.append({"role": "assistant", "content": None, "reasoning": [retained]})
         elif isinstance(item_type, str) and item_type.endswith("_call"):
             # Only function tools are offered; any other tool call is unsupported.
             tool_calls.append({"type": item_type})
         # Other non-tool items carry no assistant output.
-    message: dict[str, Any] = {"role": "assistant", "content": "\n\n".join(texts) if texts else None}
-    if not texts and refusals:
-        message["refusal"] = "\n\n".join(refusals)
+    message: dict[str, Any] = {
+        "role": "assistant", "content": "\n\n".join(texts) if texts else None,
+        "assistant_messages": assistant_messages,
+    }
     if tool_calls:
         message["tool_calls"] = tool_calls
-    if reasoning:
-        message["reasoning"] = reasoning
     return message
 
 

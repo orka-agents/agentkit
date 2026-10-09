@@ -3537,6 +3537,148 @@ def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call(
     assert fake.requests[0]["tool_choice"] == "auto"
 
 
+@pytest.mark.parametrize("phase", [None, "commentary"])
+@pytest.mark.parametrize("persisted", [False, True])
+def test_foundry_brokered_model_loop_preserves_assistant_phase_on_tool_resume(tmp_path, phase, persisted):
+    assistant = {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Checking SFO."}],
+    }
+    if phase is not None:
+        assistant["phase"] = phase
+    fake = _FakeChatTransport([
+        {
+            "status": "completed", "output": [
+                {"type": "reasoning", "summary": [], "encrypted_content": "opaque-reasoning"},
+                assistant,
+                {"type": "reasoning", "summary": [], "encrypted_content": "opaque-second-reasoning"},
+                {"type": "function_call", "call_id": "call_model",
+                 "name": "check-network-telemetry", "arguments": '{"site":"sfo"}'},
+            ],
+        },
+        _chat_response({"role": "assistant", "content": "Telemetry is healthy."}),
+    ])
+    spec = _spec(tool_name="check-network-telemetry")
+    kwargs = {"response_state_file": tmp_path / "phase-tool-resume.json"} if persisted else {}
+    app = _model_loop_app(spec, fake, **kwargs)
+    with TestClient(app) as client:
+        initial = client.post("/responses", json={"input": "Check SFO telemetry"})
+        assert initial.status_code == 200, initial.text
+        call = _call(initial.json())
+    if persisted:
+        app = _model_loop_app(spec, fake, **kwargs)
+    with TestClient(app) as client:
+        final = client.post(
+            "/responses", headers=CONTINUATION_AUTH,
+            json=_continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
+        )
+    assert final.status_code == 200, final.text
+    expected = {"type": "message", "role": "assistant", "content": "Checking SFO."}
+    if phase is not None:
+        expected["phase"] = phase
+    assert fake.requests[1]["input"][-5:] == [
+        {"type": "reasoning", "summary": [], "encrypted_content": "opaque-reasoning"},
+        expected,
+        {"type": "reasoning", "summary": [], "encrypted_content": "opaque-second-reasoning"},
+        {"type": "function_call", "call_id": call["call_id"],
+         "name": "check-network-telemetry", "arguments": '{"site":"sfo"}'},
+        {"type": "function_call_output", "call_id": call["call_id"], "output": '{"approved":true,"output":{"ok":true}}'},
+    ]
+
+
+@pytest.mark.parametrize("phase", [None, "final_answer"])
+@pytest.mark.parametrize("content_type", ["output_text", "refusal"])
+@pytest.mark.parametrize("commentary", [False, True])
+def test_foundry_brokered_model_loop_preserves_message_phases_in_persisted_session(
+    tmp_path, phase, content_type, commentary,
+):
+    state_file = tmp_path / "phase-session.json"
+    answer = "The answer is 42." if content_type == "output_text" else "I cannot help with that."
+    part = {"type": "output_text", "text": answer} if content_type == "output_text" else {"type": "refusal", "refusal": answer}
+    output = [
+        {"type": "message", "role": "assistant", "phase": "commentary",
+         "content": [{"type": "output_text", "text": "Checking the answer."}]},
+        {"type": "message", "role": "assistant",
+         "content": [part]},
+    ]
+    if phase is not None:
+        output[1]["phase"] = phase
+    if not commentary:
+        output = output[1:]
+    fake = _FakeChatTransport([
+        {"status": "completed", "output": output},
+        _chat_response({"role": "assistant", "content": "Still 42."}),
+    ])
+    spec = _spec()
+    headers = {"x-agent-session-id": "phase-session"}
+    with TestClient(_model_loop_app(spec, fake, response_state_file=state_file)) as client:
+        initial = client.post("/responses", headers=headers, json={"input": "What is the answer?"})
+    assert initial.status_code == 200, initial.text
+    assert _message_text(initial.json()) == ("Checking the answer.\n\n" if commentary else "") + answer
+    # Reload from disk, rather than relying on in-memory metadata surviving.
+    with TestClient(_model_loop_app(spec, fake, response_state_file=state_file)) as client:
+        followup = client.post(
+            "/responses", headers=headers,
+            json={"previous_response_id": initial.json()["id"], "input": "What was the answer?"},
+        )
+    assert followup.status_code == 200, followup.text
+    expected_answer = {"type": "message", "role": "assistant", "content": answer}
+    if phase is not None:
+        expected_answer["phase"] = phase
+    expected_history = [{"type": "message", "role": "user", "content": "What is the answer?"}]
+    if commentary:
+        expected_history.append({
+            "type": "message", "role": "assistant", "content": "Checking the answer.", "phase": "commentary",
+        })
+    expected_history.extend([
+        expected_answer,
+        {"type": "message", "role": "user", "content": "What was the answer?"},
+    ])
+    assert fake.requests[1]["input"][-len(expected_history):] == expected_history
+
+
+@pytest.mark.parametrize("phase", ["unexpected", 1, [], {}])
+def test_foundry_brokered_model_loop_rejects_invalid_assistant_phase(phase):
+    fake = _FakeChatTransport([{
+        "status": "completed", "output": [
+            {"type": "message", "role": "assistant", "phase": phase,
+             "content": [{"type": "output_text", "text": "Do not retain this."}]},
+        ],
+    }])
+    with TestClient(_model_loop_app(_spec(), fake)) as client:
+        response = client.post("/responses", json={"input": "Say hello"})
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "InvalidModelResponse"
+
+
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
+def test_foundry_brokered_model_loop_preserves_assistant_phase_in_input_history(phase):
+    assistant = {"role": "assistant", "content": "A previous answer.", "phase": phase}
+    fake = _FakeChatTransport([_chat_response({"role": "assistant", "content": "A new answer."})])
+    with TestClient(_model_loop_app(_spec(), fake)) as client:
+        response = client.post("/responses", json={"input": [
+            assistant, {"role": "user", "content": "Continue."},
+        ]})
+    assert response.status_code == 200, response.text
+    expected = {"type": "message", "role": "assistant", "content": "A previous answer."}
+    if phase is not None:
+        expected["phase"] = phase
+    assert fake.requests[0]["input"][-2] == expected
+
+
+@pytest.mark.parametrize("phase", ["unexpected", 1, [], {}])
+def test_foundry_brokered_model_loop_rejects_invalid_input_history_phase(phase):
+    fake = _FakeChatTransport([])
+    with TestClient(_model_loop_app(_spec(), fake)) as client:
+        response = client.post("/responses", json={"input": [
+            {"role": "assistant", "content": "A previous answer.", "phase": phase},
+            {"role": "user", "content": "Continue."},
+        ]})
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert fake.requests == []
+
+
 def test_foundry_brokered_model_loop_reads_responses_output_around_reasoning_items():
     spec = _spec(tool_name="check-network-telemetry")
     reasoning = {"type": "reasoning", "id": "rs_model", "summary": []}

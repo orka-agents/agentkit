@@ -376,7 +376,10 @@ def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> Ru
             role = str(item.get("role") or "")
             text = _responses_content_to_text(item.get("content"))
             if role in FORWARDED_ROLES and text:
-                history.append(ConversationTurn(role=role, text=text))
+                phase = item.get("phase") if role == "assistant" else None
+                if phase not in (None, "commentary", "final_answer"):
+                    raise ValueError("Responses assistant phase must be commentary or final_answer")
+                history.append(ConversationTurn(role=role, text=text, phase=phase))
         if not history:
             return RunRequest(prompt="", session_id=session_id)
         last = history[-1]
@@ -618,8 +621,11 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     if not isinstance(continuation_payloads, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in continuation_payloads.items()):
         raise ValueError("stored continuationPayloads must map call IDs to response objects")
     if not isinstance(conversation_history, list) or not all(
-        isinstance(turn, dict) and set(turn) == {"role", "content"}
+        isinstance(turn, dict) and set(turn) in ({"role", "content"}, {"role", "content", "phase"})
         and turn["role"] in {"user", "assistant"} and isinstance(turn["content"], str)
+        and ("phase" not in turn or (
+            turn["role"] == "assistant" and turn["phase"] in (None, "commentary", "final_answer")
+        ))
         for turn in conversation_history
     ):
         raise ValueError("stored conversationHistory must contain user and assistant text")
@@ -2255,7 +2261,10 @@ def _model_pending_call(
 def _bounded_conversation_history(messages: list[dict[str, Any]], *, max_bytes: int) -> list[dict[str, str]]:
     """Retain complete recent exchanges, without system prompts or tool data."""
     turns = [
-        {"role": message["role"], "content": message["content"]}
+        {
+            "role": message["role"], "content": message["content"],
+            **({"phase": message["phase"]} if message.get("phase") is not None else {}),
+        }
         for message in messages
         if message.get("role") in {"user", "assistant"}
         and isinstance(message.get("content"), str) and message["content"]
@@ -2939,7 +2948,8 @@ def create_foundry_app(
             return _error(str(exc), status=400, code="invalid_input")
         if model_loop is not None and session_id and previous_state is not None:
             run_request = replace(run_request, history=(
-                *(ConversationTurn(role=turn["role"], text=turn["content"]) for turn in previous_state.conversation_history),
+                *(ConversationTurn(role=turn["role"], text=turn["content"], phase=turn.get("phase"))
+                  for turn in previous_state.conversation_history),
                 *run_request.history,
             ))
 

@@ -60,7 +60,8 @@ def packaged_skill(tmp_path, monkeypatch):
     return AgentSpec.model_validate(data), document, text
 
 
-def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill):
+@pytest.mark.parametrize("trailing_commentary", [False, True])
+def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill, trailing_commentary):
     spec, document, text = packaged_skill
     fake = _FakeChatTransport([
         _tool("load_skill", {"skill_name": "inspection"}),
@@ -69,6 +70,13 @@ def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill)
         _tool("get-active-incidents"),
         _chat_response({"role": "assistant", "content": "Incident INC-17 explains the signal loss."}),
     ])
+    if trailing_commentary:
+        for response in fake.responses:
+            if any(item.get("name") == "load_skill" for item in response["output"]):
+                response["output"].append({
+                    "type": "message", "role": "assistant", "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Loading inspection."}],
+                })
     app = _model_loop_app(spec, fake)
     document.unlink()  # Both skill calls must use the startup snapshot.
     with TestClient(app) as client:
@@ -98,6 +106,13 @@ def test_hosted_skills_load_locally_between_governed_tool_rounds(packaged_skill)
     assert calls[1]["call_id"] == _call(first.json())["call_id"]
     assert calls[3]["call_id"] == _call(second.json())["call_id"]
     assert all(request["parallel_tool_calls"] is False for request in fake.requests)
+    if trailing_commentary:
+        for index, item in enumerate(items):
+            if item["type"] == "function_call" and item["name"] == "load_skill":
+                assert items[index + 1] == {
+                    "type": "message", "role": "assistant", "phase": "commentary", "content": "Loading inspection.",
+                }
+                assert items[index + 2]["type"] == "function_call_output"
 
 
 @pytest.mark.parametrize("arguments", [
