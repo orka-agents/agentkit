@@ -1,4 +1,4 @@
-"""Native agentsessions Harness SPI. PR1 has no model or tool execution path."""
+"""Native agentsessions Harness SPI with controller-mediated model effects."""
 
 from __future__ import annotations
 
@@ -12,33 +12,22 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 import grpc
 
 from ..adapter_support import _wait_for_owner_task
-from ..conversation import ConversationTurn, RunRequest
+from ..conversation import RunRequest
 from ..runtime import RunResult
 from ._generated import common_pb2 as common
 from ._generated import harness_pb2 as harness
 from ._generated import harness_pb2_grpc
 from .binding import VerifiedAgentsessionsBinding
+from .exchange import ExecutionExchange, MAX_MESSAGE_BYTES
+from .history import UnsupportedContent as _Unsupported, run_request as _request
 
-MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 _LOG = logging.getLogger(__name__)
 # A fresh, explicitly supplied async execution hook. It owns any per-Start
 # resources and must close them under cancellation. Never use build_runtime.
 ExecutionRunner = Callable[
-    [VerifiedAgentsessionsBinding, RunRequest], Awaitable[RunResult | None]
+    [VerifiedAgentsessionsBinding, RunRequest, ExecutionExchange], Awaitable[RunResult | None]
 ]
-_HISTORY_METADATA_BODIES = {
-    common.EVENT_MODEL_CALL: "model",
-    common.EVENT_USAGE: "usage",
-    common.EVENT_LIFECYCLE: "lifecycle",
-    common.EVENT_END: "end",
-    common.EVENT_ERROR: "error",
-    common.EVENT_EXECUTION_START: "execution_start",
-}
-
-
-class _Unsupported(ValueError):
-    pass
 
 
 async def _settle(tasks: list[asyncio.Task]) -> bool:
@@ -50,49 +39,12 @@ async def _settle(tasks: list[asyncio.Task]) -> bool:
 
 
 async def _invoke_runner(
-    runner: ExecutionRunner, binding: VerifiedAgentsessionsBinding, request: RunRequest
+    runner: ExecutionRunner, binding: VerifiedAgentsessionsBinding, request: RunRequest,
+    exchange: ExecutionExchange,
 ) -> RunResult | None:
     # Invocation also belongs inside the task: callbacks may return any
     # Awaitable or raise synchronously before returning one.
-    return await runner(binding, request)
-
-
-def _text(message: common.Message, role: str) -> str:
-    if message.role != role or any(part.WhichOneof("part") != "text" for part in message.parts):
-        raise _Unsupported("only role-correct plain text is supported")
-    return "".join(part.text.text for part in message.parts)
-
-
-def _request(first: harness.ControllerFrame) -> RunRequest:
-    start = first.start
-    history: list[ConversationTurn] = []
-    for event in start.history:
-        if event.kind in (common.EVENT_INPUT, common.EVENT_OUTPUT):
-            role = "user" if event.kind == common.EVENT_INPUT else "assistant"
-            if event.WhichOneof("body") != "message":
-                raise _Unsupported("history message payload is required")
-            history.append(ConversationTurn(role=role, text=_text(event.message, role)))
-        elif event.kind in _HISTORY_METADATA_BODIES:
-            # Host-owned journal metadata is not conversation input. Never feed
-            # ExecutionStart.Config or model requests into framework prompts.
-            if event.WhichOneof("body") != _HISTORY_METADATA_BODIES[event.kind]:
-                raise _Unsupported("unsupported history payload")
-            if event.kind == common.EVENT_MODEL_CALL:
-                for message in event.model.messages:
-                    if message.role not in {"user", "assistant"}:
-                        raise _Unsupported("unsupported model history role")
-                    _text(message, message.role)
-        else:
-            raise _Unsupported("tool or unknown history is unsupported")
-    inputs = [_text(message, "user") for message in start.inputs]
-    history.extend(ConversationTurn(role="user", text=value) for value in inputs[:-1])
-    return RunRequest(
-        prompt=inputs[-1] if inputs else "",
-        history=tuple(history),
-        session_id=first.session or None,
-        turn_id=first.execution_id,
-        config=bytes(start.config),
-    )
+    return await runner(binding, request, exchange)
 
 
 def _end(state: str, code: grpc.StatusCode | None = None, description: str = "") -> common.HarnessEnd:
@@ -163,6 +115,7 @@ class HarnessService(harness_pb2_grpc.HarnessServicer):
         self,
         frames: AsyncIterator[harness.ControllerFrame],
         first: harness.ControllerFrame,
+        exchange: ExecutionExchange,
     ) -> common.HarnessEnd:
         async for frame in frames:
             if frame.execution_id != first.execution_id or frame.session != first.session:
@@ -170,8 +123,14 @@ class HarnessService(harness_pb2_grpc.HarnessServicer):
             kind = frame.WhichOneof("frame")
             if kind == "cancel":
                 return _end("CANCELED", grpc.StatusCode.CANCELLED, "execution canceled")
-            if kind in {"model", "tool", "approval"}:
-                return _end("FAILED", grpc.StatusCode.UNIMPLEMENTED, "model, tool and approval replies are unsupported")
+            if kind == "model":
+                try:
+                    exchange.accept(frame.model)
+                except ValueError:
+                    return _end("FAILED", grpc.StatusCode.INVALID_ARGUMENT, "invalid model result")
+                continue
+            if kind in {"tool", "approval"}:
+                return _end("FAILED", grpc.StatusCode.UNIMPLEMENTED, "tool and approval replies are unsupported")
             return _end("FAILED", grpc.StatusCode.INVALID_ARGUMENT, "unexpected control frame")
         # A half-close means the controller can no longer service mediated effects.
         return _end("CANCELED", grpc.StatusCode.CANCELLED, "controller disconnected")
@@ -212,13 +171,16 @@ class HarnessService(harness_pb2_grpc.HarnessServicer):
         self._idle.clear()
         reader = None
         execution = None
+        outgoing = None
+        exchange = ExecutionExchange(execution_id, self.binding.spec.model.name, len(first.start.inputs))
         cleanup_failed = False
         settlement = None
 
         async def cleanup() -> None:
             nonlocal settlement, cleanup_failed
             if settlement is None:
-                tasks = [task for task in (reader, execution) if task is not None]
+                exchange.close()
+                tasks = [task for task in (reader, execution, outgoing) if task is not None]
                 # Retrieve already-failed outcomes even when caller cancellation
                 # preempts result handling; classify cleanup failures separately.
                 cleanup_tasks = [task for task in tasks if not task.done() or task.cancelling()]
@@ -254,10 +216,21 @@ class HarnessService(harness_pb2_grpc.HarnessServicer):
                 await cleanup()
                 yield _event(execution_id, kind=common.EVENT_END, end=_end("FAILED", grpc.StatusCode.UNIMPLEMENTED, "agentsessions execution is not implemented"))
                 return
-            reader = asyncio.create_task(self._read_controls(frames, first))
-            execution = asyncio.create_task(_invoke_runner(self.runner, self.binding, request))
+            reader = asyncio.create_task(self._read_controls(frames, first, exchange))
+            execution = asyncio.create_task(_invoke_runner(self.runner, self.binding, request, exchange))
             self._owners.update((reader, execution))
-            await asyncio.wait((reader, execution), return_when=asyncio.FIRST_COMPLETED)
+            outgoing = asyncio.create_task(exchange.events.get())
+            while True:
+                await asyncio.wait((reader, execution, outgoing), return_when=asyncio.FIRST_COMPLETED)
+                # Control failure wins over queued effects or concurrent completion.
+                if reader.done() or execution.done():
+                    break
+                event = outgoing.result()
+                # No await between marking and yielding: the receiver must not
+                # accept a guessed reply while the model call is still queued.
+                exchange.mark_emitted(event.model.id)
+                yield event
+                outgoing = asyncio.create_task(exchange.events.get())
             result = None
             if reader.done():
                 try:

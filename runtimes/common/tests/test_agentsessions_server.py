@@ -39,7 +39,7 @@ async def _running_server(binding_file):
 
     gate = _CleanupGate()
 
-    async def runner(binding, request):
+    async def runner(binding, request, exchange):
         gate.entered.set()
         try:
             await asyncio.Future()

@@ -41,7 +41,7 @@ def _run_child(config: str) -> None:
     binding = protocol().load_verified_agentsessions_binding(config)
     grpc.aio.server = _observed_server_factory(lambda port: print(f"PORT {port}", flush=True))
 
-    async def runner(binding, request):
+    async def runner(binding, request, exchange):
         print("ENTERED", flush=True)
         try:
             await asyncio.Future()
@@ -171,7 +171,7 @@ def test_serve_native_rpc_waits_for_execution_cleanup(binding_file, monkeypatch,
             grpc.aio, "server", _observed_server_factory(bound.set_result, server_ready.set_result)
         )
 
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             entered.set()
             try:
                 await asyncio.Future()
@@ -273,7 +273,7 @@ def test_shutdown_closes_admission_before_transport_stop(binding_file, monkeypat
         original_registered = service._registered_server
         calls = []
 
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             calls.append(request)
 
         def registered(servicer):

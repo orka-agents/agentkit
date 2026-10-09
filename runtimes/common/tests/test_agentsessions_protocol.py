@@ -159,7 +159,7 @@ def test_runner_receives_history_multiple_inputs_and_opaque_config(binding_file)
     async def check():
         from agentkit_serve_common.runtime import RunResult
         seen = []
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             seen.append((binding, request))
             return RunResult(text="neutral reply")
         async with live(binding_file, runner) as (_, c, h, stub, binding):
@@ -191,7 +191,7 @@ def test_runner_receives_history_multiple_inputs_and_opaque_config(binding_file)
 def test_inputless_start_is_not_invented_input(binding_file):
     async def check():
         from agentkit_serve_common.runtime import RunResult
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             assert request.prompt == ""
             assert request.history == ()
             assert request.config == b""
@@ -204,7 +204,7 @@ def test_inputless_start_is_not_invented_input(binding_file):
 
 
 def test_runner_failure_is_sanitized_and_ends_once(binding_file):
-    async def runner(binding, request):
+    async def runner(binding, request, exchange):
         raise RuntimeError("do not leak private request/config/provider material")
     async def check():
         async with live(binding_file, runner) as (_, c, h, stub, _):
@@ -262,7 +262,7 @@ def test_reader_controls_blocked_runner_and_releases_admission(binding_file, con
         entered = asyncio.Event()
         cleaned = asyncio.Event()
         calls = 0
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -286,7 +286,7 @@ def test_reader_controls_blocked_runner_and_releases_admission(binding_file, con
                 await call.write(frame)
             if control != "disconnect":
                 events = await asyncio.wait_for(collect(call), 2)
-                expected = ("CANCELED", 1) if control in {"cancel", "half-close"} else ("FAILED", 3 if control in {"wrong-id", "wrong-session", "start", "unknown"} else 12)
+                expected = ("CANCELED", 1) if control in {"cancel", "half-close"} else ("FAILED", 3 if control in {"wrong-id", "wrong-session", "start", "unknown", "model"} else 12)
                 terminal(events, c, *expected)
             await asyncio.wait_for(cleaned.wait(), 2)
             next_call = stub.Connect()
@@ -300,7 +300,7 @@ def test_concurrent_execution_rejected_without_poisoning_active_run(binding_file
         from agentkit_serve_common.runtime import RunResult
         entered = asyncio.Event()
         release = asyncio.Event()
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             entered.set()
             await release.wait()
             return RunResult(text="one")
@@ -345,7 +345,7 @@ def test_cancel_then_disconnect_cannot_interrupt_async_cleanup(binding_file):
         release_cleanup = asyncio.Event()
         cleaned = asyncio.Event()
         calls = 0
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -401,7 +401,7 @@ def test_direct_serve_nonloopback_without_auth_is_rejected(binding_file):
 def test_wire_receive_and_send_bounds(binding_file):
     async def check():
         import grpc
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             from agentkit_serve_common.runtime import RunResult
             return RunResult(text="x" * (4 * 1024 * 1024))
         async with live(binding_file, runner) as (_, c, h, stub, _):
@@ -420,7 +420,7 @@ def test_surrogate_output_fails_safely_and_next_execution_is_admitted(binding_fi
     async def check():
         from agentkit_serve_common.runtime import RunResult
         calls = 0
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             return RunResult(text="private-output-prefix-\ud800" if calls == 1 else "healthy")
@@ -451,12 +451,12 @@ def test_control_does_not_second_cancel_runner_already_closing(binding_file, mon
         interrupted = asyncio.Event()
         calls = 0
         original_reader = HarnessService._read_controls
-        async def observed_reader(self, frames, first):
-            result = await original_reader(self, frames, first)
+        async def observed_reader(self, frames, first, exchange):
+            result = await original_reader(self, frames, first, exchange)
             control_read.set()
             return result
         monkeypatch.setattr(HarnessService, "_read_controls", observed_reader)
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -507,7 +507,7 @@ def test_canceled_cleanup_failure_has_safe_diagnosis_and_releases_admission(bind
         entered = asyncio.Event()
         cleaned = asyncio.Event()
         calls = 0
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -572,7 +572,7 @@ def test_connect_cancellation_retrieves_already_failed_tasks(binding_file, caplo
         unhandled = []
         loop.set_exception_handler(lambda loop, context: unhandled.append(context))
         calls = 0
-        async def runner(binding, request):
+        async def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -621,7 +621,7 @@ def test_runner_accepts_awaitables_and_sanitizes_synchronous_failure(binding_fil
                 self.future = future
             def __await__(self):
                 return self.future.__await__()
-        def runner(binding, request):
+        def runner(binding, request, exchange):
             nonlocal calls
             calls += 1
             if kind == "synchronous-failure" and calls == 1:

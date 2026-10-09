@@ -64,7 +64,7 @@ def test_cli_nonloopback_requires_auth(binding_file, monkeypatch, bind, token):
 def test_cli_passes_only_explicit_agentsessions_runner(binding_file, monkeypatch):
     captured = {}
     class Factory(ProviderTrap):
-        async def run_agentsessions(self, binding, request):
+        async def run_agentsessions(self, binding, request, exchange):
             raise AssertionError("server entrypoint mocked only")
     factory = Factory()
     monkeypatch.setattr(cli, "run_agentsessions", lambda *args, **kwargs: captured.update(kwargs), raising=False)

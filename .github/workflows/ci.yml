@@ -55,6 +55,9 @@ jobs:
           shellcheck scripts/parity-container-smoke.sh
           bash -n scripts/generate-agentsessions-stubs.sh
           shellcheck scripts/generate-agentsessions-stubs.sh
+          bash -n scripts/agentsessions-e2e.sh
+          shellcheck scripts/agentsessions-e2e.sh
+          test -z "$(gofmt -l test/agentsessions/*.go)"
           test -z "$(gofmt -l test/orka-harness-v2/probe/*.go)"
           go test test/orka-harness-v2/probe/localai.go test/orka-harness-v2/probe/localai_test.go
           for script in \
@@ -496,6 +499,24 @@ jobs:
           smoke agentkit-smoke-maf maf-agent:ci 18081
           smoke agentkit-smoke-langgraph langgraph-agent:ci 18082
           orka_smoke agentkit-smoke-orka hello-agent:ci 18083
+
+      - name: Setup Go for agentsessions replay proof
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: test/agentsessions/go.mod
+          cache-dependency-path: test/agentsessions/go.sum
+
+      - name: Prove keyless agentsessions journal and replay
+        run: |
+          set -euo pipefail
+          make build-test-agent TAG=ci BUILDER= \
+            FIXTURE=test/agentsessions/Agentkitfile.yaml \
+            AGENT_IMAGE=agentkit-agentsessions-text:ci
+          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
+            scripts/agentsessions-e2e.sh --skip-build
+          cd test/agentsessions
+          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
+            go test -v -count=1 -run '^TestRunnerSignalCleanup$' ./...
 
       - name: Container parity smoke
         env:
