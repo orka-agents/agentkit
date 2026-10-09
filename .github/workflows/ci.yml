@@ -42,6 +42,8 @@ jobs:
           bash -n scripts/live-copilot-agent-e2e.sh
           bash -n scripts/orka-harness-v2-e2e.sh
           shellcheck scripts/orka-harness-v2-e2e.sh
+          bash -n scripts/generate-agentsessions-stubs.sh
+          shellcheck scripts/generate-agentsessions-stubs.sh
           test -z "$(gofmt -l test/orka-harness-v2/probe/*.go)"
           for script in \
             deploy/foundry/doctor.sh \
@@ -154,6 +156,17 @@ jobs:
           fi
           uv pip install --python .venv/bin/python "${prerelease_args[@]}" -e ".[dev]" build
 
+
+      - name: Setup Go for common wire interoperability
+        if: matrix.path == 'runtimes/common'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: test/agentsessions/go.mod
+          cache-dependency-path: test/agentsessions/go.sum
+
+      - name: Check pinned agentsessions stubs
+        if: matrix.path == 'runtimes/common'
+        run: scripts/generate-agentsessions-stubs.sh --check
 
       - name: Validate Foundry helper rendering
         if: matrix.path == 'runtimes/common'

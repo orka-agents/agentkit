@@ -12,6 +12,7 @@ Protocol modes:
   ``/responses``.
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
 * ``acp``: Orka-owned ACP protocol v1 over newline-delimited JSON-RPC on stdio.
+* ``agentsessions``: keyless native protobuf Harness SPI over gRPC (h2c).
 
 Network posture:
 
@@ -39,6 +40,11 @@ from .acp import (
     run_acp_stdio,
 )
 from .adapter_support import AgentBuildError, resolve_model_api
+from .agentsessions import (
+    AgentsessionsConfigurationError,
+    load_verified_agentsessions_binding,
+    run as run_agentsessions,
+)
 from .config import ConfigError, load, load_or_exit
 from .foundry import create_foundry_app
 from .orka import create_orka_app
@@ -47,7 +53,7 @@ from .server import create_app
 
 # Hosts that mean "loopback only" — a bind to any of these needs no auth token.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
-_PROTOCOLS = frozenset({"acp", "openai", "foundry", "orka"})
+_PROTOCOLS = frozenset({"acp", "agentsessions", "openai", "foundry", "orka"})
 
 DEFAULT_CONFIG_PATH = "/agent/agent.yaml"
 DEFAULT_PORT = 8080
@@ -148,7 +154,15 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
             _fail(str(exc))
         run_acp_stdio(spec, factory)
         return
-    spec = _load_spec_or_exit(args.config, protocol)
+    binding = None
+    if protocol == "agentsessions":
+        try:
+            binding = load_verified_agentsessions_binding(args.config)
+        except AgentsessionsConfigurationError as exc:
+            _fail(str(exc))
+        spec = binding.spec
+    else:
+        spec = _load_spec_or_exit(args.config, protocol)
     if spec.brokered_tools and protocol != "foundry":
         _fail(
             "brokeredTools require AGENTKIT_PROTOCOL=foundry (or --protocol foundry); "
@@ -171,6 +185,16 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
             f"AGENTKIT_AUTH_TOKEN to require `Authorization: Bearer <token>` on "
             f"protected endpoints, or bind 127.0.0.1 (the default) for loopback-only access"
         )
+
+    if binding is not None:
+        # Optional, explicit per-Start capability. No default provider runtime
+        # fallback; adapters without this hook fail closed in the gRPC skeleton.
+        runner = getattr(factory, "run_agentsessions", None)
+        run_agentsessions(
+            binding, bind=bind, port=port, auth_token=auth_token,
+            runner=runner if callable(runner) else None,
+        )
+        return
 
     app = _create_protocol_app(protocol, spec, factory, auth_token)
 

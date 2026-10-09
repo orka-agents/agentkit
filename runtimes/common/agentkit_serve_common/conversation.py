@@ -68,6 +68,8 @@ class RunRequest:
     on_tool_event: Callable[[ToolCallEvent], Awaitable[None]] | None = field(
         default=None, repr=False, compare=False
     )
+    # Journal-restored opaque agentsessions Start.Config; never env or prompt input.
+    config: bytes = field(default=b"", repr=False)
 
 
 class OpenAIMessage(Protocol):

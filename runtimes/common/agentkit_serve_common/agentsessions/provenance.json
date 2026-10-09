@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/aramase/agentsessions",
+  "commit": "b212d498ba52615b5087b2579bdd482809065642",
+  "go_module_version": "v0.1.3-0.20261006182201-b212d498ba52",
+  "license": "Apache-2.0",
+  "sources": {
+    "proto/common.proto": {"upstream": "api/common.proto", "sha256": "f7554f6bf8493533e8fa896353a2e53d3999eb22f5ecf71b2e31a92b8cadc00f"},
+    "proto/harness.proto": {"upstream": "api/harness.proto", "sha256": "4cdfaeb3511d3d5827b6f6751c0775ca5848448f4ee89b7f52834dfb7b750e5e"},
+    "LICENSE.agentsessions": {"upstream": "LICENSE", "sha256": "4b58f3e82696440ff173457975a7dd01e3fca6d4bb304c29428e33de00033089"}
+  },
+  "generator": {"grpcio-tools": "1.78.0", "protobuf": "6.31.1", "grpcio": "1.78.0"},
+  "modifications": "Proto and license inputs are unmodified. Generated Python imports are made package-relative; an AgentKit notice is prepended."
+}

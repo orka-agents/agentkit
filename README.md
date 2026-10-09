@@ -347,6 +347,38 @@ The most important rules are:
 
 Full reference: [`docs/agentkitfile.md`](docs/agentkitfile.md).
 
+## Verify released images
+
+Tagged releases publish SBOM and provenance attestations and keylessly sign each
+multi-architecture image index with cosign using GitHub Actions OIDC. No
+long-lived signing key is used. This applies to the published `agentkit`,
+`serve-pydantic-ai`, `serve-maf`, and `serve-langgraph` images, not to custom agents
+you build from them. Releases published before signing was enabled have no
+signature from this workflow.
+
+With cosign v3 (v3.0.6 or newer) and Docker Buildx installed, select a signed
+release image (replace `<version>` with its release version). The workflow uses
+cosign v3's bundle format and OCI referring artifacts for signatures:
+
+```sh
+IMAGE='ghcr.io/orka-agents/agentkit/serve-pydantic-ai:v<version>'
+
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/orka-agents/agentkit/\.github/workflows/release\.yml@refs/tags/v[0-9][0-9A-Za-z_.-]*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$IMAGE"
+
+docker buildx imagetools inspect "$IMAGE" --format '{{ json .SBOM }}'
+```
+
+The first command verifies the signature and checks that the signing certificate
+identifies this repository's release workflow on a version tag, issued through
+GitHub Actions OIDC. The second reads the BuildKit SBOM attestations for the
+image's platforms. Verifying by tag or by `image@sha256:<digest>` resolves to the
+signed multi-architecture index; individual platform digests are not signed
+separately. Prefer an index digest for repeatable verification and use that same
+reference for both commands, since tags can move.
+
 ## Develop AgentKit locally
 
 Build the frontend image, the default runtime adapter image, and a test agent:
