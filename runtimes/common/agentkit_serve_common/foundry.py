@@ -49,6 +49,10 @@ from .model_errors import normalized_model_error_details
 from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory, RuntimeHealth
+from .responses import (
+    responses_payload,
+    responses_usage as _responses_usage,
+)
 from .server import make_auth_dependency
 from .tool_errors import orka_tool_error_details
 
@@ -133,18 +137,6 @@ def _usage(result: RunResult) -> dict[str, int]:
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
-    }
-
-
-def _responses_usage(result: RunResult | None = None, usage: Mapping[str, int] | None = None) -> dict[str, int]:
-    raw = dict(usage or (result.usage if result is not None else {}) or {})
-    input_tokens = int(raw.get("input_tokens", raw.get("prompt_tokens", 0)) or 0)
-    output_tokens = int(raw.get("output_tokens", raw.get("completion_tokens", 0)) or 0)
-    total_tokens = int(raw.get("total_tokens", input_tokens + output_tokens) or 0)
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
     }
 
 
@@ -419,33 +411,16 @@ def _responses_payload(
     created_at: int | None = None,
 ) -> dict[str, Any]:
     response_id = response_id or _new_response_id(previous_response_id)
-    message_id = _new_message_id(response_id)
-    payload: dict[str, Any] = {
-        "id": response_id,
-        "object": "response",
-        "created_at": int(time.time()) if created_at is None else created_at,
-        "status": "completed",
-        "model": spec.model.name,
-        "output": [
-            {
-                "id": message_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": result.text,
-                        "annotations": [],
-                    }
-                ],
-                "response_id": response_id,
-            }
-        ],
-        "usage": _responses_usage(result),
-    }
-    if previous_response_id:
-        payload["previous_response_id"] = previous_response_id
+    payload = responses_payload(
+        spec.model.name,
+        result,
+        previous_response_id=previous_response_id,
+        response_id=response_id,
+        message_id=_new_message_id(response_id),
+        created_at=created_at,
+    )
+    # The hosted SDK associates each message with its Foundry response ID.
+    payload["output"][0]["response_id"] = response_id
     return payload
 
 

@@ -51,6 +51,15 @@ for the qualified direct MAF and hosted Foundry paths.
 
 ## Current support
 
+All three adapters serve both `POST /v1/chat/completions` and
+`POST /v1/responses` in `AGENTKIT_PROTOCOL=openai`. They share one listener,
+runtime session, baked tools, auth, and lifecycle; no new protocol or capability
+flag is required. Generic Responses is synchronous, stateless, and text-only,
+with client-supplied message history and completed assistant text and usage.
+It rejects unsupported features before execution, as defined in
+[the HTTP contract](agent-abi.md#served-http-contract). This does not change
+`foundry-responses-minimal` or Foundry/brokered continuation support.
+
 | Runtime | Capabilities |
 |---|---|
 | `pydantic-ai` | `stdio-mcp`, `streamable-http-mcp`, `foundry-invocations-protocol`, `foundry-responses-minimal`, `orka-harness-v1`, `orka-observed-tools` |
@@ -93,7 +102,8 @@ fallback. LangGraph explicitly sets its SDK transport so ambient LangChain
 settings cannot override this selector.
 
 Responses requires a backend that implements `/responses`; Chat requires
-`/chat/completions`. AgentKit does not probe or silently switch APIs. Invalid
+`/chat/completions`. There is no `auto` value; AgentKit does not probe or silently
+switch APIs. Both inbound routes remain available with either selector. Invalid
 selector values fail before client/auth initialization. The separate
 `agentsessions` host-mediated model contract remains Chat-only. Native Anthropic
 Messages is not supported. This selector does not change the agent.yaml model

@@ -207,13 +207,25 @@ The Go frontend must:
 
 ## Served HTTP contract
 
-The native runtime serves:
+With `AGENTKIT_PROTOCOL=openai`, the runtime serves:
 
 - `GET /healthz` — liveness.
 - `GET /v1/models` — one-model listing containing `model.name`.
 - `POST /v1/chat/completions` — non-streaming run that returns one
-  `chat.completion` object. Optional `X-AgentKit-Session-Id` is forwarded to
-  runtime adapters for provider-neutral session/memory correlation.
+  `chat.completion` object.
+- `POST /v1/responses` runs synchronously with stateless, text-only input and
+  returns one completed assistant message with `output_text`, `input_tokens`,
+  `output_tokens`, and `total_tokens` usage, and `store: false`.
+
+Both POST routes share the listener, runtime session, baked MCP tools, auth,
+health state, and application lifespan. Optional `X-AgentKit-Session-Id` is
+forwarded to runtime adapters for provider-neutral session/memory correlation;
+it does not retain or replace the client-supplied transcript.
+
+`AGENTKIT_MODEL_API` independently selects the upstream model transport:
+`chat_completions` by default or explicit `responses`. Neither client route
+forces an upstream API, and there is no `auto`, fallback, new protocol, or ABI
+field for this choice.
 
 Runtime protocol selection happens outside the ABI with `agentkit-serve
 --protocol` or `AGENTKIT_PROTOCOL`; the same `/agent/agent.yaml` file is reused by
@@ -239,8 +251,34 @@ does not change the ABI file shape.
 - an empty `messages` array, and
 - requests whose final message is not a `user` message.
 
-The response collapses any intermediate framework/tool loop into one assistant
-message with `finish_reason: "stop"`.
+The Chat response collapses any intermediate framework/tool loop into one
+assistant message with `finish_reason: "stop"`.
+
+`POST /v1/responses` accepts `input` as a string or a non-empty message array
+whose final message is `user`. Array items must be messages with `system`,
+`developer`, `user`, or `assistant` roles. Content is a string or a list of
+`input_text`/`output_text` parts with string `text`. Developer messages become
+system history; assistant `phase`, when supplied as `commentary` or
+`final_answer`, is preserved in normalized history. Top-level `instructions`
+becomes client system history before the input history and after the baked
+instructions. Each request supplies its own conversation. Usage reports aggregate
+counts. Cache and reasoning detail counters are zero because the runtime seam
+does not report those breakdowns.
+
+Before runtime or tool execution, Responses rejects:
+
+- `stream: true`, non-empty `tools`, or specific `tool_choice` values. Only
+  missing, empty, `none`, and `auto` tool choices are accepted;
+- `previous_response_id` or `conversation` state references;
+- `background: true` or `store: true`;
+- non-message input items, including function calls and function outputs, or
+  multimodal content, including images, audio, and files; and
+- empty message arrays, unsupported roles/content/phase, or a final message
+  whose role is not `user`.
+
+Responses runs baked tools internally and returns their final text, not client
+function-call continuations. These restrictions apply to generic
+`/v1/responses`, not Foundry `/responses` or its brokered continuation contract.
 
 ## Network and process contract
 

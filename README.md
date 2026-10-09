@@ -1,8 +1,8 @@
 # AgentKit
 
 AgentKit builds an agent from YAML into a normal OCI container image. The
-container serves an OpenAI-compatible `/v1` Chat Completions API, can own MCP
-tools, and keeps secret values out of the image.
+container serves OpenAI-compatible Chat Completions and Responses APIs on the
+same `/v1` listener, can own MCP tools, and keeps secret values out of the image.
 
 Use AgentKit when you want to package an agent the same way you package any other
 container: build it with Docker, run it locally, push it to a registry, and deploy
@@ -55,11 +55,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"https://example.com"}]}'
 ```
 
-The image also exposes:
+The same container also accepts Responses requests:
+
+```sh
+curl http://127.0.0.1:8080/v1/responses \
+  -H 'authorization: Bearer dev-token' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","input":"https://example.com","store":false}'
+```
+
+Both routes share the runtime, baked MCP tools, bearer auth, and lifecycle.
+Responses is synchronous, stateless, and text-only. Send `input` as a string or
+an array of `system`, `developer`, `user`, and `assistant` messages ending in a
+user message. Message content can be text or `input_text`/`output_text` parts;
+assistant `phase` is preserved in history. Optional top-level `instructions`
+becomes client system history after the baked instructions. The reply contains
+one completed assistant `output_text` message, token usage, and `store: false`.
+`X-AgentKit-Session-Id` supports correlation on either route, not stored history.
+
+Responses rejects streaming, nonempty request `tools`, specific `tool_choice`,
+`previous_response_id`, `conversation`, `background: true`, `store: true`, and
+non-message or multimodal input before execution. Tools come from the image.
+See [the HTTP contract](docs/agent-abi.md#served-http-contract) for details.
+
+The image exposes:
 
 - `GET /healthz`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 
 ## Select a protocol surface
 
@@ -90,10 +114,12 @@ set it to `responses` to use a Responses-compatible model backend. This works
 with standalone/local Docker agents and the OpenAI, Foundry, Orka, and ACP
 serving protocols. It does not require Foundry hosting or Foundry credentials.
 The configured model backend must implement the selected API; AgentKit does not
-silently fall back to Chat when Responses is unavailable.
+silently fall back to Chat when Responses is unavailable. There is no `auto`
+value or separate Responses serving protocol. With `AGENTKIT_PROTOCOL=openai`,
+both client routes are available regardless of the upstream selector.
 
-For example, the same standalone image can accept Chat Completions requests
-while calling the model through Responses:
+For example, the same standalone image can accept either Chat Completions or
+Responses requests while calling the model through Responses:
 
 ```sh
 docker run --rm \
@@ -118,10 +144,13 @@ Protocol endpoints:
 
 | Protocol | Endpoints | Notes |
 |---|---|---|
-| `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions` | Default, non-streaming Chat Completions. |
+| `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions`, `/v1/responses` | Default, synchronous Chat Completions and stateless text-only Responses on one listener. |
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
 | `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
 | `acp` | stdin/stdout | ACP protocol v1 child mode for Orka `orka.harness.v2`. It opens no network listener and accepts only the supervisor's loopback provider proxy and prompt-scoped HTTP MCP server. |
+
+Generic `/v1/responses` does not change Foundry's `/responses` or its brokered
+continuation paths.
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -321,9 +350,9 @@ AgentKit files are runtime-neutral. Pick the agent framework with the optional
 runtime: langgraph
 ```
 
-All runtimes read the same built agent config and serve the same non-streaming
-OpenAI-compatible API. Runtime capabilities are explicit and validated before
-build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
+All runtimes read the same built agent config and serve both non-streaming
+OpenAI-compatible client APIs. Runtime capabilities are explicit and validated
+before build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
 [`docs/runtime-adapters.md`](docs/runtime-adapters.md).
 
 ## Configure the server

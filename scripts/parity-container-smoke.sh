@@ -2,7 +2,8 @@
 
 # Container parity smoke: run each runtime's built parity agent image under the
 # openai, foundry, and orka protocols with both upstream Chat and Responses APIs
-# against a scripted model and remote MCP tool. Checks API selection, history,
+# against a scripted model and remote MCP tool. OpenAI mode checks both client
+# routes on the same container. Checks upstream API selection, history,
 # a plain answer, a tool round trip, and the normalized response to a
 # 401 that echoes the model key, and that the key never appears in a response or
 # container log. Needs the frontend and adapter images from `make build-agentkit
@@ -85,24 +86,76 @@ check_history() {
 }
 
 openai_scenarios() {
-  local base="$1" label="$2" model_api="$3" out status
+  local base="$1" label="$2" model_api="$3" out status endpoint payload token
+  local headers=()
   local auth=(--max-time "$request_timeout" -H "Authorization: Bearer $auth_token" -H "Content-Type: application/json")
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"plain:P1"}]}')"
-  check "$label plain" '.choices[0].message.content == "parity-answer: P1"' "$out"
+  check "$label Chat plain" '.choices[0].message.content == "parity-answer: P1"' "$out"
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"tool:T1"}]}')"
-  check "$label tool" '.choices[0].message.content | contains("receipt-T1")' "$out"
+  check "$label Chat tool" '.choices[0].message.content | contains("receipt-T1")' "$out"
   out="$(curl -sS "${auth[@]}" "$base/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"api:$model_api\"}]}")"
-  check "$label upstream API" ".choices[0].message.content == \"parity-api: $model_api\"" "$out"
+  check "$label Chat upstream API" ".choices[0].message.content == \"parity-api: $model_api\"" "$out"
   out="$(curl -sS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/chat/completions" \
     -d '{"messages":[{"role":"user","content":"old history"}]}')"
-  check "$label initial history" '.choices[0].message.content == "parity-answer: old history"' "$out"
+  check "$label Chat initial history" '.choices[0].message.content == "parity-answer: old history"' "$out"
   out="$(curl -sS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/chat/completions" \
     -d '{"messages":[{"role":"system","content":"client system note"},{"role":"user","content":"u1 edited"},{"role":"assistant","content":"a1 edited"},{"role":"user","content":"history:H1"}]}')"
-  check_history "$label history" '.choices[0].message.content' "$out" history:H1
+  check_history "$label Chat history" '.choices[0].message.content' "$out" history:H1
   out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/v1/chat/completions" -d '{"messages":[{"role":"user","content":"auth-echo"}]}')"
   status="${out##*$'\n'}"
-  [[ "$status" == 503 ]] || die "$label auth-echo returned HTTP $status"
-  check "$label auth-echo" '.error.code == "ModelAuthRejected"' "${out%$'\n'*}"
+  [[ "$status" == 503 ]] || die "$label Chat auth-echo returned HTTP $status"
+  check "$label Chat auth-echo" '.error.code == "ModelAuthRejected"' "${out%$'\n'*}"
+
+  # These Responses calls reuse the Chat container and its configured upstream API.
+  out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d '{"input":"plain:R1","store":false}')"
+  check "$label Responses plain" '.object == "response" and .status == "completed" and .store == false and
+    (.output | length) == 1 and .output[0].type == "message" and .output[0].role == "assistant" and
+    .output[0].status == "completed" and .output[0].content[0].type == "output_text" and
+    .output[0].content[0].text == "parity-answer: R1" and
+    (.usage.input_tokens | type) == "number" and (.usage.output_tokens | type) == "number" and
+    (.usage.total_tokens | type) == "number"' "$out"
+  out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d '{"input":"tool:R1"}')"
+  check "$label Responses baked tool" '.output[0].content[0].text | contains("receipt-R1")' "$out"
+  out="$(curl -fsS "${auth[@]}" "$base/v1/responses" -d "{\"input\":\"api:$model_api\"}")"
+  check "$label Responses upstream API" ".output[0].content[0].text == \"parity-api: $model_api\"" "$out"
+  out="$(curl -fsS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/responses" \
+    -d '{"input":"old Responses history"}')"
+  check "$label Responses initial history" '.output[0].content[0].text == "parity-answer: old Responses history"' "$out"
+  out="$(curl -fsS "${auth[@]}" -H 'X-AgentKit-Session-Id: parity-history' "$base/v1/responses" \
+    -d '{"instructions":"client instructions","input":[
+      {"role":"system","content":"client system note"},
+      {"role":"developer","content":[{"type":"input_text","text":"client developer note"}]},
+      {"role":"user","content":[{"type":"input_text","text":"u1 edited"}]},
+      {"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"a1 edited"}]},
+      {"role":"user","content":[{"type":"input_text","text":"history:HR1"}]}
+    ]}')"
+  # $turns is a jq variable, not a shell expansion. Neither route retains old turns.
+  # shellcheck disable=SC2016
+  check "$label Responses history" '(.output[0].content[0].text | ltrimstr("parity-history: ") | fromjson) as $turns |
+    ($turns | length) == 7 and $turns[0][0] == "system" and
+    ($turns[0][1] | contains("Follow the scripted parity fixture.")) and
+    $turns[1:] == [["system","client instructions"],["system","client system note"],
+      ["system","client developer note"],["user","u1 edited"],["assistant","a1 edited"],["user","history:HR1"]]' "$out"
+  out="$(curl -sS -w '\n%{http_code}' "${auth[@]}" "$base/v1/responses" -d '{"input":"auth-echo"}')"
+  status="${out##*$'\n'}"
+  [[ "$status" == 503 ]] || die "$label Responses auth-echo returned HTTP $status"
+  check "$label Responses auth-echo" '.error.code == "ModelAuthRejected"' "${out%$'\n'*}"
+
+  for endpoint in chat/completions responses; do
+    if [[ "$endpoint" == responses ]]; then
+      payload='{"input":"plain:unauthorized"}'
+    else
+      payload='{"messages":[{"role":"user","content":"plain:unauthorized"}]}'
+    fi
+    for token in '' invalid-token; do
+      headers=(-H 'Content-Type: application/json')
+      [[ -z "$token" ]] || headers+=(-H "Authorization: Bearer $token")
+      out="$(curl -sS --max-time "$request_timeout" -w '\n%{http_code}' "${headers[@]}" "$base/v1/$endpoint" -d "$payload")"
+      status="${out##*$'\n'}"
+      [[ "$status" == 401 ]] || die "$label $endpoint client auth '${token:-missing}' returned HTTP $status"
+      check "$label $endpoint client auth '${token:-missing}'" '.error.type == "invalid_request_error"' "${out%$'\n'*}"
+    done
+  done
 }
 
 foundry_scenarios() {

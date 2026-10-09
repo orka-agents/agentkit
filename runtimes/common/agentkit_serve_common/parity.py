@@ -39,6 +39,8 @@ from .conversation import RunRequest, ToolCallEvent
 __all__ = [
     "pytest_generate_tests",
     "test_parity_model_receives_baked_instructions_then_client_history",
+    "test_parity_dual_openai_endpoints_with_sdk",
+    "test_parity_responses_tool_roundtrip",
     "test_parity_client_history_is_authoritative_with_session_header",
     "test_parity_orka_turns_carry_runtime_session_history",
     "test_parity_tool_roundtrip",
@@ -638,6 +640,28 @@ def test_parity_model_receives_baked_instructions_then_client_history(model_api)
         assert _conversation(body) == _EXPECTED_CONVERSATION
 
 
+def test_parity_dual_openai_endpoints_with_sdk(model_api):
+    """Both client APIs use the same configured upstream API and baked agent."""
+    from openai import OpenAI
+
+    messages = [message for message in _CLIENT_CONVERSATION if message["role"] != "tool"]
+    with _harness(model_api=model_api) as (provider, spec), _openai(spec) as client:
+        sdk = OpenAI(
+            base_url="http://testserver/v1", api_key="unused", http_client=client,
+            _strict_response_validation=True,
+        )
+        chat = sdk.chat.completions.create(model=_MODEL_NAME, messages=messages)
+        response = sdk.responses.create(model=_MODEL_NAME, input=messages, store=False)
+        assert chat.choices[0].message.content == response.output_text == "parity-answer"
+        assert response.status == "completed"
+        assert response.usage.total_tokens > 0
+
+    assert [auth for auth, _ in provider.requests] == [f"Bearer {_MODEL_KEY}"] * 2
+    for body in provider.bodies():
+        assert body["model"] == _MODEL_NAME
+        assert _conversation(body) == _EXPECTED_CONVERSATION
+
+
 def test_parity_client_history_is_authoritative_with_session_header(model_api):
     """A session header must not replace the history the client actually sent."""
     headers = {"X-AgentKit-Session-Id": "parity-session"}
@@ -694,6 +718,19 @@ def test_parity_tool_roundtrip(model_api):
     assert {tool["name"] for tool in _tool_definitions(first)} == _TOOL_NAMES
     echo = next(tool for tool in _tool_definitions(first) if tool["name"] == "probe_echo")
     assert echo["parameters"]["required"] == ["value"]
+    assert "receipt-MARK" in _tool_results(second)["call_parity_0"]
+
+
+def test_parity_responses_tool_roundtrip(model_api):
+    """Client Responses requests retain baked tool execution with either upstream API."""
+    with _harness(model_api=model_api, tools=True) as (provider, spec), _openai(spec) as client:
+        provider.script = _call_then_answer(("probe_echo", json.dumps({"value": "MARK"})))
+        response = client.post("/v1/responses", json={"input": "use the tool", "store": False})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["output"][0]["content"][0]["text"] == "parity-final"
+    first, second = provider.bodies()
+    assert {tool["name"] for tool in _tool_definitions(first)} == _TOOL_NAMES
     assert "receipt-MARK" in _tool_results(second)["call_parity_0"]
 
 

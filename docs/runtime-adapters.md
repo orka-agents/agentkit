@@ -13,7 +13,8 @@ must be identical across adapters:
 |---|---|
 | `config.py` | Strict `/agent/agent.yaml` reader and ABI version check. |
 | `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka\|acp`, bind/port handling, auth startup gates. |
-| `server.py` | FastAPI app and OpenAI-compatible response/error envelopes. |
+| `server.py` | Shared FastAPI listener, runtime/auth/lifecycle, and Chat Completions/Responses routes. |
+| `responses.py` | Stateless text-only Responses input normalization and shared response/usage encoding. |
 | `foundry.py` | Foundry `/readiness`, `/invocations`, and minimal `/responses` skin. |
 | `orka.py` | Observed-mode `orka.harness.v1` HTTP+SSE skin. |
 | `acp.py` | Strict ACP stdio child for an Orka `orka.harness.v2` supervisor. |
@@ -43,6 +44,11 @@ OpenAI mode exposes:
 - `GET /v1/models` returns the one configured model name.
 - `POST /v1/chat/completions` runs the agent once and returns one
   `chat.completion` object with a single assistant message.
+- `POST /v1/responses` runs the same agent synchronously and returns one
+  completed assistant `output_text` message, usage, and `store: false`.
+
+Both POST routes share one listener, runtime session, bearer auth, health state,
+and MCP/application lifespan. No separate Responses protocol is needed.
 
 Foundry mode exposes `/readiness`, `/invocations`, and synchronous
 `/responses`. It defaults to port `8088` when the ABI kept the generic default
@@ -59,7 +65,7 @@ providers remain prohibited. At session creation it
 accepts at most one loopback HTTP MCP server with bearer authentication, which
 is the prompt-scoped broker created by the Orka supervisor.
 
-Request behavior is intentionally narrow:
+Chat Completions request behavior is intentionally narrow:
 
 - `stream: true` returns HTTP 400 with code `stream_unsupported`.
 - non-empty `tools` returns HTTP 400 with code `tools_unsupported`.
@@ -75,6 +81,20 @@ Request behavior is intentionally narrow:
   `RunRequest` for runtime/session correlation. It never replaces the history the
   client sent. Orka mode additionally forwards `turn_id`, `correlation_id`,
   `deadline`, `metadata`, and per-run `env` fields.
+
+Generic Responses accepts a string `input` or a non-empty message array ending
+in a user message. Messages support `system`, `developer`, `user`, and
+`assistant` roles, with string content or `input_text`/`output_text` parts.
+Developer messages become system history; assistant `phase` is preserved in
+normalized history. Top-level `instructions` becomes client system history
+after baked instructions and before input history. `X-AgentKit-Session-Id`
+provides the same correlation as Chat, not stored conversation state.
+
+Responses rejects streaming, nonempty request tools, specific tool choices,
+`previous_response_id`, `conversation`, `background: true`, `store: true`, and
+non-message/multimodal input before runtime or tool execution. The built agent
+still runs its own tools internally. Foundry `/responses` and brokered
+continuations keep their separate behavior.
 
 The protocol layer owns the conversation: OpenAI and Foundry clients send it, and
 Orka mode keeps each runtime session's completed user/assistant turns, as the
@@ -105,7 +125,12 @@ failures; and a traceback otherwise.
 ## Model endpoint compatibility
 
 Adapters use the baked `model.baseURL` and `model.name` to construct their
-OpenAI-compatible chat client. They do not special-case a provider: the endpoint
+OpenAI-compatible model client. `AGENTKIT_MODEL_API` explicitly selects
+`chat_completions`, the default, or `responses` for upstream calls. It does not
+change the inbound routes: either client API can use either upstream API. There
+is no `auto`, probing, or fallback; the backend must implement the selected API.
+This startup selector does not change the ABI, Foundry `/responses`, or brokered
+continuation rules. Adapters do not special-case a provider: the endpoint
 can be OpenAI, another hosted provider, a local gateway, an in-cluster service,
 or a prebuilt or custom [AIKit](https://github.com/kaito-project/aikit) model
 image. AIKit is just an example of an OpenAI-compatible endpoint. For no-auth

@@ -7,7 +7,8 @@ only per-adapter input.
 
 Protocol modes:
 
-* ``openai`` (default): ``/healthz``, ``/v1/models``, ``/v1/chat/completions``.
+* ``openai`` (default): ``/healthz``, ``/v1/models``, ``/v1/chat/completions``,
+  and stateless ``/v1/responses``.
 * ``foundry``: ``/readiness``, ``/invocations``, minimal non-streaming
   ``/responses``.
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
