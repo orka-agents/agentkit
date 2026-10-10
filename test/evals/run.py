@@ -189,6 +189,7 @@ def run_trial(args: argparse.Namespace, case_id: str, trial: int) -> dict[str, A
                         "ModelUpstreamError",
                         "MCPToolProtocolError",
                         "AgentRunFailed",
+                        "AgentRetryLimitExceeded",
                         "AgentNotInitialized",
                         "LangGraphResultError",
                     }:
@@ -239,7 +240,7 @@ def run_trial(args: argparse.Namespace, case_id: str, trial: int) -> dict[str, A
         infrastructure_failure = is_infrastructure_failure(state, error)
         if infrastructure_failure:
             grades["taskSuccess"] = False
-            grades["failureReasons"].append("live_model_unavailable")
+            grades["failureReasons"].append("infrastructure_failure")
         result = {
             "case": case_id,
             "category": world.case.category,

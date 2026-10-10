@@ -292,13 +292,21 @@ plans do not automatically fail the task.
 
 Quality failures are informational and exit zero. The suite still completes
 independent cases and trials. An individual task that exceeds its time budget receives a failing grade.
+Known exhausted model/tool correction retries returned as HTTP 502 with safe code
+`AgentRetryLimitExceeded` are quality failures after completed real inference.
+They allow `complete=true` with `qualityPassed=false` and exit zero.
+`AgentRunFailed` and unknown HTTP, framework, protocol or transport errors remain
+infrastructure failures. These results use the neutral `infrastructure_failure`
+failure reason without changing the report schema.
 Build, startup, model transport, exhausted suite budgets and other
 infrastructure failures or incomplete runs exit nonzero. Partial reports are
 not complete results. Each measured trial requires at least one completed real
-inference response. Pending model forwards are settled before final accounting;
-a stalled first inference cannot produce a complete, green baseline. Cleanup
-failures also return nonzero and appear in `run.json`. Check completion status and planned versus completed
-counts before comparing grades; a green job does not mean every task passed.
+inference response. Provider failures, zero completions or in-flight work force
+infrastructure failure regardless of the retry code. Pending model forwards are
+settled before final accounting; a stalled first inference cannot produce a
+complete, green baseline. Cleanup failures also return nonzero and appear in
+`run.json`. Check completion status and planned versus completed counts before
+comparing grades; a green job does not mean every task passed.
 
 `.github/workflows/live-task-evals.yml` runs only manually or nightly, not on
 pushes or pull requests. Its three-adapter matrix defaults to three trials per

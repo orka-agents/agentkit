@@ -217,6 +217,51 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(result["providerCompletions"], 0)
             self.assertEqual(request.call_args_list[-1].args[0], "http://fixture/eval/settle")
 
+    def test_retry_limit_is_quality_failure_only_after_completed_inference(self):
+        from cases import World
+
+        @contextlib.contextmanager
+        def isolated(*args):
+            yield "fixture", "http://fixture", "agent", "http://agent"
+
+        for changes, infrastructure in (
+            ({}, False),
+            ({"providerCompletions": 0}, True),
+            ({"providerRequests": 2, "providerFailures": 1}, True),
+            ({"providerRequests": 2, "providerInflight": 1}, True),
+        ):
+            with self.subTest(accounting=changes):
+                world = World("stock", 1)
+                world.provider_requests = world.provider_completions = 1
+                state = world.snapshot()
+                state.update(changes)
+                error = runner.urllib.error.HTTPError(
+                    "http://agent/v1/chat/completions",
+                    502,
+                    "agent retry limit exceeded",
+                    {},
+                    io.BytesIO(json.dumps({"error": {"code": "AgentRetryLimitExceeded"}}).encode()),
+                )
+                with (
+                    error,
+                    tempfile.TemporaryDirectory() as directory,
+                    patch.object(runner, "containers", isolated),
+                    patch.object(runner, "docker", return_value="sha256:test"),
+                    patch.object(runner, "request", side_effect=[error, state]),
+                ):
+                    options = args(directory, cases="stock")
+                    self.assertEqual(runner.run(options), 2 if infrastructure else 0)
+                    report = json.loads(options.output.read_text())
+                    self.assertEqual(report["complete"], not infrastructure)
+                    self.assertFalse(report["qualityPassed"])
+                    self.assertEqual(report["summary"]["completedTrials"], 1)
+                    item = report["results"][0]
+                    self.assertFalse(item["taskSuccess"])
+                    self.assertEqual(item["infrastructureFailure"], infrastructure)
+                    self.assertIn("runtime_AgentRetryLimitExceeded", item["failureReasons"])
+                    self.assertEqual("infrastructure_failure" in item["failureReasons"], infrastructure)
+                    self.assertNotIn("live_model_unavailable", item["failureReasons"])
+
     def test_agent_run_failure_after_inference_keeps_the_suite_incomplete(self):
         from cases import World
 
@@ -247,6 +292,9 @@ class Lifecycle(unittest.TestCase):
             self.assertFalse(report["qualityPassed"])
             self.assertTrue(report["results"][0]["infrastructureFailure"])
             self.assertEqual(report["results"][0]["providerCompletions"], 1)
+            self.assertIn("runtime_AgentRunFailed", report["results"][0]["failureReasons"])
+            self.assertIn("infrastructure_failure", report["results"][0]["failureReasons"])
+            self.assertNotIn("live_model_unavailable", report["results"][0]["failureReasons"])
 
     def test_fixture_accounting_timeout_is_infrastructure_not_task_timeout(self):
         from cases import World
