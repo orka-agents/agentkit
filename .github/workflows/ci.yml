@@ -47,6 +47,8 @@ jobs:
           bash -n scripts/live-aikit-agent-e2e.sh
           bash -n scripts/aikit-e2e-common.sh
           shellcheck -x scripts/live-aikit-agent-e2e.sh scripts/aikit-e2e-common.sh
+          bash -n scripts/live-task-evals.sh
+          shellcheck -x scripts/live-task-evals.sh
           bash -n scripts/orka-harness-v2-e2e.sh
           shellcheck -x scripts/orka-harness-v2-e2e.sh
           bash -n scripts/parity-container-smoke.sh
@@ -214,6 +216,10 @@ jobs:
           else
             echo "No package-local tests for ${{ matrix.package }}; compile and wheel checks cover it."
           fi
+
+      - name: Run live eval stdlib unit tests
+        if: matrix.path == 'runtimes/common'
+        run: python3 -m unittest discover -s test/evals -p 'test_*.py'
 
       - name: Build Python wheel
         working-directory: ${{ matrix.path }}

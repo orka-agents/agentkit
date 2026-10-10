@@ -224,3 +224,107 @@ output, and CPU threads, disables reasoning, and uses greedy sampling while
 preserving native tool templates. Both live entrypoints cap CPU use at four CPUs or the daemon's available count,
 whichever is smaller, and warm the model before running timed agent turns. `AIKIT_IMAGE` can override the image for local testing;
 it must serve the same `qwen-3.5-2b` model. CI uses the checked-in digest.
+
+## Live task-success evals
+
+`scripts/live-task-evals.sh` measures task success for `pydantic-ai`,
+`microsoft-agent-framework` and `langgraph`. It reuses a digest-pinned AIKit
+Qwen3.5-2B CPU model server across tasks. Inference is real, not scripted.
+Stock, prices, contacts, reservations and warehouse notes come from controlled
+MCP fixture tools, not external business services. Each case/trial gets fresh
+agent and fixture containers so tool state and conversation history do not leak
+between trials. Grading uses code, not an LLM judge. Fixture values vary
+deterministically by case and trial; each adapter gets the same corresponding
+inputs. Consistency means success across those variants, not a statistical
+claim about identical-input repeatability.
+
+Run in a Linux shell on the Docker daemon's host, with a daemon-backed Buildx
+builder and network access for image pulls and build dependencies. If local
+Docker is unavailable, sync the checkout to a Linux VM and run these commands
+there over SSH. No external model API credentials are required.
+
+```sh
+scripts/live-task-evals.sh                         # all three adapters
+scripts/live-task-evals.sh langgraph                # one adapter
+scripts/live-task-evals.sh maf                      # alias for microsoft-agent-framework
+EVAL_TRIALS=1 EVAL_CASES=stock,lookup-stock \
+  ARTIFACT_DIR=artifacts/focused-evals \
+  scripts/live-task-evals.sh pydantic-ai
+```
+
+The ten cases are:
+
+| Case ID | Task |
+|---|---|
+| `no-tool` | Answer arithmetic without calling tools. |
+| `stock` | Read stock for an exact SKU. |
+| `price` | Quote the requested quantity. |
+| `contact` | Find a contact's email. |
+| `lookup-stock` | Identify a product before checking stock. |
+| `lookup-reserve` | Identify a product, reserve stock and check the remainder. |
+| `history` | Use the selected SKU from an earlier turn. |
+| `recover-tool-error` | Retry after a controlled tool failure. |
+| `untrusted-note` | Read a note without following its injected instructions. |
+| `unknown-product` | Report missing data without inventing a product. |
+
+The default run covers **10 cases × 3 trials × 3 adapters = 90 trials**.
+
+| Setting | Default and purpose |
+|---|---|
+| `EVAL_TRIALS` | `3`, an integer from `1` through `10` per case and adapter. |
+| `EVAL_CASES` | All ten cases. Set comma-separated case IDs for a focused run. |
+| `ARTIFACT_DIR` | Persistent reports in `artifacts/live-task-evals/<unique run>/`. Override to select a directory. |
+| `EVAL_CASE_TIMEOUT_SECONDS` | `120`, the timeout for one case/trial. |
+| `EVAL_SUITE_TIMEOUT_SECONDS` | `3600`, the per-adapter suite budget, including trial startup but excluding image/model setup. |
+
+`TAG`, `PLATFORM` and `BUILDER` work as in the existing live runner. With
+`PLATFORM` unset, the runner selects the Docker daemon's Linux amd64 or arm64
+architecture.
+
+Per-adapter JSON reports include individual grades, counts, duration and
+reproducibility metadata for the source, model, images and eval configuration.
+Answer grades check expected facts. Tool-selection grades check required and
+extraneous calls; argument grades check identifiers and quantities. Safety grades
+check unauthorized actions and untrusted-note handling. Task success requires
+correct answers, completed tool work, final fixture state and safety. Extra benign
+reads or recovered argument mistakes remain diagnostic grades, so valid alternative
+plans do not automatically fail the task.
+
+Quality failures are informational and exit zero. The suite still completes
+independent cases and trials. An individual task that exceeds its time budget receives a failing grade.
+Known exhausted model/tool correction retries returned as HTTP 502 with safe code
+`AgentRetryLimitExceeded` are quality failures after completed real inference.
+They allow `complete=true` with `qualityPassed=false` and exit zero.
+`AgentRunFailed` and unknown HTTP, framework, protocol or transport errors remain
+infrastructure failures. These results use the neutral `infrastructure_failure`
+failure reason without changing the report schema.
+Build, startup, model transport, exhausted suite budgets and other
+infrastructure failures or incomplete runs exit nonzero. Partial reports are
+not complete results. Each measured trial requires at least one completed real
+inference response. Provider failures, zero completions or in-flight work force
+infrastructure failure regardless of the retry code. Pending model forwards are
+settled before final accounting; a stalled first inference cannot produce a
+complete, green baseline. Cleanup failures also return nonzero and appear in
+`run.json`. Check completion status and planned versus completed counts before
+comparing grades; a green job does not mean every task passed.
+
+`.github/workflows/live-task-evals.yml` runs only manually or nightly, not on
+pushes or pull requests. Its three-adapter matrix defaults to three trials per
+case, and a failed lane does not cancel the others. In the repository's Actions
+tab, select **Live task-success evals**, then **Run workflow** to choose a branch
+and trial count. Download `live-task-evals-<adapter>` from the run summary's
+Artifacts section. CI always attempts the upload, including partial reports
+from failed runs, and retains artifacts for seven days. Setup failures may leave
+no report to upload. Existing conformance gates remain separate and unchanged.
+
+Run the evaluator's stdlib unit tests without Docker or inference:
+
+```sh
+python3 -m unittest discover -s test/evals -p 'test_*.py'
+bash -n scripts/live-task-evals.sh
+shellcheck -x scripts/live-task-evals.sh
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+```
+
+The common Python CI lane runs these unit tests; the shell/actionlint checks run
+in the existing Go lane.

@@ -1,0 +1,107 @@
+name: Live task-success evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Trials per case, integer 1..10
+        type: number
+        required: true
+        default: 3
+  schedule:
+    - cron: "43 9 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-task-evals-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-task-evals:
+    name: Live task-success evals (${{ matrix.adapter }})
+    runs-on: ubuntu-latest
+    # Leave time for Docker setup, image builds, the 60-minute suite and uploads.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [pydantic-ai, microsoft-agent-framework, langgraph]
+    env:
+      TAG: ci-live-task-evals
+      PLATFORM: linux/amd64
+      BUILDER: ""
+      EVAL_TRIALS: ${{ github.event.inputs.trials || '3' }}
+      EVAL_CASE_TIMEOUT_SECONDS: "120"
+      EVAL_SUITE_TIMEOUT_SECONDS: "3600"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Free disk space for Docker-heavy live evals
+        run: |
+          set -euxo pipefail
+          echo "Disk usage before cleanup"
+          df -h
+          docker system df || true
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/swift
+
+          docker system prune -af || true
+          docker builder prune -af || true
+
+          echo "Disk usage after cleanup"
+          df -h
+          docker system df || true
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup Docker daemon with containerd image store
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Configure Docker Buildx daemon builder
+        run: |
+          docker buildx version
+          docker buildx inspect --bootstrap
+          echo "BUILDER=" >> "$GITHUB_ENV"
+
+      - name: Run live task-success evals
+        # Image pulls/builds and warmup precede the suite's own 60-minute budget.
+        timeout-minutes: 100
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentkit-live-task-evals
+        run: bash scripts/live-task-evals.sh "$ADAPTER"
+
+      - name: Upload live task-success reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-task-evals-${{ matrix.adapter }}
+          path: ${{ runner.temp }}/agentkit-live-task-evals
+          if-no-files-found: warn
+          retention-days: 7
