@@ -14,7 +14,9 @@ import (
 )
 
 const (
-	imageProtocols     = "openai,foundry,orka"
+	// All shipped adapters select these modes at runtime. AgentSessions still
+	// requires verified digests, a text-only profile and host-mediated execution.
+	imageProtocols     = "openai,foundry,orka,agentsessions"
 	orkaHarnessVersion = "orka.harness.v1"
 )
 

@@ -1,93 +1,104 @@
 # agentsessions Harness
 
-Select `--protocol agentsessions` or `AGENTKIT_PROTOCOL=agentsessions` on an
-adapter's existing `agentkit-serve` entrypoint. This is native protobuf gRPC
+Select `--protocol agentsessions` or `AGENTKIT_PROTOCOL=agentsessions` on the
+adapter's existing `agentkit-serve` entrypoint. All three runtimes — `pydantic-ai`,
+`microsoft-agent-framework` (build selector alias `maf`) and `langgraph` — support
+**host-mediated, text-only Chat model execution**. There is no fallback to the
+normal provider runtime. This is native protobuf gRPC: unary
 `agentsessions.v1.Harness.Describe` and bidirectional `Harness.Connect`, not an
-HTTP/ACP facade. **Pydantic AI supports host-mediated, text-only Chat model
-execution.** Other adapters fail closed with `FAILED/UNIMPLEMENTED` (12); there
-is no fallback to their normal provider runtime. Tools remain unsupported.
+HTTP facade or ACP.
 
-The wire sources are pinned to
+The wire sources and controller proof are pinned to
 [`aramase/agentsessions@b212d498ba52615b5087b2579bdd482809065642`](https://github.com/aramase/agentsessions/tree/b212d498ba52615b5087b2579bdd482809065642),
-Go module `v0.1.3-0.20261006182201-b212d498ba52`. That host journals and restores
-opaque `Start.Config` via `EVENT_EXECUTION_START`.
+Go module `v0.1.3-0.20261006182201-b212d498ba52`. Compatibility with other host
+revisions is not established by this proof.
+
+## Supported subset
+
+| Surface | Supported behavior / limit |
+|---|---|
+| Model execution | Baked model name and instructions; ordered `system`/`user`/`assistant` text at the model bridge. The host invokes the model or supplies a journaled result. |
+| Conversation | History INPUT/OUTPUT becomes ordered user/assistant turns, preserving empty text. Earlier Inputs and the final Input are appended exactly once; zero Inputs do not invent a user turn. |
+| Host metadata | Known journal metadata is validated but is not prompt content. Resume cursor and identity are not framework state. |
+| `Start.Config` | Opaque bytes forwarded unchanged in `RunRequest.config`, excluded from its repr, and ignored by the current text policy. The pinned host journals/restores them through `EVENT_EXECUTION_START`; Config is not an env, credential, option or prompt channel. |
+| Recovery | Describe advertises `STATELESS_REPLAY` and `fork_safe=true` for this restricted profile. Every Start creates fresh framework resources; there is no cross-turn framework cache. |
+| Capabilities | No tools advertised; `requires_gpu=false`, `streaming=false`, `reasoning_replay=false`. |
+| Unsupported content | Tool schemas/calls/results, approvals, multimodal/file/data/reasoning parts, developer roles, unknown history and model options fail closed. No private wire encodings are accepted. |
+
+The common exchange emits `EVENT_MODEL_CALL` with the baked model, ordered text
+messages, deterministic per-execution IDs (`model-1`, `model-2`, …), empty params
+and no input hash. **The host computes the fingerprint, journals model effects,
+and owns OUTPUT and usage.** All three adapter hooks return `None`, so they do
+not add duplicate OUTPUT or invent usage.
 
 ## Immutable startup binding
 
-Set both deployment-owned values (lowercase `sha256:<64 hex>`):
+Set both deployment-owned values as lowercase `sha256:<64 hex>`:
 
 - `AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST`: SHA-256 of the **exact
-  bytes** of `/agent/agent.yaml` (or `--config`). YAML-equivalent rewrites fail.
+  bytes** of `/agent/agent.yaml` (or `--config`). Compute it outside the runtime;
+  YAML-equivalent rewrites fail verification.
 - `AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST`: immutable adapter image digest
-  covering the adapter implementation and installed dependency closure. Do not
-  use a moving tag. Deployment must retain that implementation for replay.
+  covering the implementation and installed dependency closure, not a moving
+  tag. Retain that implementation and the exact baked configuration for replay.
 
 The descriptor ID is `agentkit:<configuration digest>:<implementation digest>`.
-Describe advertises the baked model name, stateless replay and fork safety for
-this restricted profile; no tools, GPU, streaming or reasoning replay.
-Deployment-supplied digests bind identity; they are **not authentication** or an
-attestation of an independently measured image.
+These values bind the ABI and implementation identity; they are **not
+authentication** or attestation of an independently measured image.
 
-Startup rejects baked direct tools, brokered tools and all context providers.
-A nonempty credential in the baked model's `apiKeyEnv` is rejected without
-printing its value. Credential-bearing model URL userinfo, queries and fragments
-are also rejected without echoing the URL. Absent provider credentials and required-env declarations
-are not resolved. Original model URLs and workload identity are never used.
-Do not inject provider secrets into the process, image, Config or argv.
+Startup rejects baked direct tools, `brokeredTools` and every context provider.
+A nonempty value in the baked model's `apiKeyEnv` is rejected without printing
+it. Model URL userinfo, queries and fragments are also rejected without echoing
+the URL. Required-env declarations and absent provider credentials are not
+resolved; the original provider URL and workload-identity auth are never used.
+Keep provider keys out of the image, process, Config, logs and argv. The local
+bridge token is generated per execution and is not a provider credential.
 
-## Network and controls
+See the [keyless launch example](../README.md#agentsessions-keyless-text-profile).
+
+## Transport and authentication
 
 `AGENTKIT_BIND` defaults to `127.0.0.1`; `AGENTKIT_PORT` overrides the baked
-expose port (normally 8080). Nonloopback binding requires
-`AGENTKIT_AUTH_TOKEN`. When configured, **both** RPCs require exactly one gRPC
-metadata entry `authorization: Bearer <token>`, including on loopback. Start
-identity is not used as authentication. Clients must inject metadata explicitly;
-the upstream reference harnesswire client does not do this by itself.
+expose port (normally 8080). Nonloopback binding requires `AGENTKIT_AUTH_TOKEN`.
+When configured, **both RPCs** require exactly one gRPC metadata entry
+`authorization: Bearer <token>`, even on loopback. Start identity is not
+authentication. Clients must inject metadata explicitly; the upstream reference
+harnesswire client does not do so by itself.
 
-Transport is h2c (no built-in TLS). A nonloopback listener must be isolated on a
-private network, or behind a trusted TLS/auth proxy; possession of a bearer
-token does not make public plaintext transport safe. No HTTP readiness endpoint
-is added by this skeleton.
+Transport is h2c, with no built-in TLS or HTTP health endpoint. Isolate a
+nonloopback listener on a private network or behind a trusted TLS/auth proxy;
+a bearer token does not make public plaintext transport safe. The container is
+a trust boundary, not a network sandbox: deployment must prevent unexpected
+outbound traffic and exporters. The adapter settings below do not establish
+universal telemetry or network enforcement.
 
-Connect admits one execution at a time. Start must be first and carry a nonempty
-execution ID (at most 1024 UTF-8 bytes, leaving room for bounded terminal frames).
-Later frames must match **both** the execution ID and the session
-string exactly; empty session strings are allowed (the reference client omits
-session). Invalid first frames terminate the RPC with `INVALID_ARGUMENT`.
-Once admitted, completion/failure/cancellation ends with exactly one END while
-writable, using the original execution ID on every event. Other admissions get
-`FAILED/RESOURCE_EXHAUSTED` without disturbing the active execution.
+## Execution lifecycle and failures
 
-The reader stays live independently of the execution task. Cancel, EOF/half-close
-and transport disconnect cancel execution and release admission after cleanup.
-Keep the request stream open until END, as the host reference client does.
-Correlated ModelResult replies are validated by the independent reader. Missing
-or duplicate results, mismatched call IDs, non-assistant/nontext content, oversized
-results, negative usage or a different usage model fail with `INVALID_ARGUMENT`.
-Unsolicited ModelResult is also invalid. Tool/approval replies are refused with
-`UNIMPLEMENTED`; repeated Start and unknown frames fail with `INVALID_ARGUMENT`.
-Failures use fixed descriptions,
-never exception text, request content, Config or credentials. Protobuf send and
-receive messages are bounded at 4 MiB, including all framing fields.
+Connect admits one execution at a time. Start must be first, with a nonempty
+execution ID of at most 1024 UTF-8 bytes. Later frames must match **both** its
+execution ID and session string exactly; empty sessions are allowed (the
+reference client omits session). Invalid first frames abort the RPC with
+`INVALID_ARGUMENT`. A busy admission receives `FAILED/RESOURCE_EXHAUSTED`
+without disturbing the active execution.
 
-## Explicit per-execution exchange
+Keep the request stream open until END so the controller can service effects.
+The reader remains live independently of the runner. Completion, early failure
+and cancellation clean up owned resources and release admission **before** END,
+so a new turn may start at END without draining EOF. Cancel, repeated
+cancellation, EOF/half-close and disconnect settle owned cleanup; exactly one
+safe END is emitted where writable. No delivery/availability claim is made for
+an unwritable transport. A detected cleanup failure produces a safe
+`FAILED/INTERNAL` END where writable, never a successful terminal status.
 
-The common package exports:
-
-```python
-load_verified_agentsessions_binding(path: str | Path) -> VerifiedAgentsessionsBinding
-# binding.spec, configuration_digest, implementation_digest, descriptor_id
-
-ExecutionRunner = Callable[
-    [VerifiedAgentsessionsBinding, RunRequest, ExecutionExchange],
-    Awaitable[RunResult | None],
-]
-# exchange.input_count distinguishes zero Inputs from an empty text prompt.
-# await exchange.call(messages: Sequence[common_pb2.Message]) -> common_pb2.Message
-create_server(binding, *, runner=None, auth_token=None) -> grpc.aio.Server
-async def serve(binding, *, bind="127.0.0.1", port=8080, auth_token=None, runner=None): ...
-def run(binding, *, bind="127.0.0.1", port=8080, auth_token=None, runner=None): ...
-```
+On a main-thread POSIX event loop with signal support, the CLI owns SIGINT and
+SIGTERM while serving. The first signal closes admission and stops the gRPC
+transport, then waits for execution-owned teardown before the event loop exits.
+SIGTERM returns normally; SIGINT raises `KeyboardInterrupt` after cleanup.
+Further SIGINT/SIGTERM signals do not interrupt that drain, and prior handlers
+are restored afterward. Embedded async `serve()` does not install signal
+handlers; off-thread or unsupported-loop callers retain their prior signal
+behavior. Cleanup has no forced deadline: deployment grace periods and
+uncatchable SIGKILL can still terminate the process before teardown finishes.
 
 The returned server preserves the gRPC server API. `stop()` waits for execution
 cleanup even when its caller is canceled. `wait_for_termination()` includes that
@@ -95,115 +106,111 @@ cleanup and retains its timeout result without canceling the shutdown. Stopping
 before the first start is a no-op, as in native gRPC. Public TCP port binding
 also enforces the nonloopback authentication gate; Unix sockets are local-only.
 
-CLI recognizes only the optional adapter `async run_agentsessions(binding,
-request, exchange) -> RunResult | None` hook. This extends the internal PR1
-hook; no adapter shipped its earlier two-argument form. There is **no fallback
-to `build_runtime`**, callback-in-metadata or environment-selected model bridge.
-The hook is awaited once per Start and owns fresh cancellable resources.
+ModelResult must correlate to the single pending call. Unsolicited/duplicate or
+mismatched replies, missing message payloads, non-assistant/nontext content,
+oversized results, negative usage or a different usage model fail with
+`INVALID_ARGUMENT`. Unsupported Start content and tool/approval replies fail
+with `UNIMPLEMENTED`; repeated Start, unknown control frames and mismatched
+identities fail with `INVALID_ARGUMENT`. Internal framework or reader failures
+use safe `INTERNAL` descriptions, never raw exceptions, request content, Config
+or credentials.
 
-`RunRequest.config: bytes = b""` receives Start.Config unchanged and is excluded
-from the dataclass repr. The pinned host journals/replays these bytes. **Config
-is opaque and ignored by the current text policy**: it is never parsed into
-credentials, environment variables, model options or prompts. Do not treat
-nonempty Config as a request to change model behavior.
+Execution is serialized: one pending model effect and a one-event queue.
+Protobuf send/receive messages are bounded at 4 MiB including framing fields;
+bridge HTTP bodies, ModelResult and encoded bridge responses each have a 1 MiB
+limit. Concurrent HTTP requests are refused and listener concurrency is bounded.
 
-History INPUT/OUTPUT messages become ordered user/assistant text turns, including
-empty text. Earlier Inputs are appended once and the final Input becomes
-`prompt`, also including empty text. The exchange retains the original input
-count so an inputless invocation does not fabricate a user message. Nontext,
-tool roles/events, unknown history, model options and mismatched message bodies
-fail closed before execution. Known host metadata is not prompt content; cursor
-and identity do not become hidden framework state. No cross-turn cache exists.
+## Per-Start framework resources
 
-The exchange emits `EVENT_MODEL_CALL` with the baked model, ordered text
-messages, deterministic per-execution `model-1`, `model-2`, ... IDs, empty params
-and no input_hash. **The host computes the hash, records the effect, invokes the
-model (or serves the journaled result on replay), and journals OUTPUT.** There is
-one pending effect and a one-event queue; overlapping calls are refused. The
-pydantic hook returns `None`, avoiding an additional OUTPUT or fabricated USAGE.
-A neutral test hook can still return RunResult to emit an independent finalized
-assistant OUTPUT. Exceptions produce sanitized FAILED/INTERNAL END.
+Each hook owns a fresh ephemeral `127.0.0.1` HTTP bridge with a fresh bearer token,
+SDK client and framework agent/graph. Clients and listener requests close before
+admission is released. The shared core remains framework-neutral; adapters opt
+in through `async run_agentsessions(binding, request, exchange) -> RunResult |
+None`. Missing hooks fail closed rather than calling `build_runtime`; there is
+no callback-in-metadata or environment-selected model bridge.
 
-## Pydantic AI loopback text policy
+| Runtime | Restricted execution path |
+|---|---|
+| Pydantic AI | Fresh `OpenAIProvider`/`OpenAIChatModel`/`Agent`; documented graph iteration stops after the SDK model request, before tool or output-validation retries, preserving empty host completions. |
+| Microsoft Agent Framework | Fresh public `RawOpenAIChatCompletionClient` and `RawAgent`, with buffered `Agent.run`. These omit MAF's two default-enabled telemetry layers without changing global providers. No cached session, context provider, tool or MCP state participates. |
+| LangGraph | Fresh Chat Completions model and compiled graph invoked with `ainvoke`; no checkpointer, store, global cache, LangSmith tracing or Responses route. Canonical text roles are preserved even for o-series models; `temperature=None` avoids injecting sampling options. |
 
-Each Start creates an ephemeral `127.0.0.1` HTTP listener with a fresh local
-bearer token (not a provider key). A fresh SDK AsyncOpenAI client is explicitly
-injected into OpenAIProvider, then a fresh OpenAIChatModel and Agent are created.
-The original provider URL, apiKeyEnv and workload identity are not resolved.
-HTTP client proxy/environment discovery and redirects are disabled; SDK retries
-are zero, and no direct-provider fallback exists. Explicit local Authorization
-also prevents ambient `OPENAI_CUSTOM_HEADERS` from replacing the per-run token.
-Client, Agent, listener and pending request resources close before admission is
-released.
+All use an explicitly injected AsyncOpenAI client bound to the local bridge:
+proxy/environment discovery and redirects disabled, retries zero, explicit
+local Authorization, connect timeout 5 seconds and no wall-clock read timeout.
+The controller owns model completion, reply deadlines and cancellation; ambient
+provider credentials and the normal provider builders are not used.
 
-The bridge accepts only `/v1/chat/completions` requests with the exact baked model,
-ordered `system`/`user`/`assistant` text messages and an optional boolean `stream`.
-Tool schemas/calls/roles, developer roles, file/data/reasoning content and all
-other options (including stream_options/usage requests) are rejected before a
-model effect. Requests and encoded responses are bounded to 1 MiB; ModelResult
-is also bounded to 1 MiB, within the gRPC 4 MiB transport limit. Concurrent HTTP
-bodies are refused and transport concurrency is bounded.
+The bridge accepts only `/v1/chat/completions` with the exact baked `model`,
+ordered text `messages` and optional boolean `stream`. All other options,
+including tool schemas and `stream_options`, are rejected before a model effect.
+`stream=true` is **buffered synthetic terminal SSE only**: after the complete
+validated ModelResult, one final chunk with `finish_reason="stop"`, then
+`[DONE]`. It is not true streaming and does not change advertised capabilities.
 
-`stream=true` supports **buffered synthetic terminal SSE only**, after the entire
-validated ModelResult arrives: one final chunk with `finish_reason="stop"`, then
-`[DONE]`. This is not real streaming and no usage is invented or advertised.
-Describe continues to advertise streaming=false and reasoning_replay=false.
-The pydantic hook uses documented Agent graph iteration to finish after the SDK
-model request, before framework tool/output-validation retries. This preserves
-valid empty host completions as well as empty conversation turns.
+## Checks and recovery proof
 
-## Regeneration and checks
+### Built-image controller replay
 
-`runtimes/common/agentkit_serve_common/agentsessions/` contains the exact proto
-inputs, upstream Apache-2.0 license, source hash/provenance manifest and generated
-Python stubs. Runtime compatibility bounds are separate from exact compiler pins
+Run on the **Linux Docker daemon host**, with Docker/Buildx, Go matching
+`test/agentsessions/go.mod` and `setsid`. The test connects to a private container
+IP on an internal-only network; Docker Desktop/remote-daemon clients cannot use
+this path without running on the daemon host. Builds need registry/dependency
+access; runtime model effects need no external provider or credentials.
+
+```sh
+scripts/agentsessions-e2e.sh --build pydantic-ai
+scripts/agentsessions-e2e.sh --build maf
+scripts/agentsessions-e2e.sh --build langgraph
+```
+
+Syntax: `scripts/agentsessions-e2e.sh [--build|--skip-build]
+[pydantic-ai|maf|microsoft-agent-framework|langgraph]`. The runtime defaults to
+`pydantic-ai`, or `AGENTKIT_AGENTSESSIONS_RUNTIME` when no selector is supplied.
+There is no `--help` mode; invalid modes or extra arguments print usage and
+exit 2. Unsupported runtime selectors also exit 2.
+
+`--build` builds the real BuildKit frontend, selected adapter and AgentKit-derived
+fixture image under `test/agentsessions/`. `--skip-build` uses an already-built
+image (`AGENTKIT_AGENTSESSIONS_IMAGE` can select it); rebuild after implementation
+changes before treating the proof as fresh. Plain nested `go test` **skips**
+`TestContainerStatelessReplay` without that image variable. CI covers all three
+runtimes plus runtime-selection and SIGINT/SIGTERM cleanup tests. The runner
+owns a unique Docker label and process group for quiescent cleanup.
+
+All three fixtures use the same logical text agent, a `.invalid` provider URL
+and absent `OPENAI_API_KEY`, exercising the actual framework/SDK image, not a
+fake SDK or Pydantic TestModel. An offline host model serves two live turns,
+producing **2 live model calls, 2 journaled model calls and 2 outputs**. The proof
+closes/reopens SQLite, replaces the container at its immutable image ID, then
+calls **`Controller.Replay`** to re-execute both turns. It requires:
+
+- **0 replay model calls**, equal outputs and an unchanged, verified journal;
+- exact opaque Config/cursor restoration rather than current constructor values;
+- refusal of an intentional model-input fingerprint mismatch without a model call;
+- absent provider credentials and an internal-only, no-egress fixture network.
+
+`AGENTSESSIONS_REPLAY_PROOF` reports the actual runtime, immutable image digest,
+host pin and assertions. `Sessions.Replay` read-only redelivery and Go/Python
+wire interoperability are **not reconstruction proofs**. This establishes only
+the container/controller text profile, not Session service, placement, Canvas,
+kind deployment or live-provider integration.
+
+### Wire regeneration and common checks
+
+`runtimes/common/agentkit_serve_common/agentsessions/` contains exact proto inputs,
+the upstream Apache-2.0 license, provenance/source hashes and generated Python
+stubs. Runtime compatibility bounds are separate from the exact compiler pins
 in `scripts/agentsessions-generator-requirements.txt`.
 
 ```sh
-scripts/generate-agentsessions-stubs.sh --fetch  # fetch exact pinned inputs, verify hashes, generate
-scripts/generate-agentsessions-stubs.sh          # regenerate from vendored, verified inputs
-scripts/generate-agentsessions-stubs.sh --check  # regenerate in temp space; fail on drift, no writes
+scripts/generate-agentsessions-stubs.sh --fetch  # fetch pinned inputs, verify, generate
+scripts/generate-agentsessions-stubs.sh          # regenerate verified vendored inputs
+scripts/generate-agentsessions-stubs.sh --check  # temporary regeneration; no writes
 uv run --directory runtimes/common --extra dev pytest -q
 ```
 
-The script uses `uv`; `UV=/absolute/path/to/uv` overrides its executable. CI
-checks regeneration and common tests run a native Go client against the Python
-gRPC server using an isolated module under `test/agentsessions/` (no root Go
-dependency expansion). That client check proves wire compatibility, **not host
-replay**.
-
-### Built-image controller replay proof
-
-Run on the **Linux Docker daemon host** (the test connects directly to a private
-container IP on an internal-only network):
-
-```sh
-scripts/agentsessions-e2e.sh --build
-```
-
-The script builds the BuildKit frontend, Pydantic AI adapter and AgentKit-derived
-image from `test/agentsessions/Agentkitfile.yaml`, then sets
-`AGENTKIT_AGENTSESSIONS_IMAGE` and runs `TestContainerStatelessReplay` in the
-nested Go module. A plain nested `go test` **skips** this container proof when
-that image variable is absent. `--skip-build` uses an already-built image; rebuild
-after implementation changes before treating its result as fresh evidence.
-
-The fixture uses the exact pinned agentsessions controller, native harnesswire
-client and SQLite journal against the real Python/SDK container. An offline host
-model serves two live turns; there is no Pydantic TestModel override or provider
-credential. It verifies ordered model context and exact opaque Config/cursor
-bytes in wire Starts and execution-start journal records. It then closes and
-reopens SQLite, replaces the container and calls **`Controller.Replay`**, actually
-re-executing both turns against recorded model effects. A provider that fails if
-invoked must remain unused. Replay must restore journaled Config/cursors rather
-than current constructor values, preserve outputs and the journal, and reject a
-changed model-input fingerprint without invoking the provider.
-
-The recorded full-image run observed **2 live model calls, 2 journaled model
-calls, and 0 replay model calls**, with equal outputs, an unchanged verified
-journal, restored Config/cursors and successful container/database restart.
-The fixture checks absence of provider credentials and uses an internal-only,
-no-egress Docker network. `AGENTSESSIONS_REPLAY_PROOF` reports the immutable image
-digest, host pin and these assertions. `Sessions.Replay` journal redelivery alone
-is not re-execution proof. This is a container/controller text-profile proof,
-**not service or placement integration**.
+The generator uses `uv`; `UV=/absolute/path/to/uv` overrides its executable.
+Common tests run a native Go client against Python gRPC using the isolated
+`test/agentsessions/` module, without expanding root Go dependencies. See the
+[development guide](development.md) for general package checks.

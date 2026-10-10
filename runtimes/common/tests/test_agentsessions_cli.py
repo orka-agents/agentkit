@@ -8,6 +8,23 @@ from agentkit_serve_common import cli
 from test_agentsessions_protocol import binding_file  # noqa: F401
 
 
+def test_cli_help_explains_agentsessions_constraints_and_guide(capsys):
+    assert cli._parse_args(["--protocol", "agentsessions"]).protocol == "agentsessions"
+    with pytest.raises(SystemExit) as error:
+        cli._parse_args(["--help"])
+    assert error.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    help_text = " ".join(captured.out.lower().split())
+    assert "agentsessions" in help_text
+    assert "grpc" in help_text
+    assert "text-only" in help_text
+    assert "configuration" in help_text and "implementation" in help_text
+    assert "digest" in help_text
+    assert "no tools" in help_text
+    assert "docs/agentsessions.md" in help_text
+
+
 class ProviderTrap:
     def build_runtime(self, spec):
         pytest.fail("normal provider runtime must never be built")

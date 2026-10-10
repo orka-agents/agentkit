@@ -57,6 +57,54 @@ def test_verified_binding_reads_exact_bytes_and_never_resolves_provider(binding_
         p.load_verified_agentsessions_binding(path)
 
 
+def test_verified_binding_returned_spec_cannot_change_identity_or_next_spec(binding_file):
+    binding = protocol().load_verified_agentsessions_binding(binding_file[0])
+    digest = binding.configuration_digest
+    descriptor_id = binding.descriptor_id
+    returned = binding.spec
+    returned.instructions = "changed instructions"
+    returned.model.name = "changed-model"
+    returned.expose.port = 9090
+    returned.env.clear()
+    returned.tools.append("changed tool")
+
+    assert binding.configuration_digest == digest
+    assert binding.descriptor_id == descriptor_id
+    assert binding.spec.instructions == "Be helpful."
+    assert binding.spec.model.name == "host-model"
+    assert binding.spec.expose.port == 8080
+    assert len(binding.spec.env) == 1
+    assert binding.spec.tools == []
+
+
+def test_verified_binding_owns_constructor_bytes(binding_file):
+    from agentkit_serve_common.agentsessions.binding import VerifiedAgentsessionsBinding
+
+    raw = bytearray(binding_file[0].read_bytes())
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    binding = VerifiedAgentsessionsBinding(raw, "sha256:" + "a" * 64)
+    raw[:] = b"changed caller buffer"
+    assert binding.configuration_digest == digest
+    assert binding.spec.model.name == "host-model"
+    assert binding.spec.instructions == "Be helpful."
+
+
+def test_verified_binding_retains_exact_bytes_not_reserialized_yaml(binding_file, monkeypatch):
+    path, _ = binding_file
+    p = protocol()
+    first = p.load_verified_agentsessions_binding(path)
+    raw = path.read_bytes() + b"\n# same configuration, distinct exact-byte identity\n"
+    path.write_bytes(raw)
+    monkeypatch.setenv("AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST", "sha256:" + hashlib.sha256(raw).hexdigest())
+    second = p.load_verified_agentsessions_binding(path)
+    assert first.spec == second.spec
+    assert first.configuration_digest != second.configuration_digest
+    assert second.configuration_digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    path.write_bytes(b"changed after verification")
+    assert second.configuration_digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert second.spec.model.name == "host-model"
+
+
 @pytest.mark.parametrize("digest", [None, "", "sha256:" + "0" * 64, "sha256:" + "A" * 64, "not-a-digest"])
 def test_digest_missing_invalid_or_mismatch_fails(binding_file, monkeypatch, digest):
     path, _ = binding_file
@@ -152,6 +200,29 @@ def test_describe_and_skeleton_unimplemented(binding_file):
             call = stub.Connect()
             await call.write(start(h, c))
             terminal(await collect(call), c, "FAILED", 12)
+    asyncio.run(check())
+
+
+def test_describe_and_next_execution_ignore_returned_spec_mutation(binding_file):
+    async def check():
+        from agentkit_serve_common.runtime import RunResult
+
+        async def runner(binding, request, exchange):
+            assert binding.spec.model.name == "host-model"
+            assert binding.spec.instructions == "Be helpful."
+            return RunResult(text="original configuration")
+
+        async with live(binding_file, runner) as (_, c, h, stub, binding):
+            before = await stub.Describe(h.DescribeRequest())
+            returned = binding.spec
+            returned.model.name = "changed-model"
+            returned.instructions = "changed instructions"
+            after = await stub.Describe(h.DescribeRequest())
+            assert after == before
+            assert list(after.models) == ["host-model"]
+            call = stub.Connect()
+            await call.write(start(h, c))
+            terminal(await collect(call), c, "COMPLETED")
     asyncio.run(check())
 
 

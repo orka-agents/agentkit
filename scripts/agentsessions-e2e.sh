@@ -4,10 +4,19 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="${1:---build}"
-if [[ $# -gt 1 || ( "$mode" != --build && "$mode" != --skip-build ) ]]; then
-    printf '%s\n' 'usage: agentsessions-e2e.sh [--build|--skip-build]' >&2
+if [[ $# -gt 2 || ( "$mode" != --build && "$mode" != --skip-build ) ]]; then
+    printf '%s\n' 'usage: agentsessions-e2e.sh [--build|--skip-build] [pydantic-ai|maf|microsoft-agent-framework|langgraph]' >&2
     exit 2
 fi
+runtime="${2:-${AGENTKIT_AGENTSESSIONS_RUNTIME:-pydantic-ai}}"
+case "$runtime" in
+    pydantic-ai) target=build-serve; fixture=Agentkitfile.yaml; image_name=agentkit-agentsessions-text ;;
+    maf|microsoft-agent-framework)
+        runtime=microsoft-agent-framework
+        target=build-serve-maf; fixture=Agentkitfile-maf.yaml; image_name=agentkit-agentsessions-maf-text ;;
+    langgraph) target=build-serve-langgraph; fixture=Agentkitfile-langgraph.yaml; image_name=agentkit-agentsessions-langgraph-text ;;
+    *) printf '%s\n' 'unsupported agentsessions proof runtime' >&2; exit 2 ;;
+esac
 for tool in docker go setsid; do
     command -v "$tool" >/dev/null || { printf '%s is required\n' "$tool" >&2; exit 2; }
 done
@@ -60,21 +69,22 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 tag="${TAG:-agentsessions-e2e}"
-image="${AGENTKIT_AGENTSESSIONS_IMAGE:-agentkit-agentsessions-text:$tag}"
+image="${AGENTKIT_AGENTSESSIONS_IMAGE:-$image_name:$tag}"
 if [[ "$mode" == --build ]]; then
     builder="${BUILDER:-default}"
     export BUILDX_BUILDER="$builder"
     # The gateway frontend must see local frontend/adapter images, not a remote builder.
     make build-agentkit TAG="$tag"
-    make build-serve TAG="$tag"
-    make build-test-agent TAG="$tag" BUILDER="$builder" \
-        FIXTURE=test/agentsessions/Agentkitfile.yaml AGENT_IMAGE="$image"
+    make "$target" TAG="$tag"
+    make build-test-agent TAG="$tag" BUILDER="$builder" RUNTIME="$runtime" \
+        FIXTURE="test/agentsessions/$fixture" AGENT_IMAGE="$image"
 fi
 docker image inspect "$image" --format '{{.Id}}'
 cd test/agentsessions
 # The Go test owns normal cleanup; shell traps also reclaim this run's labelled
 # resources on interruption. An isolated process group includes the test binary.
 TMPDIR="$scratch" AGENTKIT_AGENTSESSIONS_RUN_ID="$run_id" AGENTKIT_AGENTSESSIONS_IMAGE="$image" \
+    AGENTKIT_AGENTSESSIONS_RUNTIME="$runtime" \
     setsid --wait go test -v -count=1 -run '^TestContainerStatelessReplay$' ./... &
 runner=$!
 wait "$runner"

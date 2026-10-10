@@ -92,6 +92,7 @@ Protocol endpoints:
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
 | `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
 | `acp` | stdin/stdout | ACP protocol v1 child mode for Orka `orka.harness.v2`. It opens no network listener and accepts only the supervisor's loopback provider proxy and prompt-scoped HTTP MCP server. |
+| `agentsessions` | Native gRPC `agentsessions.v1.Harness.Describe` / `Harness.Connect` (h2c) | All three runtimes: keyless, host-mediated text-only execution; required configuration/implementation digests, no tools/context providers, no HTTP health endpoint. [Subset and replay limits](docs/agentsessions.md). |
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -138,6 +139,55 @@ CI also runs an offline Orka container smoke that starts a built AgentKit image 
 acceptance, and SSE terminal-frame shape without calling a live model provider.
 For local Orka/kind conformance demos that need a successful no-provider turn,
 set `AGENTKIT_ORKA_OFFLINE_ECHO=1`; this fixture mode is not for production.
+
+### agentsessions keyless text profile
+
+For an already-built tool/context-free agent, set `AGENT_IMAGE` to an immutable
+agent image reference, `IMPLEMENTATION_DIGEST` to the immutable adapter image
+digest (`sha256:<64 lowercase hex>`) including installed dependencies, and
+`PRIVATE_NETWORK` to a private Docker bridge network pre-created with
+`--internal` by the deployment owner. Run this example and the gRPC client on the
+**Linux Docker daemon host**; it uses the container's private IP, not a published
+host port. This is not a Docker Desktop or remote-daemon client recipe. Reserve
+`agentkit-agentsessions` as the container name for this example only.
+
+Extract a local `agent.yaml` containing **the exact bytes baked at
+`/agent/agent.yaml`**, then compute its digest outside the runtime, not from the
+source Agentkitfile. Retain these artifacts for replay.
+
+```sh
+CONFIG_DIGEST="sha256:$(sha256sum agent.yaml | cut -d ' ' -f1)"
+docker run -d --rm --name agentkit-agentsessions \
+  --network "${PRIVATE_NETWORK:?set a pre-created private internal bridge network}" \
+  -e AGENTKIT_PROTOCOL=agentsessions \
+  -e AGENTKIT_BIND=0.0.0.0 \
+  -e AGENTKIT_PORT=8080 \
+  -e AGENTKIT_AUTH_TOKEN="${AGENTKIT_AUTH_TOKEN:?set a harness bearer token}" \
+  -e AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST="$CONFIG_DIGEST" \
+  -e AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST="${IMPLEMENTATION_DIGEST:?set an immutable adapter digest}" \
+  "${AGENT_IMAGE:?set an immutable agent image reference}"
+
+HARNESS_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' agentkit-agentsessions)"
+HARNESS_ADDRESS="${HARNESS_IP}:8080"
+```
+
+Do **not** pass a provider key. The host services model effects; original provider
+URLs/auth and required-env declarations are not used. From the daemon host, dial
+`HARNESS_ADDRESS` with an h2c gRPC client for both `Harness.Describe` and
+`Harness.Connect`, supplying exactly one `authorization: Bearer <token>` metadata
+entry to each RPC, using the configured `AGENTKIT_AUTH_TOKEN`. h2c has no built-in
+TLS: keep it private or use a trusted TLS/auth proxy, and enforce egress isolation
+in deployment. Digests bind identity, not authentication or attestation.
+
+When finished, stop the detached example container (`--rm` removes it); the
+pre-created network remains owned by the deployment owner:
+
+```sh
+docker stop agentkit-agentsessions
+```
+
+See [the guide](docs/agentsessions.md) for supported text, opaque Config,
+cancellation, stateless replay and the three-runtime built-image proof.
 
 ## Use any OpenAI-compatible model endpoint
 
@@ -292,15 +342,19 @@ runtime: langgraph
 ```
 
 All runtimes read the same built agent config and serve the same non-streaming
-OpenAI-compatible API. Runtime capabilities are explicit and validated before
-build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
+OpenAI-compatible API in the default mode. All three also support the restricted
+[agentsessions text profile](docs/agentsessions.md), which rejects tools and
+context providers regardless of the normal runtime's capabilities. Runtime
+capabilities are explicit and validated before build; see
+[`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
 [`docs/runtime-adapters.md`](docs/runtime-adapters.md).
 
 ## Configure the server
 
-By default, generated images bind to `127.0.0.1` inside the container. If you bind
-to a non-loopback address such as `0.0.0.0`, set `AGENTKIT_AUTH_TOKEN`; `/v1/*`
-requests must then include `Authorization: Bearer <token>`.
+In the default OpenAI HTTP mode, generated images bind to `127.0.0.1` inside the
+container. If you bind to a non-loopback address such as `0.0.0.0`, set
+`AGENTKIT_AUTH_TOKEN`; `/v1/*` requests must then include
+`Authorization: Bearer <token>`.
 
 ```sh
 docker run --rm \
@@ -405,6 +459,8 @@ workflow.
 - [`docs/development.md`](docs/development.md) — local development and CI.
 - [`docs/release.md`](docs/release.md) — publishing images and package setup.
 - [`docs/orka.md`](docs/orka.md) — Orka harness mode and AgentRuntime rendering.
+- [`docs/agentsessions.md`](docs/agentsessions.md) — native gRPC text profile,
+  immutable startup binding, auth, lifecycle and controller replay proof.
 - [`docs/architecture.md`](docs/architecture.md) — codebase architecture map for
   contributors.
 - [`deploy/foundry/README.md`](deploy/foundry/README.md) — Foundry deployment and

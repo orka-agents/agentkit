@@ -12,6 +12,7 @@ import socket
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse, Response
@@ -27,6 +28,10 @@ MAX_HTTP_BYTES = 1024 * 1024
 class LoopbackBinding:
     base_url: str
     token: str = field(repr=False)
+
+    async def authorize_request(self, request: httpx.Request) -> None:
+        """Replace every SDK/environment auth spelling at the final HTTP boundary."""
+        request.headers["Authorization"] = "Bearer " + self.token
 
 
 def _object(pairs):

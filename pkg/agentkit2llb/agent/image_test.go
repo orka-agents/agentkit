@@ -80,6 +80,20 @@ func TestNewImageConfigUsesEffectiveAgentContract(t *testing.T) {
 	}
 }
 
+func TestNewImageConfigAdvertisesRuntimeSelectableProtocols(t *testing.T) {
+	for _, runtime := range runtimes.Runtimes {
+		t.Run(runtime.Name, func(t *testing.T) {
+			agent := imageAgent(runtime.Name, 0)
+			agent.Metadata.Labels[config.ImageLabelPortableProtocols] = "user-controlled"
+			img := NewImageConfig(agent, &specs.Platform{Architecture: utils.PlatformAMD64})
+			const want = "openai,foundry,orka,agentsessions"
+			if got := img.Config.Labels[config.ImageLabelPortableProtocols]; got != want {
+				t.Fatalf("discoverable protocols = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestNewImageConfigPreservesTargetPlatformIdentity(t *testing.T) {
 	platform := &specs.Platform{
 		Architecture: "arm",

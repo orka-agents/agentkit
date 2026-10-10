@@ -503,14 +503,20 @@ jobs:
       - name: Prove keyless agentsessions journal and replay
         run: |
           set -euo pipefail
-          make build-test-agent TAG=ci BUILDER= \
-            FIXTURE=test/agentsessions/Agentkitfile.yaml \
-            AGENT_IMAGE=agentkit-agentsessions-text:ci
-          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
-            scripts/agentsessions-e2e.sh --skip-build
-          cd test/agentsessions
-          AGENTKIT_AGENTSESSIONS_IMAGE=agentkit-agentsessions-text:ci \
-            go test -v -count=1 -run '^TestRunnerSignalCleanup$' ./...
+          # Keep runtime rows separate from commands that may consume stdin.
+          while read -r -u 3 runtime fixture image; do
+            make build-test-agent TAG=ci BUILDER= RUNTIME="$runtime" \
+              FIXTURE="test/agentsessions/$fixture" AGENT_IMAGE="$image"
+            AGENTKIT_AGENTSESSIONS_IMAGE="$image" \
+              scripts/agentsessions-e2e.sh --skip-build "$runtime"
+            (cd test/agentsessions && \
+              AGENTKIT_AGENTSESSIONS_IMAGE="$image" AGENTKIT_AGENTSESSIONS_RUNTIME="$runtime" \
+              go test -v -count=1 -run '^TestRunner(SignalCleanup|RuntimeSelection)$' ./...)
+          done 3<<'RUNTIMES'
+          pydantic-ai Agentkitfile.yaml agentkit-agentsessions-text:ci
+          microsoft-agent-framework Agentkitfile-maf.yaml agentkit-agentsessions-maf-text:ci
+          langgraph Agentkitfile-langgraph.yaml agentkit-agentsessions-langgraph-text:ci
+          RUNTIMES
 
       - name: Container parity smoke
         env:

@@ -6,11 +6,11 @@ import hashlib
 import os
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from ..config import AgentSpec, ConfigError, load_with_bytes
+from ..config import AgentSpec, ConfigError, load_bytes, load_with_bytes
 
 AGENT_CONFIGURATION_DIGEST_ENV = "AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST"
 IMPLEMENTATION_DIGEST_ENV = "AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST"
@@ -20,11 +20,32 @@ class AgentsessionsConfigurationError(ValueError):
     """Safe startup failure, without configuration or credential values."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class VerifiedAgentsessionsBinding:
-    spec: AgentSpec
-    configuration_digest: str
+    _configuration_bytes: bytes = field(repr=False)
+    _spec: AgentSpec = field(repr=False, compare=False)
     implementation_digest: str
+
+    def __init__(self, configuration_bytes: bytes, implementation_digest: str):
+        # Identity and execution come from the same owned exact-byte snapshot,
+        # never from a caller-owned model or a reserialized YAML representation.
+        raw = bytes(configuration_bytes)
+        try:
+            spec = load_bytes(raw, source="verified agentsessions configuration")
+        except ConfigError:
+            raise AgentsessionsConfigurationError("cannot load agentsessions agent configuration") from None
+        object.__setattr__(self, "_configuration_bytes", raw)
+        object.__setattr__(self, "_spec", spec)
+        object.__setattr__(self, "implementation_digest", implementation_digest)
+
+    @property
+    def spec(self) -> AgentSpec:
+        """Return a detached mutable copy; the verified execution snapshot stays private."""
+        return self._spec.model_copy(deep=True)
+
+    @property
+    def configuration_digest(self) -> str:
+        return "sha256:" + hashlib.sha256(self._configuration_bytes).hexdigest()
 
     @property
     def descriptor_id(self) -> str:
@@ -71,4 +92,4 @@ def load_verified_agentsessions_binding(path: str | Path) -> VerifiedAgentsessio
             raise ValueError("credential-bearing URL")
     except ValueError:
         raise AgentsessionsConfigurationError("agentsessions rejects credential-bearing model URLs") from None
-    return VerifiedAgentsessionsBinding(spec, configuration_digest, implementation_digest)
+    return VerifiedAgentsessionsBinding(raw, implementation_digest)

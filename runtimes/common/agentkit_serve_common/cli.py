@@ -1,9 +1,9 @@
 """Shared CLI / network-posture core for AgentKit runtime adapters.
 
 Loads ``/agent/agent.yaml`` and selects one protocol skin. HTTP modes apply the
-network posture and run uvicorn; ACP uses stdio. Each adapter's console script
-calls :func:`run` with its own framework-specific ``agent_factory`` module, the
-only per-adapter input.
+network posture and run uvicorn; ACP uses stdio and agentsessions uses native
+gRPC. Each adapter's console script calls :func:`run` with its own
+framework-specific ``agent_factory`` module, the only per-adapter input.
 
 Protocol modes:
 
@@ -12,7 +12,9 @@ Protocol modes:
   ``/responses``.
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
 * ``acp``: Orka-owned ACP protocol v1 over newline-delimited JSON-RPC on stdio.
-* ``agentsessions``: keyless native protobuf Harness SPI over gRPC (h2c).
+* ``agentsessions``: keyless native protobuf Harness SPI over gRPC (h2c),
+  host-mediated text-only execution with no tools. Requires configuration and
+  implementation SHA-256 digests; see ``docs/agentsessions.md``.
 
 Network posture:
 
@@ -22,6 +24,9 @@ Network posture:
   event-stream, cancel, and output endpoints are bearer-authenticated.
 * In ``openai`` mode, ``/v1/*`` requires ``Authorization: Bearer <token>`` when a
   token is set; ``/healthz`` stays open.
+* In ``agentsessions`` mode, both RPCs require exactly one bearer authorization
+  metadata entry when a token is set. There is no HTTP health endpoint or TLS;
+  deployment must isolate nonloopback h2c or use a trusted TLS/auth proxy.
 """
 
 from __future__ import annotations
@@ -72,6 +77,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agentkit-serve",
         description="Serve an AgentKit agent over the selected protocol skin.",
+        epilog=(
+            "agentsessions: native gRPC (h2c), host-mediated text-only execution; "
+            "no tools. Requires configuration and implementation SHA-256 digests. "
+            "See docs/agentsessions.md for startup binding, auth, and replay limits."
+        ),
     )
     parser.add_argument(
         "--config",

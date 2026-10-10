@@ -39,7 +39,11 @@ agentkit-serve-common = { path = "../common", editable = true }
 agentkit-serve = "agentkit_serve.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    # In-memory exporters exercise protocol-local telemetry suppression.
+    "opentelemetry-sdk>=1.44,<2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentkit_serve"]

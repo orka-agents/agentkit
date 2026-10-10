@@ -12,11 +12,12 @@ must be identical across adapters:
 | Module | Responsibility |
 |---|---|
 | `config.py` | Strict `/agent/agent.yaml` reader and ABI version check. |
-| `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka\|acp`, bind/port handling, auth startup gates. |
+| `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka\|acp\|agentsessions`, bind/port handling, auth startup gates. |
 | `server.py` | FastAPI app and OpenAI-compatible response/error envelopes. |
 | `foundry.py` | Foundry `/readiness`, `/invocations`, and minimal `/responses` skin. |
 | `orka.py` | Observed-mode `orka.harness.v1` HTTP+SSE skin. |
 | `acp.py` | Strict ACP stdio child for an Orka `orka.harness.v2` supervisor. |
+| `agentsessions/` | Native protobuf gRPC Harness, immutable startup binding, validated text history, bounded model exchange and per-execution loopback bridge. |
 | `conversation.py` | Protocol request normalization into `RunRequest`. |
 | `runtime.py` | `RuntimeFactory`, `RuntimeSession`, `RunResult`, `AgentRunError`. |
 | `adapter_support.py` | API-key lookup, tool env projection, timeout parsing, error normalization. |
@@ -24,16 +25,31 @@ must be identical across adapters:
 | `conformance.py` | Shared HTTP behavior tests adapter packages import. |
 | `parity.py` | Shared wire-level suite that runs each adapter's real runtime against a scripted model and MCP tool. |
 
-The protocol app factories receive an adapter module that satisfies
-`RuntimeFactory`. The shared core calls only `factory.build_runtime(spec)` and
-`RuntimeSession.run(request)`, so it never imports pydantic-ai, Microsoft Agent
-Framework, LangChain, OpenAI SDK types, Azure, Foundry SDKs, or Orka controllers.
+HTTP app factories receive an adapter module satisfying `RuntimeFactory` and
+call `factory.build_runtime(spec)` and `RuntimeSession.run(request)`. ACP uses
+its supervisor-bound runtime contract. agentsessions instead uses the optional
+explicit `async run_agentsessions(binding, request, exchange) -> RunResult |
+None` adapter hook, awaited once per Start. Missing hooks fail closed with
+`UNIMPLEMENTED`; there is no normal provider-runtime fallback. The shared core
+never imports pydantic-ai, Microsoft Agent Framework, LangChain, OpenAI SDK types,
+Azure, Foundry SDKs, or Orka controllers.
 
 ## Protocol surfaces
 
 All adapters can serve the same selected protocol surface. `openai` is the
-default. `foundry` and `orka` are selected with `--protocol` or
-`AGENTKIT_PROTOCOL`.
+default. Select with `--protocol` or `AGENTKIT_PROTOCOL`.
+
+| Profile | Model/tool/env behavior |
+|---|---|
+| Normal HTTP (`openai`, `foundry`, `orka`) | Uses configured provider clients and runtime-supported baked MCP/context capabilities; startup/per-run env rules apply. |
+| ACP stdio | Supervisor-bound provider proxy and prompt-scoped MCP broker; rejects baked direct/brokered tools, with the MAF packaged-skill exception described below. |
+| agentsessions native gRPC | All three adapters support host-mediated text only. Requires exact configuration and immutable implementation digests; rejects baked tools, brokered tools and every context provider. Does not resolve required/provider env, use original provider URLs/auth or build the normal runtime. Fresh state per Start; Config stays opaque. |
+
+The normal HTTP rules below do **not** widen the
+[agentsessions supported subset](agentsessions.md). Its `Describe`/bidirectional
+`Connect` RPCs use h2c, advertise stateless replay/fork safety only for that
+subset, and add no HTTP health endpoint. Tools, approvals, multimodal/reasoning
+parts, developer roles and model options fail closed.
 
 OpenAI mode exposes:
 
@@ -59,7 +75,7 @@ providers remain prohibited. At session creation it
 accepts at most one loopback HTTP MCP server with bearer authentication, which
 is the prompt-scoped broker created by the Orka supervisor.
 
-Request behavior is intentionally narrow:
+OpenAI-compatible HTTP request behavior is intentionally narrow:
 
 - `stream: true` returns HTTP 400 with code `stream_unsupported`.
 - non-empty `tools` returns HTTP 400 with code `tools_unsupported`.
@@ -104,9 +120,10 @@ failures; and a traceback otherwise.
 
 ## Model endpoint compatibility
 
-Adapters use the baked `model.baseURL` and `model.name` to construct their
-OpenAI-compatible chat client. They do not special-case a provider: the endpoint
-can be OpenAI, another hosted provider, a local gateway, an in-cluster service,
+In normal HTTP modes, adapters use the baked `model.baseURL` and `model.name` to
+construct their OpenAI-compatible chat client. They do not special-case a
+provider: the endpoint can be OpenAI, another hosted provider, a local gateway,
+an in-cluster service,
 or a prebuilt or custom [AIKit](https://github.com/kaito-project/aikit) model
 image. AIKit is just an example of an OpenAI-compatible endpoint. For no-auth
 endpoints, omit `model.apiKeyEnv` unless you place an auth proxy in front of the
@@ -131,11 +148,18 @@ supervisor injects only `AGENTKIT_ACP_PROVIDER_BASE_URL`,
 `AGENTKIT_ACP_PROVIDER_TOKEN`, `AGENTKIT_ACP_MODEL`, and
 `AGENTKIT_ACP_AGENT_CONFIGURATION_DIGEST` into the child.
 
+agentsessions also requires `AGENTKIT_AUTH_TOKEN` for nonloopback binds. When
+configured, both RPCs require exactly one `authorization: Bearer <token>` gRPC
+metadata entry, including on loopback; the reference host client must be given
+this metadata explicitly. Deploy h2c privately or behind a trusted TLS/auth
+proxy, and enforce outbound isolation at the deployment boundary. Per-hook
+telemetry settings do not constitute a universal network sandbox.
+
 ## Tool lifecycle and env projection
 
-Tools are MCP servers declared in the ABI. Stdio tools use `name`, `command`,
-and an `env` allowlist; remote tools use `type: mcp`, `transport:
-streamable-http`, `urlEnv`, optional headers, and generic auth. Adapter
+In normal HTTP runtimes, tools are MCP servers declared in the ABI. Stdio tools
+use `name`, `command`, and an `env` allowlist; remote tools use `type: mcp`,
+`transport: streamable-http`, `urlEnv`, optional headers, and generic auth. Adapter
 factories are responsible for turning each tool spec into their framework's MCP
 integration.
 
@@ -174,6 +198,9 @@ Path: `runtimes/pydantic-ai/`
 - Supports both older `MCPServerStdio` and newer `MCPToolset` /
   `StdioTransport` APIs.
 - Maps pydantic-ai message history and usage objects into the neutral contract.
+- agentsessions creates a fresh local-bridge SDK client and Agent per Start,
+  stopping graph iteration after the model request and before tool/validation
+  retries. The host owns output/usage, including empty completions.
 
 ### Microsoft Agent Framework
 
@@ -187,9 +214,13 @@ Path: `runtimes/microsoft-agent-framework/`
   model auth, Azure AI Search context, and external memory.
 - Guardrail tests prevent unrelated cloud packages such as CopilotStudio/Purview
   from crossing the adapter boundary.
-- Supports session-aware runs, remote MCP, filesystem/MCP skills, search context,
-  and memory context through generic ABI fields. Sessions keep context-provider
-  state only; each run's conversation comes from the request.
+- Normal runtime supports session-aware runs, remote MCP, filesystem/MCP skills,
+  search context, and memory context through generic ABI fields. Sessions keep
+  context-provider state only; each run's conversation comes from the request.
+- agentsessions uses fresh public `RawAgent` and
+  `RawOpenAIChatCompletionClient` for buffered execution, omitting both default
+  MAF telemetry layers without mutating globals. No normal session cache,
+  context/tool/MCP state or provider builder participates.
 
 ### LangGraph
 
@@ -202,6 +233,10 @@ Path: `runtimes/langgraph/`
   persistent MCP sessions.
 - Aggregates token usage from every AI message in a tool-using graph run.
 - Guardrail tests keep Azure and Foundry packages out of the generic adapter.
+- agentsessions creates a fresh local-bridge chat model and compiled graph:
+  no checkpointer/store/cache, LangSmith tracing or Responses API. Explicit
+  `temperature=None` and canonical text messages avoid injected model options
+  and o-series developer-role rewrites.
 
 ## Adding an adapter
 
@@ -214,6 +249,11 @@ To add a single-agent runtime:
 4. add a `RuntimeSpec` in `pkg/agentkit/runtimes/catalog.go`,
 5. add the matching `runtimes/catalog/*.yaml` entry and tests/fixtures, and
 6. import the shared conformance tests in the adapter's test suite.
+
+For agentsessions, additionally implement the optional per-Start hook with fresh
+cancellable resources and the shared restricted model exchange. Do not reuse
+normal provider/tool builders or return duplicate host-owned output/usage; see
+[the profile and proof guide](agentsessions.md).
 
 No shared server changes should be necessary when the adapter can satisfy the
 neutral `RuntimeSession` contract.
