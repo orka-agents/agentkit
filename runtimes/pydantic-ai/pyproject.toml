@@ -16,7 +16,7 @@ dependencies = [
     # The framework-neutral core (ABI loader, /v1 facade, CLI). Brings fastapi,
     # uvicorn, pydantic, pyyaml transitively. Resolved from the sibling path in dev
     # (see [tool.uv.sources]) and COPYed + installed in the Docker image build.
-    "agentkit-serve-common",
+    "agentkit-serve-common[a2a]",
 ]
 
 [tool.uv.sources]
