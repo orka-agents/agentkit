@@ -139,7 +139,10 @@ def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_toke
                 _fail("A2A requires the agentkit-serve-common[a2a] extra")
             raise
         url = os.environ.get("AGENTKIT_A2A_URL") or f"http://localhost:{_resolve_port(protocol, spec.expose.port)}/"
-        return create_a2a_app(spec, factory, auth_token=auth_token, advertised_url=url)
+        try:
+            return create_a2a_app(spec, factory, auth_token=auth_token, advertised_url=url)
+        except ValueError as exc:
+            _fail(str(exc))
     raise AssertionError(f"unknown protocol: {protocol}")
 
 

@@ -264,6 +264,8 @@ class _Executor(AgentExecutor):
             result = await asyncio.shield(self.run_task)
             if len(result.text.encode("utf-8")) <= MAX_TEXT_BYTES:
                 state, text = TaskState.completed, result.text
+            else:
+                _LOG.warning("A2A output exceeded limit task_id=%s", task.id)
         except asyncio.CancelledError:
             state = TaskState.canceled
         except Exception as exc:  # noqa: BLE001 - runtime boundary; never expose exception payloads.

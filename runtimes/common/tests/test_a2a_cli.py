@@ -94,6 +94,17 @@ def test_nonloopback_a2a_requires_operator_advertised_url(monkeypatch, capsys):
     assert "AGENTKIT_A2A_URL" in capsys.readouterr().err
 
 
+def test_a2a_invalid_operator_url_has_normal_cli_error(monkeypatch, capsys):
+    pytest.importorskip("a2a")
+    monkeypatch.setenv("AGENTKIT_A2A_URL", "agent:8080")
+    with pytest.raises(SystemExit) as exc:
+        cli.run(SupportedFactory(), ["--protocol", "a2a", "--config", "agent.yaml"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "agentkit-serve:" in error and "absolute HTTP(S) URL" in error
+    assert "Traceback" not in error
+
+
 @pytest.mark.parametrize(
     "port,url", [("9191", None), ("9191", "https://agents.example/a2a/")]
 )

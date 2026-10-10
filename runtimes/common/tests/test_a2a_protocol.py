@@ -327,6 +327,21 @@ def test_task_context_history_and_output_limits(monkeypatch):
         assert rpc(client).json()["result"]["status"]["state"] == "failed"
 
 
+def test_oversized_output_has_payload_free_diagnostic(monkeypatch, caplog):
+    from agentkit_serve_common.a2a import core
+
+    monkeypatch.setattr(core, "MAX_TEXT_BYTES", 24)
+    factory = Factory()
+    factory.runtime.output = "private-model-output" * 3
+    caplog.set_level("WARNING")
+    with TestClient(app(factory)) as client:
+        task = rpc(client).json()["result"]
+    assert task["status"]["state"] == "failed"
+    assert "A2A output exceeded limit" in caplog.text
+    assert task["id"] in caplog.text
+    assert "private-model-output" not in caplog.text
+
+
 def test_push_get_unknown_and_terminal_cancel_have_specific_errors():
     with TestClient(app()) as client:
         task = rpc(client).json()["result"]
