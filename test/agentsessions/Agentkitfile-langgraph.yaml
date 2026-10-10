@@ -1,0 +1,16 @@
+#syntax=ghcr.io/orka-agents/agentkit/agentkit:latest
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: agentsessions-text-proof
+runtime: langgraph
+model:
+  provider: openai-compatible
+  baseURL: http://provider-must-not-be-used.invalid/v1
+  name: host-model
+  apiKeyEnv: OPENAI_API_KEY
+instructions: |
+  Return the host-provided text completion without tools.
+expose:
+  openai: true
+  port: 8080

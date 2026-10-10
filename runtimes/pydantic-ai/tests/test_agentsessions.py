@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import hashlib
 import os
 from contextlib import asynccontextmanager
@@ -20,14 +21,22 @@ def text(role, value):
 
 
 @pytest.fixture
-def binding(tmp_path, monkeypatch):
-    data = {"abiVersion": "v0", "metadata": {"name": "host-bound"}, "model": {"provider": "openai-compatible", "baseURL": "http://127.0.0.1:1/v1", "name": "host-model", "apiKeyEnv": "P2_PROVIDER_KEY", "auth": {"type": "workload-identity-token", "audience": "https://identity.invalid"}}, "instructions": "Only baked rules.", "env": [{"name": "P2_PROVIDER_KEY", "required": True}], "expose": {"openai": True, "port": 8080}}
-    path = tmp_path / "agent.yaml"
-    path.write_bytes(yaml.safe_dump(data).encode())
-    monkeypatch.setenv("AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST", "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
-    monkeypatch.setenv("AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST", "sha256:" + "c" * 64)
-    monkeypatch.delenv("P2_PROVIDER_KEY", raising=False)
-    return load_verified_agentsessions_binding(path)
+def bake(tmp_path, monkeypatch):
+    def build(*, model=None, **extra):
+        data = {"abiVersion": "v0", "metadata": {"name": "host-bound"}, "model": {"provider": "openai-compatible", "baseURL": "http://127.0.0.1:1/v1", "name": "host-model", "apiKeyEnv": "P2_PROVIDER_KEY", "auth": {"type": "workload-identity-token", "audience": "https://identity.invalid"}}, "instructions": "Only baked rules.", "env": [{"name": "P2_PROVIDER_KEY", "required": True}], "expose": {"openai": True, "port": 8080}, **extra}
+        data["model"].update(model or {})
+        path = tmp_path / "agent.yaml"
+        path.write_bytes(yaml.safe_dump(data).encode())
+        monkeypatch.setenv("AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST", "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
+        monkeypatch.setenv("AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST", "sha256:" + "c" * 64)
+        monkeypatch.delenv("P2_PROVIDER_KEY", raising=False)
+        return load_verified_agentsessions_binding(path)
+    return build
+
+
+@pytest.fixture
+def binding(bake):
+    return bake()
 
 
 def hook():
@@ -99,7 +108,7 @@ def test_actual_sdk_preserves_history_input_boundaries_and_config(binding, input
     "Authorization: Bearer unrelated-ambient-token",
     "authorization: Bearer unrelated-ambient-token\naUtHoRiZaTiOn: Bearer another-ambient-token",
 ])
-def test_fresh_sdk_clients_agents_local_tokens_cleanup_no_provider_or_proxy(binding, monkeypatch, ambient_headers):
+def test_fresh_sdk_clients_agents_local_tokens_cleanup_no_provider_or_proxy(bake, monkeypatch, ambient_headers):
     async def check():
         hits, clients, agents = [], [], []
         async def trap(reader, writer):
@@ -108,7 +117,7 @@ def test_fresh_sdk_clients_agents_local_tokens_cleanup_no_provider_or_proxy(bind
             await writer.wait_closed()
         server = await asyncio.start_server(trap, "127.0.0.1", 0)
         url = "http://127.0.0.1:" + str(server.sockets[0].getsockname()[1]) + "/v1"
-        binding.spec.model.base_url = url
+        binding = bake(model={"baseURL": url})
         monkeypatch.setenv("OPENAI_BASE_URL", url)
         monkeypatch.setenv("HTTP_PROXY", url)
         monkeypatch.setenv("ALL_PROXY", url)
@@ -267,3 +276,29 @@ def test_actual_sdk_blocked_effect_cleanup_and_next_execution(binding, control):
             assert ends[0].end.state == "COMPLETED"
         assert unhandled == []
     asyncio.run(check())
+
+
+def test_sdk_debug_diagnostics_do_not_export_execution_content(bake, caplog):
+    logger = logging.getLogger("openai._base_client")
+    caplog.set_level(logging.DEBUG, logger="openai")
+    filters = list(logger.filters)
+    binding = bake(instructions="private-sdk-instructions-marker")
+
+    async def check():
+        history = [c.Event(kind=c.EVENT_INPUT, message=text("user", "private-sdk-history-marker"))]
+        async with live(binding) as stub:
+            _, end = await turn(
+                stub, inputs=["private-sdk-input-marker"], history=history,
+                reply="private-sdk-output-marker",
+            )
+            assert end[0].end.state == "COMPLETED"
+
+    asyncio.run(check())
+    assert not any(marker in "\n".join(caplog.messages) for marker in [
+        "private-sdk-instructions-marker", "private-sdk-history-marker",
+        "private-sdk-input-marker", "private-sdk-output-marker",
+    ])
+    assert logger.filters == filters
+    assert logger.getEffectiveLevel() == logging.DEBUG
+    logger.debug("ordinary-sdk-debug-control")
+    assert "ordinary-sdk-debug-control" in caplog.messages

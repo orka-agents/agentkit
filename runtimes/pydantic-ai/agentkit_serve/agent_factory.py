@@ -23,6 +23,7 @@ error normalization live in ``agentkit_serve_common.adapter_support``.
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from types import TracebackType
 from typing import Any, AsyncIterable
 
@@ -263,6 +264,7 @@ async def run_agentsessions(
     from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
     from agentkit_serve_common.agentsessions.bridge import loopback_bridge
+    from agentkit_serve_common.agentsessions.diagnostics import suppress_sdk_diagnostics
 
     # Unlike the other protocols' conversion, empty turns are authoritative.
     history = [
@@ -275,13 +277,17 @@ async def run_agentsessions(
         # SDK run(None) may adopt an existing assistant response. An empty
         # request forces an invocation without manufacturing an empty user turn.
         history.append(ModelRequest(parts=[]))
-    async with loopback_bridge(exchange) as local:
-        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as http:
+    async with AsyncExitStack() as scope:
+        scope.enter_context(suppress_sdk_diagnostics())
+        local = await scope.enter_async_context(loopback_bridge(exchange))
+        async with httpx.AsyncClient(
+            trust_env=False, follow_redirects=False,
+            event_hooks={"request": [local.authorize_request]},
+        ) as http:
             async with AsyncOpenAI(
                 base_url=local.base_url, api_key=local.token,
                 organization="", project="", http_client=http,
-                # Explicit Authorization excludes ambient OPENAI_CUSTOM_HEADERS
-                # overrides, including differently cased authorization names.
+                # The HTTP hook also removes differently cased ambient auth.
                 default_headers={"Authorization": "Bearer " + local.token},
                 # The host owns effect completion/cancellation, not an
                 # unjournaled wall-clock read deadline. Bound loopback connect.

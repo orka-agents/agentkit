@@ -57,6 +57,30 @@ def test_bridge_roundtrip_is_authenticated_text_only_and_no_usage():
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("headers", [
+    [], [("Authorization", "Bearer ambient")],
+    [("authorization", "Bearer first"), ("aUtHoRiZaTiOn", "Bearer second")],
+    [("AUTHORIZATION", ""), ("Authorization", "Bearer first"), ("authorization", "Bearer second")],
+])
+def test_owned_client_authorization_collapses_ambient_headers(headers):
+    async def check():
+        async with live() as (exchange, _, binding):
+            async with httpx.AsyncClient(
+                base_url=binding.base_url, trust_env=False, follow_redirects=False,
+                event_hooks={"request": [binding.authorize_request]},
+            ) as client:
+                task = asyncio.create_task(client.post("chat/completions", headers=headers, json=payload()))
+                event = await asyncio.wait_for(exchange.events.get(), 3)
+                assert event.kind == c.EVENT_MODEL_CALL
+                exchange.mark_emitted(event.model.id)
+                exchange.accept(h.ModelResult(model_call_id=event.model.id, message=message()))
+                response = await task
+                assert response.status_code == 200
+                assert response.request.headers.get_list("authorization") == ["Bearer " + binding.token]
+                assert response.request.headers["content-type"] == "application/json"
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("headers", [{"Authorization": ""}, {"Authorization": "Bearer wrong"}, None])
 def test_bridge_authentication_refuses_before_effect(headers):
     async def check():

@@ -36,9 +36,10 @@ from agent_framework import (
     MCPStreamableHTTPTool,
     Message,
     MiddlewareTermination,
+    RawAgent,
     SkillsProvider,
 )
-from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.openai import OpenAIChatCompletionClient, RawOpenAIChatCompletionClient
 from httpx import AsyncClient, URL
 from mcp.types import CallToolResult
 from agentkit_serve_common.adapter_support import (
@@ -57,6 +58,7 @@ from agentkit_serve_common.adapter_support import (
     split_tool_command,
     upstream_status_code,
 )
+from agentkit_serve_common.agentsessions import ExecutionExchange, VerifiedAgentsessionsBinding
 from agentkit_serve_common.config import AgentSpec, ContextProviderSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
 from agentkit_serve_common.runtime import (
@@ -813,6 +815,57 @@ def build_runtime(spec: AgentSpec) -> RuntimeSession:
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
     return MAFRuntime(spec)
+
+
+async def run_agentsessions(
+    binding: VerifiedAgentsessionsBinding, request: RunRequest, exchange: ExecutionExchange,
+) -> None:
+    """Run fresh text-only MAF state exclusively through the host model bridge.
+
+    Config stays opaque; the controller already journals model OUTPUT and usage.
+    No provider builders or cached sessions participate in this execution.
+    """
+    import httpx
+    from openai import AsyncOpenAI
+
+    from agentkit_serve_common.agentsessions.bridge import loopback_bridge
+    from agentkit_serve_common.agentsessions.diagnostics import suppress_sdk_diagnostics
+
+    # The native service supplies validated, ordered user/assistant turns.
+    # Empty text is authoritative, unlike the other protocols' conversion.
+    messages = [Message(role=turn.role, contents=[turn.text]) for turn in request.history]
+    if exchange.input_count:
+        messages.append(Message(role="user", contents=[request.prompt]))
+    if not messages and not binding.spec.instructions:
+        # MAF requires a nonempty framework message list. Its OpenAI mapper
+        # drops this contentless system sentinel, emitting messages=[] rather
+        # than manufacturing an empty user Input.
+        messages.append(Message(role="system", contents=[]))
+    async with AsyncExitStack() as scope:
+        scope.enter_context(suppress_sdk_diagnostics())
+        local = await scope.enter_async_context(loopback_bridge(exchange))
+        async with httpx.AsyncClient(
+            trust_env=False, follow_redirects=False,
+            event_hooks={"request": [local.authorize_request]},
+        ) as http:
+            async with AsyncOpenAI(
+                base_url=local.base_url, api_key=local.token,
+                organization="", project="", http_client=http,
+                default_headers={"Authorization": "Bearer " + local.token},
+                # Host completion/cancellation owns the wait; bound only connect.
+                max_retries=0, timeout=httpx.Timeout(None, connect=5),
+            ) as sdk:
+                # Public raw constructors omit both default-enabled telemetry
+                # layers without mutating ambient providers or global settings.
+                # Tools/middleware are outside this protocol's text-only profile.
+                client = RawOpenAIChatCompletionClient(
+                    model=binding.spec.model.name, async_client=sdk,
+                    api_key=local.token, base_url=local.base_url, org_id="",
+                    instruction_role="system",
+                )
+                async with RawAgent(client=client, instructions=binding.spec.instructions) as agent:
+                    await agent.run(messages, stream=False)
+    return None
 
 
 def _status_of(exc: Exception) -> int:
