@@ -12,7 +12,7 @@ Verified during implementation against the installed package set:
 * ``langchain.agents.create_agent(model=..., tools=..., system_prompt=...)``
   returns a compiled LangGraph with ``ainvoke``.
 * ``ChatOpenAI(model=..., base_url=..., api_key=...)`` is the generic
-  OpenAI-compatible chat model client.
+  OpenAI-compatible Chat Completions or Responses model client.
 * ``MultiServerMCPClient.session(server_name, auto_initialize=False)`` plus
   ``load_mcp_tools(..., server_name=..., tool_name_prefix=True)`` keeps stdio MCP
   sessions open for the server lifespan and namespaces tool names.
@@ -26,9 +26,11 @@ adapter/target.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import AsyncExitStack
 from datetime import timedelta
+from functools import wraps
+from inspect import isawaitable
 from types import TracebackType
 from typing import Any
 from uuid import UUID
@@ -39,17 +41,20 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI as _ChatOpenAI
+from openai import AsyncStream, Stream
 
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AsyncExitStackLifecycle,
     AgentBuildError,
+    ModelAPI,
     declared_tool_env,
     mcp_tool_protocol_error,
     normalize_agent_run_error,
     positive_float_env,
     resolve_api_key,
+    resolve_model_api,
     resolve_tool_url,
     same_origin_mcp_httpx_client_factory,
     split_tool_command,
@@ -57,6 +62,7 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
+from agentkit_serve_common.model_api_auto import AutoModelAPIState, AutoModelRuntime
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -72,6 +78,7 @@ _DEFAULT_MCP_INIT_TIMEOUT = 120.0
 # Fixed tool results the model sees instead of upstream diagnostics.
 _MCP_TOOL_ERROR = "MCP tool execution failed"
 _INVALID_TOOL_ARGUMENTS = "tool call arguments must be a JSON object"
+_HISTORY_PHASE_KEY = "__agentkit_history_phase__"
 
 
 def _mcp_init_timeout() -> float:
@@ -84,13 +91,153 @@ def _resolve_api_key(spec: AgentSpec) -> str:
     return resolve_api_key(spec)
 
 
-def build_model(spec: AgentSpec) -> ChatOpenAI:
-    """Construct the OpenAI-compatible chat model pointed at ``model.baseURL``."""
-    return ChatOpenAI(
+def _response_field(value: Any, name: str, default: Any = None) -> Any:
+    return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+
+def _validate_output_item(item: Any) -> None:
+    # Some compatible providers omit optional item status. Do not require it,
+    # but an explicit unfinished status cannot authorize text or tool execution.
+    status = _response_field(item, "status")
+    if status is not None and status != "completed":
+        raise AgentRunError("agent run failed", status=502, code="AgentRunFailed")
+
+
+def _validate_response_output(response: Any) -> None:
+    for item in _response_field(response, "output", ()) or ():
+        _validate_output_item(item)
+
+
+def _validate_response_event(event: Any) -> None:
+    kind = _response_field(event, "type")
+    if kind == "response.output_item.done":
+        _validate_output_item(_response_field(event, "item"))
+    elif kind in {"response.completed", "response.incomplete", "response.failed"}:
+        _validate_response_output(_response_field(event, "response"))
+    # output_item.added legitimately carries in_progress. Only done items and
+    # terminal snapshots can finalize model output.
+
+
+class _ValidatedResponsesStream:
+    """Validate decoded SDK events, delegating transport and cleanup to the SDK."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def __iter__(self) -> Iterator[Any]:
+        for event in self._stream:
+            _validate_response_event(event)
+            yield event
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        async for event in self._stream:
+            _validate_response_event(event)
+            yield event
+
+    def __enter__(self) -> _ValidatedResponsesStream:
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> Any:
+        return self._stream.__exit__(*exc)
+
+    async def __aenter__(self) -> _ValidatedResponsesStream:
+        await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self._stream.__aexit__(*exc)
+
+
+def _validated_response_result(value: Any) -> Any:
+    if isawaitable(value):
+        async def resolve() -> Any:
+            return _validated_response_result(await value)
+
+        return resolve()
+    if isinstance(value, (Stream, AsyncStream)) or callable(getattr(value, "__aiter__", None)):
+        return _ValidatedResponsesStream(value)
+    if callable(getattr(value, "parse", None)):
+        # with_raw_response returns an SDK response whose parse() yields the
+        # native Response or stream. Validate that result, not HTTP metadata.
+        return _ValidatedResponsesResource(value)
+    _validate_response_output(value)
+    return value
+
+
+class _ValidatedResponsesResource:
+    """Keep raw output-item statuses available before LangChain discards them."""
+
+    def __init__(self, resource: Any) -> None:
+        self._resource = resource
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._resource, name)
+        if name == "with_raw_response":
+            return _ValidatedResponsesResource(value)
+        if name in {"create", "parse"}:
+            @wraps(value)
+            def call(*args: Any, **kwargs: Any) -> Any:
+                return _validated_response_result(value(*args, **kwargs))
+
+            return call
+        return value
+
+
+class ChatOpenAI(_ChatOpenAI):
+    """Preserve history phases even with langchain-openai 1.0's serializer."""
+
+    def _get_request_payload(self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "input" not in payload:
+            return payload
+        assistant_items = iter(
+            item for item in payload["input"]
+            if item.get("type", "message") == "message" and item.get("role") == "assistant"
+        )
+        # Marked client history is a prefix with one message item per assistant
+        # turn. Generated tool/reasoning items must not consume or acquire phases.
+        for message in self._convert_input(input_).to_messages():
+            if not isinstance(message, AIMessage) or _HISTORY_PHASE_KEY not in message.additional_kwargs:
+                continue
+            item = next(assistant_items, None)
+            if item is None:
+                break
+            if (phase := message.additional_kwargs[_HISTORY_PHASE_KEY]) is not None:
+                item.setdefault("phase", phase)
+        return payload
+
+
+def build_model(
+    spec: AgentSpec,
+    *,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+) -> ChatOpenAI:
+    """Build a concrete model; auto negotiation belongs to the runtime."""
+    if model_api is None:
+        selection = resolve_model_api()
+        model_api = "responses" if selection == "auto" else selection
+    model = ChatOpenAI(
         model=spec.model.name,
         base_url=spec.model.base_url,
         api_key=_resolve_api_key(spec),
+        # Pin routing so LC_OUTPUT_VERSION cannot override the startup selector.
+        use_responses_api=model_api == "responses",
+        # The runtime forwards explicit history, not provider-held conversations.
+        store=False if model_api == "responses" else None,
     )
+    if model_api == "responses":
+        for client in (model.root_client, model.root_async_client):
+            responses = client.responses
+            if client is model.root_async_client and auto_state is not None:
+                # Accept successful SDK calls before validation can reject output.
+                responses = auto_state.wrap_responses(responses, client=client)
+            client.responses = _ValidatedResponsesResource(responses)
+    return model
 
 
 def _tool_env(tool: ToolSpec) -> dict[str, str]:
@@ -142,17 +289,25 @@ class _MCPSessionBoundary:
             raise mcp_tool_protocol_error(exc) from None
 
 
-class _InvalidToolCallMiddleware(AgentMiddleware):
-    """Answer tool calls whose arguments are not JSON so the model can retry.
+class _ModelResultMiddleware(AgentMiddleware):
+    """Reject unfinished Responses and let the model retry invalid tool arguments.
 
-    LangChain parks them in ``invalid_tool_calls``, which the agent loop would
-    otherwise treat as a final (often empty) answer.
+    LangChain parses tool calls even from unfinished Responses. Reject those
+    before tools run. It also parks invalid JSON in ``invalid_tool_calls``, which
+    the agent loop would otherwise treat as a final (often empty) answer.
     """
+
+    def __init__(self, *, responses_api: bool) -> None:
+        self.responses_api = responses_api
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         message = state["messages"][-1]
-        if not isinstance(message, AIMessage) or not message.invalid_tool_calls:
+        if not isinstance(message, AIMessage):
+            return None
+        if self.responses_api and message.response_metadata.get("status") != "completed":
+            raise AgentRunError("agent run failed", status=502, code="AgentRunFailed")
+        if not message.invalid_tool_calls:
             return None
         update: dict[str, Any] = {
             "messages": [
@@ -177,8 +332,16 @@ class LangGraphRuntime:
     so stdio MCP sessions stay warm across requests and close on shutdown.
     """
 
-    def __init__(self, spec: AgentSpec) -> None:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        *,
+        model_api: ModelAPI | None = None,
+        auto_state: AutoModelAPIState | None = None,
+    ) -> None:
         self.spec = spec
+        self.model_api = model_api
+        self.auto_state = auto_state
         self.stack = AsyncExitStack()
         self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.graph: Any | None = None
@@ -186,13 +349,16 @@ class LangGraphRuntime:
 
     async def __aenter__(self) -> RuntimeSession:
         async def start() -> RuntimeSession:
-            model = build_model(self.spec)
+            if self.model_api is None and self.auto_state is None:
+                model = build_model(self.spec)
+            else:
+                model = build_model(self.spec, model_api=self.model_api, auto_state=self.auto_state)
             tools = await self._load_tools()
             self.graph = create_agent(
                 model=model,
                 tools=tools,
                 system_prompt=self.spec.instructions,
-                middleware=[_InvalidToolCallMiddleware()],
+                middleware=[_ModelResultMiddleware(responses_api=model.use_responses_api is True)],
             )
             return self
 
@@ -271,6 +437,10 @@ def build_runtime(spec: AgentSpec) -> RuntimeSession:
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
     validate_supported_spec(spec)
+    if resolve_model_api() == "auto":
+        return AutoModelRuntime(
+            lambda model_api, state: LangGraphRuntime(spec, model_api=model_api, auto_state=state),
+        )
     return LangGraphRuntime(spec)
 
 
@@ -294,7 +464,15 @@ def _to_messages(request: RunRequest) -> list[BaseMessage]:
         elif turn.role == "user":
             messages.append(HumanMessage(content=turn.text))
         elif turn.role == "assistant":
-            messages.append(AIMessage(content=turn.text))
+            # Native Responses serializers read phase from text blocks. Both the
+            # minimum and current Chat serializers strip it from these blocks.
+            content = turn.text if turn.phase is None else [
+                {"type": "text", "text": turn.text, "phase": turn.phase},
+            ]
+            messages.append(AIMessage(
+                content=content,
+                additional_kwargs={_HISTORY_PHASE_KEY: turn.phase},
+            ))
     messages.append(HumanMessage(content=request.prompt))
     return messages
 

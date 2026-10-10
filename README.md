@@ -1,8 +1,8 @@
 # AgentKit
 
 AgentKit builds an agent from YAML into a normal OCI container image. The
-container serves an OpenAI-compatible `/v1` Chat Completions API, can own MCP
-tools, and keeps secret values out of the image.
+container serves OpenAI-compatible Chat Completions and Responses APIs on the
+same `/v1` listener, can own MCP tools, and keeps secret values out of the image.
 
 Use AgentKit when you want to package an agent the same way you package any other
 container: build it with Docker, run it locally, push it to a registry, and deploy
@@ -55,11 +55,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"https://example.com"}]}'
 ```
 
-The image also exposes:
+The same container also accepts Responses requests:
+
+```sh
+curl http://127.0.0.1:8080/v1/responses \
+  -H 'authorization: Bearer dev-token' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","input":"https://example.com","store":false}'
+```
+
+Both routes share the runtime, baked MCP tools, bearer auth, and lifecycle.
+Responses is synchronous, stateless, and text-only. Send `input` as a string or
+an array of `system`, `developer`, `user`, and `assistant` messages ending in a
+user message. Message content can be text or `input_text`/`output_text` parts;
+assistant `phase` is preserved in history. Optional top-level `instructions`
+becomes client system history after the baked instructions. The reply contains
+one completed assistant `output_text` message, token usage, and `store: false`.
+`X-AgentKit-Session-Id` supports correlation on either route, not stored history.
+
+Responses rejects streaming, nonempty request `tools`, specific `tool_choice`,
+`previous_response_id`, `conversation`, `background: true`, `store: true`, and
+non-message or multimodal input before execution. Tools come from the image.
+See [the HTTP contract](docs/agent-abi.md#served-http-contract) for details.
+
+The image exposes:
 
 - `GET /healthz`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 
 ## Select a protocol surface
 
@@ -84,14 +108,67 @@ docker run \
 agentkit-serve --config /agent/agent.yaml --protocol acp
 ```
 
+`AGENTKIT_MODEL_API` separately selects the upstream model API for Pydantic AI,
+Microsoft Agent Framework, and LangGraph. It defaults to `chat_completions`.
+Explicit `chat_completions` and `responses` never switch APIs. Opt in with
+`AGENTKIT_MODEL_API=auto` to prefer Responses and allow one Chat retry only when
+the first real Responses request gets a recognized unsupported endpoint/API
+rejection. Auto sends no separate probe and caches the concrete API for that
+runtime/backend/model lifetime.
+
+Unknown 404s, missing models, 401/403/429, timeouts, and generic 5xx errors do not
+trigger fallback. Once a Responses HTTP request is accepted, auto never switches,
+even if a stream fails or output is malformed or incomplete. A permitted retry
+preserves history and tools, closes the rejected Responses runtime and tool
+resources before starting Chat, and keeps upstream Responses `store: false`.
+See [model endpoint compatibility](docs/runtime-adapters.md#model-endpoint-compatibility)
+for the rejection rules.
+
+This works with standalone/container agents and the OpenAI, Foundry, Orka, and
+ACP serving protocols. It does not require Foundry hosting or credentials.
+With `AGENTKIT_PROTOCOL=openai`, both client routes remain available regardless
+of the upstream selector. There is no separate Responses serving protocol.
+
+For example, the same standalone image can accept either Chat Completions or
+Responses requests while calling the model through Responses:
+
+```sh
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -e AGENTKIT_BIND=0.0.0.0 \
+  -e AGENTKIT_AUTH_TOKEN=dev-token \
+  -e AGENTKIT_MODEL_API=responses \
+  -e OPENAI_API_KEY \
+  url-summarizer:latest
+```
+
+The local Makefile workflow also forwards this selector:
+`make run-test-agent AGENTKIT_MODEL_API=responses`, with `RUNTIME=maf` or
+`RUNTIME=langgraph` when needed. To negotiate instead, replace the Docker env
+setting above with `-e AGENTKIT_MODEL_API=auto`, or run:
+
+```sh
+make run-test-agent AGENTKIT_MODEL_API=auto
+```
+
+This is startup configuration, not a per-turn override. Foundry brokered auto
+persists the concrete API and restores it for continuations; explicit API
+mismatch protections are unchanged. The separate `agentsessions` host-mediated
+model contract remains Chat-only.
+See [model-driven tool workflows](docs/foundry-hosted-brokered.md#model-driven-tool-workflows)
+for brokered continuation rules.
+
 Protocol endpoints:
 
 | Protocol | Endpoints | Notes |
 |---|---|---|
-| `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions` | Default, non-streaming Chat Completions. |
+| `openai` | `/healthz`, `/v1/models`, `/v1/chat/completions`, `/v1/responses` | Default, synchronous Chat Completions and stateless text-only Responses on one listener. |
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
 | `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
 | `acp` | stdin/stdout | ACP protocol v1 child mode for Orka `orka.harness.v2`. It opens no network listener and accepts only the supervisor's loopback provider proxy and prompt-scoped HTTP MCP server. |
+
+Generic `/v1/responses` does not change Foundry's `/responses` or its brokered
+continuation paths.
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -291,9 +368,9 @@ AgentKit files are runtime-neutral. Pick the agent framework with the optional
 runtime: langgraph
 ```
 
-All runtimes read the same built agent config and serve the same non-streaming
-OpenAI-compatible API. Runtime capabilities are explicit and validated before
-build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
+All runtimes read the same built agent config and serve both non-streaming
+OpenAI-compatible client APIs. Runtime capabilities are explicit and validated
+before build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
 [`docs/runtime-adapters.md`](docs/runtime-adapters.md).
 
 ## Configure the server

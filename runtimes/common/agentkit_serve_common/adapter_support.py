@@ -16,10 +16,10 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from contextlib import AsyncExitStack
 from types import TracebackType
-from typing import Mapping, TypeVar
+from typing import Literal, Mapping, TypeVar, cast
 
 import anyio
 
@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 NO_AUTH_API_KEY = "not-needed"
 
 
+MODEL_API_ENV = "AGENTKIT_MODEL_API"
+MODEL_APIS = ("chat_completions", "responses")
+ModelAPI = Literal["chat_completions", "responses"]
+MODEL_API_CHOICES = (*MODEL_APIS, "auto")
+ModelAPISelection = Literal["chat_completions", "responses", "auto"]
+
+
 MCP_TIMEOUT_ENV = "AGENTKIT_MCP_TIMEOUT"
 WORKLOAD_TOKEN_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN"
 WORKLOAD_TOKEN_COMMAND_ENV = "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND"
@@ -45,6 +52,18 @@ _T = TypeVar("_T")
 
 class AgentBuildError(Exception):
     """Raised when an adapter cannot construct its concrete agent."""
+
+
+def resolve_model_api(
+    *, supported: Collection[str] | None = None, runtime: str = "this runtime",
+) -> ModelAPISelection:
+    """Resolve the startup-only model protocol, never per-turn environment data."""
+    value = os.environ.get(MODEL_API_ENV, "chat_completions")
+    if value not in MODEL_API_CHOICES:
+        raise AgentBuildError(f"{MODEL_API_ENV} must be chat_completions, responses, or auto")
+    if supported is not None and value not in supported:
+        raise AgentBuildError(f"{runtime} does not support {MODEL_API_ENV}={value}")
+    return cast(ModelAPISelection, value)
 
 
 def _attach_secondary_error(

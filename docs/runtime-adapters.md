@@ -13,13 +13,15 @@ must be identical across adapters:
 |---|---|
 | `config.py` | Strict `/agent/agent.yaml` reader and ABI version check. |
 | `cli.py` | `agentkit-serve --config ... --protocol openai\|foundry\|orka\|acp`, bind/port handling, auth startup gates. |
-| `server.py` | FastAPI app and OpenAI-compatible response/error envelopes. |
+| `server.py` | Shared FastAPI listener, runtime/auth/lifecycle, and Chat Completions/Responses routes. |
+| `responses.py` | Stateless text-only Responses input normalization and shared response/usage encoding. |
 | `foundry.py` | Foundry `/readiness`, `/invocations`, and minimal `/responses` skin. |
 | `orka.py` | Observed-mode `orka.harness.v1` HTTP+SSE skin. |
 | `acp.py` | Strict ACP stdio child for an Orka `orka.harness.v2` supervisor. |
 | `conversation.py` | Protocol request normalization into `RunRequest`. |
 | `runtime.py` | `RuntimeFactory`, `RuntimeSession`, `RunResult`, `AgentRunError`. |
 | `adapter_support.py` | API-key lookup, tool env projection, timeout parsing, error normalization. |
+| `model_api_auto.py` | Authoritative unsupported-API classification, first-request negotiation, cached API choice, and resource cleanup before fallback. |
 | `model_errors.py` | Runtime-owned model error codes and messages shared by every protocol skin. |
 | `conformance.py` | Shared HTTP behavior tests adapter packages import. |
 | `parity.py` | Shared wire-level suite that runs each adapter's real runtime against a scripted model and MCP tool. |
@@ -43,6 +45,11 @@ OpenAI mode exposes:
 - `GET /v1/models` returns the one configured model name.
 - `POST /v1/chat/completions` runs the agent once and returns one
   `chat.completion` object with a single assistant message.
+- `POST /v1/responses` runs the same agent synchronously and returns one
+  completed assistant `output_text` message, usage, and `store: false`.
+
+Both POST routes share one listener, runtime session, bearer auth, health state,
+and MCP/application lifespan. No separate Responses protocol is needed.
 
 Foundry mode exposes `/readiness`, `/invocations`, and synchronous
 `/responses`. It defaults to port `8088` when the ABI kept the generic default
@@ -59,7 +66,7 @@ providers remain prohibited. At session creation it
 accepts at most one loopback HTTP MCP server with bearer authentication, which
 is the prompt-scoped broker created by the Orka supervisor.
 
-Request behavior is intentionally narrow:
+Chat Completions request behavior is intentionally narrow:
 
 - `stream: true` returns HTTP 400 with code `stream_unsupported`.
 - non-empty `tools` returns HTTP 400 with code `tools_unsupported`.
@@ -75,6 +82,20 @@ Request behavior is intentionally narrow:
   `RunRequest` for runtime/session correlation. It never replaces the history the
   client sent. Orka mode additionally forwards `turn_id`, `correlation_id`,
   `deadline`, `metadata`, and per-run `env` fields.
+
+Generic Responses accepts a string `input` or a non-empty message array ending
+in a user message. Messages support `system`, `developer`, `user`, and
+`assistant` roles, with string content or `input_text`/`output_text` parts.
+Developer messages become system history; assistant `phase` is preserved in
+normalized history. Top-level `instructions` becomes client system history
+after baked instructions and before input history. `X-AgentKit-Session-Id`
+provides the same correlation as Chat, not stored conversation state.
+
+Responses rejects streaming, nonempty request tools, specific tool choices,
+`previous_response_id`, `conversation`, `background: true`, `store: true`, and
+non-message/multimodal input before runtime or tool execution. The built agent
+still runs its own tools internally. Foundry `/responses` and brokered
+continuations keep their separate behavior.
 
 The protocol layer owns the conversation: OpenAI and Foundry clients send it, and
 Orka mode keeps each runtime session's completed user/assistant turns, as the
@@ -105,7 +126,41 @@ failures; and a traceback otherwise.
 ## Model endpoint compatibility
 
 Adapters use the baked `model.baseURL` and `model.name` to construct their
-OpenAI-compatible chat client. They do not special-case a provider: the endpoint
+OpenAI-compatible model client. `AGENTKIT_MODEL_API` selects `chat_completions`,
+the default, explicit `responses`, or opt-in `auto` for upstream calls. Both
+explicit values require the selected API and never fall back. The selector does
+not change inbound routes, protocols, or the ABI: either client API can use
+either upstream API.
+
+Use `-e AGENTKIT_MODEL_API=auto` with `docker run`, or
+`make run-test-agent AGENTKIT_MODEL_API=auto`. Auto sends the first real request
+to Responses, not a separate probe. It caches the concrete API for the configured
+runtime/backend/model lifetime, across client calls and tool rounds.
+
+The shared [`model_api_auto.py`](../runtimes/common/agentkit_serve_common/model_api_auto.py)
+is authoritative for fallback eligibility. Only an initial 400/404/405/501 with
+recognized endpoint/API-unsupported evidence allows one Chat retry. Recognized
+error codes are `unsupported_endpoint`, `unknown_endpoint`, `unsupported_api`,
+`responses_api_not_supported`, and `unsupported_model_api`. Known route-level
+errors include a 404 `Not Found`, 405 `Method Not Allowed`, or 501 `Not Implemented`;
+a status alone is not enough. Unknown 404s, model/deployment-missing errors,
+401/403/429, timeouts, and generic 5xx failures do not trigger fallback.
+
+Auto pins Responses when successful HTTP headers arrive, before body reads or
+SDK decoding. Responses SDK retries are disabled in auto mode so a broken body
+cannot replay accepted work. The API stays Responses even when streaming or
+later decoding yields malformed or incomplete output. A permitted fallback
+exits the rejected Responses runtime and its owned tool resources before
+starting Chat with the same history and tools. Model HTTP pools retain their
+native ownership; copied SDK options share those pools rather than adding a
+second closer. Upstream Responses calls remain stateless with `store: false`.
+
+Foundry brokered auto persists `responses` or `chat_completions`, never `auto`,
+in continuation state and restores that concrete API on resume. Explicit
+selector/continuation mismatch protections are unchanged. Foundry and generic
+Responses retain their separate inbound contracts.
+
+Adapters do not special-case a provider: the endpoint
 can be OpenAI, another hosted provider, a local gateway, an in-cluster service,
 or a prebuilt or custom [AIKit](https://github.com/kaito-project/aikit) model
 image. AIKit is just an example of an OpenAI-compatible endpoint. For no-auth
@@ -170,7 +225,7 @@ Path: `runtimes/pydantic-ai/`
 
 - Console script package name: `agentkit-serve`.
 - Adapter image target built by `make build-serve`.
-- Uses `OpenAIChatModel` and `OpenAIProvider`.
+- Uses `OpenAIChatModel` or `OpenAIResponsesModel` with `OpenAIProvider`.
 - Supports both older `MCPServerStdio` and newer `MCPToolset` /
   `StdioTransport` APIs.
 - Maps pydantic-ai message history and usage objects into the neutral contract.

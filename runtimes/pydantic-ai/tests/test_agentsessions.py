@@ -267,3 +267,28 @@ def test_actual_sdk_blocked_effect_cleanup_and_next_execution(binding, control):
             assert ends[0].end.state == "COMPLETED"
         assert unhandled == []
     asyncio.run(check())
+
+
+def test_direct_upstream_responses_selection_preserves_host_chat_rpc(binding, monkeypatch):
+    """The host-mediated exchange is not a direct upstream model connection."""
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
+
+    async def check():
+        import httpx
+
+        urls = []
+        real_send = httpx.AsyncHTTPTransport.handle_async_request
+
+        async def observe_send(transport, request):
+            urls.append(str(request.url))
+            return await real_send(transport, request)
+
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", observe_send)
+        async with live(binding) as stub:
+            event, ends = await turn(stub, inputs=["hello"])
+            assert [message.role for message in event.model.messages] == ["system", "user"]
+            assert ends[0].end.state == "COMPLETED"
+        assert len(urls) == 1
+        assert urls[0].startswith("http://127.0.0.1:") and urls[0].endswith("/v1/chat/completions")
+
+    asyncio.run(check())

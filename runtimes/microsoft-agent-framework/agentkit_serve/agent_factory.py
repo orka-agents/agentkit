@@ -38,18 +38,20 @@ from agent_framework import (
     MiddlewareTermination,
     SkillsProvider,
 )
-from agent_framework.openai import OpenAIChatCompletionClient
+from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
 from httpx import AsyncClient, URL
 from mcp.types import CallToolResult
 from agentkit_serve_common.adapter_support import (
     FORWARDED_ROLES,
     AsyncExitStackLifecycle,
     AgentBuildError,
+    ModelAPI,
     declared_tool_env,
     mcp_tool_protocol_error,
     normalize_agent_run_error,
     positive_int_env,
     resolve_api_key,
+    resolve_model_api,
     resolve_workload_identity_token,
     resolve_tool_headers,
     resolve_tool_url,
@@ -59,6 +61,7 @@ from agentkit_serve_common.adapter_support import (
 )
 from agentkit_serve_common.config import AgentSpec, ContextProviderSpec, ToolSpec
 from agentkit_serve_common.conversation import RunRequest, ToolCallEvent
+from agentkit_serve_common.model_api_auto import AutoModelAPIState, AutoModelRuntime
 from agentkit_serve_common.runtime import (
     AgentRunError,
     OfflineEchoRuntimeFactory,
@@ -261,8 +264,37 @@ async def _close_resource(resource: object) -> None:
         await result
 
 
-def build_client(spec: AgentSpec, *, workload_identity_credential: object | None = None):
-    """Construct the chat client for the configured model auth mode."""
+def _preserve_responses_phase(client) -> None:
+    # OpenAI and Foundry share this serialization hook in the minimum supported
+    # SDK. Message.additional_properties alone is not forwarded to either API.
+    prepare = getattr(client, "_prepare_message_for_openai", None)
+    if not callable(prepare):
+        raise AgentBuildError("Responses client lacks the required message serialization hook")
+
+    def prepare_with_phase(message: Message, **kwargs):
+        items = prepare(message, **kwargs)
+        phase = message.additional_properties.get("phase")
+        if message.role == "assistant" and phase in ("commentary", "final_answer"):
+            for item in items:
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    item["phase"] = phase
+        return items
+
+    client._prepare_message_for_openai = prepare_with_phase
+
+
+def build_client(
+    spec: AgentSpec,
+    *,
+    workload_identity_credential: object | None = None,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
+):
+    """Construct the model client; auto helpers start with Responses."""
+    if model_api is None:
+        selection = resolve_model_api()
+        model_api = "responses" if selection == "auto" else selection
+    client_type = OpenAIChatClient if model_api == "responses" else OpenAIChatCompletionClient
     auth = spec.model.auth
     if auth is not None and auth.type == _AUTH_WORKLOAD_IDENTITY:
         if (
@@ -270,34 +302,48 @@ def build_client(spec: AgentSpec, *, workload_identity_credential: object | None
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN")
             or os.environ.get("AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND")
         ):
-            return OpenAIChatCompletionClient(
+            chat_client = client_type(
                 model=spec.model.name,
                 base_url=spec.model.base_url,
                 api_key=_model_workload_api_key_provider(auth.audience or _DEFAULT_FOUNDRY_AUDIENCE),
             )
-        try:
-            from agent_framework.foundry import FoundryChatClient
-            from azure.identity import DefaultAzureCredential
-        except ImportError as exc:  # pragma: no cover - dependency guard.
-            raise AgentBuildError(
-                "model workload identity auth requires agent-framework-foundry and azure-identity"
-            ) from exc
-        credential = (
-            workload_identity_credential
-            if workload_identity_credential is not None
-            else DefaultAzureCredential()
-        )
-        return FoundryChatClient(
-            project_endpoint=_project_endpoint_from_openai_base_url(spec.model.base_url),
+        else:
+            chat_client = _build_foundry_client(spec, client_type, model_api, workload_identity_credential)
+    else:
+        chat_client = client_type(
             model=spec.model.name,
-            credential=credential,
+            base_url=spec.model.base_url,
+            api_key=resolve_api_key(spec),
         )
+    if model_api == "responses":
+        _preserve_responses_phase(chat_client)
+    if auto_state is not None:
+        chat_client.client.responses = auto_state.wrap_responses(chat_client.client.responses, client=chat_client.client)
+    return chat_client
 
-    return OpenAIChatCompletionClient(
+
+def _build_foundry_client(spec: AgentSpec, client_type, model_api: ModelAPI, credential: object | None):
+    try:
+        from agent_framework.foundry import FoundryChatClient
+        from azure.identity import DefaultAzureCredential
+    except ImportError as exc:  # pragma: no cover - dependency guard.
+        raise AgentBuildError(
+            "model workload identity auth requires agent-framework-foundry and azure-identity"
+        ) from exc
+    if credential is None:
+        credential = DefaultAzureCredential()
+    foundry_client = FoundryChatClient(
+        project_endpoint=_project_endpoint_from_openai_base_url(spec.model.base_url),
         model=spec.model.name,
-        base_url=spec.model.base_url,
-        api_key=resolve_api_key(spec),
+        credential=credential,
     )
+    if model_api == "responses":
+        return foundry_client
+    # Azure project discovery/auth is shared by both APIs. Keep ownership of
+    # its project client on the existing runtime lifecycle stack.
+    chat_client = client_type(model=spec.model.name, async_client=foundry_client.client)
+    chat_client.project_client = foundry_client.project_client
+    return chat_client
 
 
 def _tool_env(tool: ToolSpec) -> dict[str, str]:
@@ -476,6 +522,19 @@ class _ModelMessageMiddleware(ChatMiddleware):
         for message in context.messages:
             message.author_name = None
         await call_next()
+        if not context.stream and getattr(context.client, "STORES_BY_DEFAULT", False) is True:
+            # Responses can contain complete-looking calls in a failed or
+            # truncated result. Stop before MAF's function loop executes them.
+            raw = getattr(context.result, "raw_representation", None)
+            unfinished_item = any(
+                getattr(item, "status", None) in {"in_progress", "incomplete"}
+                for item in getattr(raw, "output", ()) or ()
+            )
+            if getattr(raw, "status", None) != "completed" or unfinished_item:
+                error = AgentRunError("model service returned an invalid response", status=502, code="InvalidModelResponse")
+                context.result = None
+                _fail_run_with(error)
+                raise MiddlewareTermination(str(error))
 
 
 def build_agent(
@@ -484,9 +543,13 @@ def build_agent(
     context_providers=None,
     stack: AsyncExitStack | None = None,
     client=None,
+    model_api: ModelAPI | None = None,
+    auto_state: AutoModelAPIState | None = None,
 ) -> Agent:
     """Assemble the MAF agent: client + system prompt + tools + context."""
     instructions = spec.instructions
+    if client is None and model_api is None:
+        resolve_model_api()
     tools = [build_tool(t, stack=stack) for t in spec.tools]
     if spec._packaged_skill_catalog:
         skills = spec._packaged_skill_catalog
@@ -499,7 +562,12 @@ def build_agent(
             func=skills.load_skill,
             approval_mode="never_require",
         ))
-    chat_client = client if client is not None else build_client(spec)
+    if client is not None:
+        chat_client = client
+    elif model_api is None and auto_state is None:
+        chat_client = build_client(spec)
+    else:
+        chat_client = build_client(spec, model_api=model_api, auto_state=auto_state)
     return Agent(
         client=chat_client,
         instructions=instructions,
@@ -508,7 +576,7 @@ def build_agent(
         context_providers=[_RequestHistoryProvider(), *(context_providers or [])],
         middleware=[_ModelMessageMiddleware(), _MCPFailureMiddleware()],
         # Each run already carries the full request history. A client that
-        # stores responses by default (the Foundry Responses API) would also
+        # stores responses by default (the Responses API) would also
         # chain the stored conversation and repeat that history. Other
         # OpenAI-compatible servers may reject an unknown store field.
         default_options={"store": False} if getattr(chat_client, "STORES_BY_DEFAULT", False) else None,
@@ -518,8 +586,16 @@ def build_agent(
 class MAFRuntime:
     """RuntimeSession Adapter around a Microsoft Agent Framework Agent."""
 
-    def __init__(self, spec: AgentSpec) -> None:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        *,
+        model_api: ModelAPI | None = None,
+        auto_state: AutoModelAPIState | None = None,
+    ) -> None:
         self.spec = spec
+        self.model_api = model_api
+        self.auto_state = auto_state
         self.stack = AsyncExitStack()
         self.lifecycle = AsyncExitStackLifecycle(self.stack)
         self.agent: Agent | None = None
@@ -532,13 +608,21 @@ class MAFRuntime:
 
     async def __aenter__(self) -> RuntimeSession:
         async def start() -> RuntimeSession:
+            if self.model_api is None:
+                resolve_model_api()
             context_providers = await self._build_context_providers()
             client = await self._build_model_fallback_client()
+            model_options = {}
+            if self.model_api is not None:
+                model_options["model_api"] = self.model_api
+            if self.auto_state is not None:
+                model_options["auto_state"] = self.auto_state
             self.agent = build_agent(
                 self.spec,
                 context_providers=context_providers,
                 stack=self.stack,
                 client=client,
+                **model_options,
             )
             # Register before entering so a partially failed Agent.__aenter__ still
             # unwinds the Agent's own internal AsyncExitStack.
@@ -651,6 +735,8 @@ class MAFRuntime:
     async def _build_model_fallback_client(self):
         if not _uses_model_workload_identity_fallback(self.spec):
             return None
+        if self.model_api is None:
+            resolve_model_api()
         try:
             from azure.identity import DefaultAzureCredential
         except ImportError as exc:  # pragma: no cover - dependency guard.
@@ -661,7 +747,15 @@ class MAFRuntime:
         credential = DefaultAzureCredential()
         if callable(getattr(credential, "close", None)):
             self.stack.push_async_callback(_close_resource, credential)
-        client = build_client(self.spec, workload_identity_credential=credential)
+        if self.model_api is None and self.auto_state is None:
+            client = build_client(self.spec, workload_identity_credential=credential)
+        else:
+            client = build_client(
+                self.spec,
+                workload_identity_credential=credential,
+                model_api=self.model_api,
+                auto_state=self.auto_state,
+            )
         # FoundryChatClient exposes its internally-created AIProjectClient, but
         # MAF's Agent does not enter that project client. Own it here while leaving
         # the framework chat client itself exclusively under Agent ownership.
@@ -812,6 +906,8 @@ def build_runtime(spec: AgentSpec) -> RuntimeSession:
     """Build the runtime session consumed by the shared server."""
     if offline_orka_echo_enabled():
         return OfflineEchoRuntimeFactory().build_runtime(spec)
+    if resolve_model_api() == "auto":
+        return AutoModelRuntime(lambda api, state: MAFRuntime(spec, model_api=api, auto_state=state))
     return MAFRuntime(spec)
 
 
@@ -858,7 +954,12 @@ def _result_usage(result: object) -> dict[str, int]:
 def _history_messages(request: RunRequest) -> tuple[Message, ...]:
     """Map a neutral RunRequest's prior turns to MAF messages."""
     return tuple(
-        Message(role=turn.role, contents=[turn.text])
+        Message(
+            role=turn.role,
+            contents=[turn.text],
+            additional_properties={"phase": turn.phase}
+            if turn.role == "assistant" and turn.phase in ("commentary", "final_answer") else None,
+        )
         for turn in request.history
         if turn.role in FORWARDED_ROLES and turn.text
     )

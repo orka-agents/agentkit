@@ -9,9 +9,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import agentkit_serve_common.foundry as foundry_module
+from _foundry_model_api_cases import (
+    model_api as model_api,
+    _FakeChatTransport,
+    _model_input,
+)
 from test_foundry_brokered_protocol import (
     CONTINUATION_AUTH,
-    _FakeChatTransport,
     _app,
     _call,
     _chat_response,
@@ -41,7 +45,9 @@ def _result(response, output, *, session="review-session"):
 
 
 @pytest.mark.parametrize("outcome", ["approved", *_ERRORS])
-def test_review_wait_and_process_restart_preserve_completed_steps_and_final_result(tmp_path, monkeypatch, outcome):
+def test_review_wait_and_process_restart_preserve_completed_steps_and_final_result(
+    model_api, tmp_path, monkeypatch, outcome
+):
     now = [1000.0]
     monkeypatch.setattr(foundry_module, "time", SimpleNamespace(time=lambda: now[0]))
     monkeypatch.setenv("AGENTKIT_FOUNDRY_RESPONSE_STATE_TTL_SECONDS", "1800")
@@ -102,19 +108,19 @@ def test_review_wait_and_process_restart_preserve_completed_steps_and_final_resu
             assert _message_text(final.json()) == f"{outcome}: {_ERRORS[outcome]}"
         else:
             assert len(second_model.requests) == 1
-            messages = second_model.requests[0]["messages"]
-            assert len([message for message in messages if message["role"] == "user"]) == 1
-            tool_results = [message for message in messages if message["role"] == "tool"]
+            items = _model_input(second_model.requests[0])
+            assert len([item for item in items if item.get("role") == "user"]) == 1
+            tool_results = [item for item in items if item["type"] == "function_call_output"]
             assert len(tool_results) == 2
-            assert json.loads(tool_results[0]["content"]) == first_output
-            assert tool_results[1]["tool_call_id"] == _call(pending)["call_id"]
+            assert json.loads(tool_results[0]["output"]) == first_output
+            assert tool_results[1]["call_id"] == _call(pending)["call_id"]
             expected = output if outcome == "approved" else {"approved": False, "error": {"code": outcome, "message": _ERRORS[outcome]}}
-            assert json.loads(tool_results[1]["content"]) == expected
-            assert "UNSAFE_TOOL_DETAIL" not in json.dumps(messages)
+            assert json.loads(tool_results[1]["output"]) == expected
+            assert "UNSAFE_TOOL_DETAIL" not in json.dumps(items)
 
 
 @pytest.mark.parametrize("saved_state", [False, True])
-def test_lost_or_expired_review_state_never_restarts_the_original_action(tmp_path, monkeypatch, saved_state):
+def test_lost_or_expired_review_state_never_restarts_the_original_action(model_api, tmp_path, monkeypatch, saved_state):
     now = [1000.0]
     monkeypatch.setattr(foundry_module, "time", SimpleNamespace(time=lambda: now[0]))
     state_file = tmp_path / "responses.json" if saved_state else None

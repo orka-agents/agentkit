@@ -7,7 +7,8 @@ only per-adapter input.
 
 Protocol modes:
 
-* ``openai`` (default): ``/healthz``, ``/v1/models``, ``/v1/chat/completions``.
+* ``openai`` (default): ``/healthz``, ``/v1/models``, ``/v1/chat/completions``,
+  and stateless ``/v1/responses``.
 * ``foundry``: ``/readiness``, ``/invocations``, minimal non-streaming
   ``/responses``.
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
@@ -39,6 +40,7 @@ from .acp import (
     load_verified_acp_runtime_binding,
     run_acp_stdio,
 )
+from .adapter_support import AgentBuildError, resolve_model_api
 from .agentsessions import (
     AgentsessionsConfigurationError,
     load_verified_agentsessions_binding,
@@ -135,6 +137,10 @@ def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_toke
 def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     """Entry point: serve an agent built by ``factory`` (the adapter's module)."""
     args = _parse_args(argv)
+    try:
+        resolve_model_api()
+    except AgentBuildError as exc:
+        _fail(str(exc))
 
     protocol = _resolve_protocol(args.protocol)
     # Keep the resolved protocol visible to adapter factories for the full server

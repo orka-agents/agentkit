@@ -400,10 +400,46 @@ deploy/foundry/scripts/local_brokered_conformance_container.sh \
 ## Model-driven tool workflows
 
 Set `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` to let the model choose tools and
-work through a task. AgentKit calls the configured OpenAI-compatible Chat
-Completions model with the static `brokeredTools` schemas. For example, the
-agent can inspect telemetry, use the result to look up an incident, and then
-explain what it found.
+work through a task. `AGENTKIT_MODEL_API` selects the upstream model API:
+
+- `chat_completions` is the default, preserving existing Chat-only backends.
+- `responses` explicitly selects the Responses API for models that need it.
+- Other values fail startup validation. No model-name inference, automatic API
+  fallback, or automatic disabling of reasoning is performed.
+
+For a reasoning-model deployment that requires Responses for function tools:
+
+```sh
+AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1
+AGENTKIT_MODEL_API=responses
+```
+
+This setting controls the upstream model connection, not AgentKit's hosted
+`/responses` endpoint. Both APIs are also available through the direct Pydantic
+AI, Microsoft Agent Framework, and LangGraph adapters, including standalone
+Docker runs. MAF supports both APIs with API-key, token-hook, or Foundry
+project-credential auth. The model backend must support the selected API;
+AgentKit does not silently switch to the other one. Invalid selections fail
+before SDK/auth initialization. In this brokered loop, Chat mode sends `messages` to
+`<model.baseURL>/chat/completions`; Responses mode sends `input` items to
+`<model.baseURL>/responses`. Both expose the same safe static `brokeredTools`
+and preserve Orka's sequential approval and continuation contract. A base URL
+ending in either API endpoint is normalized to the selected API's sibling;
+the startup setting, not the URL suffix, determines the API.
+
+Each request resends the retained transcript. Responses requests use
+`store: false`, retain replayable encrypted reasoning in its original position,
+and preserve assistant message boundaries, phase, and refusal text. Responses
+results must have `status: "completed"`; Chat results with a truncation or other
+non-completion or missing finish reason are rejected. Model output and tool arguments
+remain bounded and validated in either mode.
+
+The selected API is recorded with new pending model-loop state. Resuming that
+state with a different API returns `brokered_model_api_mismatch` before accepting
+the tool result or making another model request. Unmarked legacy model-loop
+state is treated as Chat Completions. Finish pending turns from Responses-only
+development builds before upgrading, because those builds did not record the API.
+`AGENTKIT_MODEL_API` is startup configuration, not a per-turn `input.env` override.
 
 Each operational tool call returns a `function_call` for Orka to execute. After
 Orka sends the matching `function_call_output`, AgentKit resumes the model. It
@@ -414,8 +450,8 @@ returns the cached next response without another model request. File-backed
 state preserves these completed rounds across restarts.
 
 The model can make up to 16 sequential tool calls per user turn. At the limit,
-AgentKit asks for a final answer without tools and rejects any further tool
-call. The model endpoint must support `parallel_tool_calls: false`, which asks
+AgentKit asks for a final answer with `tool_choice: "none"` and rejects any
+further tool call. The model endpoint must support `parallel_tool_calls: false`, which asks
 for one tool call at a time. AgentKit also rejects parallel tool batches if a
 model ignores that setting. AgentKit-owned MCP and direct operational tools
 remain disabled.
