@@ -287,7 +287,11 @@ class BrokeredChatModelLoop:
     ) -> dict[str, Any]:
         # The full transcript is resent each round, so the provider need not retain it.
         if self.model_api == "responses":
-            payload: dict[str, Any] = {"model": self.spec.model.name, "input": _responses_input(messages), "store": False}
+            # Stateless tool continuations need opaque reasoning from this response.
+            payload: dict[str, Any] = {
+                "model": self.spec.model.name, "input": _responses_input(messages), "store": False,
+                "include": ["reasoning.encrypted_content"],
+            }
             url = _responses_url(self.spec.model.base_url)
         else:
             payload = {"model": self.spec.model.name, "messages": _chat_input(messages)}

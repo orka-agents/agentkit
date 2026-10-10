@@ -246,6 +246,7 @@ def test_direct_auto_model_helper_builds_only_initial_responses_candidate(monkey
 
     model.assert_called_once_with(
         "local-model", provider=provider.return_value, settings={"openai_store": False},
+        profile={"openai_supports_phase": True},
     )
     wrapper.assert_not_called()
 
@@ -483,6 +484,54 @@ def test_responses_upstream_does_not_change_chat_serving_contract(monkeypatch):
             })
             assert streamed.status_code == 400
         assert len(requests) == 1 and requests[0]["stream"] is False
+    finally:
+        asyncio.run(http.aclose())
+
+
+@pytest.mark.parametrize("selection", ["responses", "auto", "chat_completions", "auto-chat"])
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
+@pytest.mark.parametrize("model_name", ["local-model", "gpt-5.4"])
+def test_responses_facade_preserves_assistant_phase_on_upstream_wire(monkeypatch, selection, phase, model_name):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto" if selection == "auto-chat" else selection)
+    requests = []
+    model_api = "chat_completions" if selection in {"chat_completions", "auto-chat"} else "responses"
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append((request.url.path, body))
+        if selection == "auto-chat" and request.url.path.endswith("/responses"):
+            return httpx.Response(404, json={"error": {"code": "unsupported_endpoint"}})
+        assert request.url.path.endswith("/responses" if model_api == "responses" else "/chat/completions")
+        return _reply(model_api)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    _inject_http(monkeypatch, http)
+    spec = _spec()
+    spec.model.name = model_name
+    assistant = {"role": "assistant", "content": "Checking the logs."}
+    if phase is not None:
+        assistant["phase"] = phase
+    try:
+        with TestClient(create_app(spec, agent_factory)) as client:
+            response = client.post("/v1/responses", json={
+                "input": [{"role": "user", "content": "Prior request"}, assistant,
+                          {"role": "user", "content": "Anything else?"},
+                          {"role": "assistant", "content": assistant["content"]},
+                          {"role": "user", "content": "Continue."}],
+            })
+            assert response.status_code == 200, response.text
+        assert len(requests) == (2 if selection == "auto-chat" else 1)
+        for path, body in requests:
+            items = body["input"] if path.endswith("/responses") else body["messages"]
+            prior = [item for item in items if item.get("role") == "assistant"]
+            assert len(prior) == 2
+            assert all(item["content"] == assistant["content"] for item in prior)
+            if path.endswith("/responses") and phase is not None:
+                assert prior[0]["phase"] == phase
+            else:
+                assert "phase" not in prior[0]
+            assert "phase" not in prior[1]
+            assert all("phase" not in item for item in items if item.get("role") != "assistant")
     finally:
         asyncio.run(http.aclose())
 

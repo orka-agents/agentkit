@@ -251,6 +251,9 @@ def build_model(
         # response storage or a provider-managed conversation.
         return _CompletedResponsesModel(
             spec.model.name, provider=provider, settings={"openai_store": False},
+            # The facade accepts phase even for custom model names. Do not let
+            # SDK model-name inference discard that caller-provided history.
+            profile={"openai_supports_phase": True},
         )
     # EOF alone must not commit partial text or execute partial tool calls.
     # Without this, pydantic-ai treats a stream that ends without a
@@ -526,7 +529,11 @@ def _to_message_history(request: RunRequest, instructions: str = "") -> list:
         elif turn.role == "system":
             out.append(ModelRequest(parts=[SystemPromptPart(content=turn.text)]))
         elif turn.role == "assistant":
-            out.append(ModelResponse(parts=[TextPart(content=turn.text)]))
+            part = TextPart(content=turn.text)
+            if turn.phase is not None:
+                part.provider_name = "openai"
+                part.provider_details = {"phase": turn.phase}
+            out.append(ModelResponse(parts=[part]))
     return out
 
 

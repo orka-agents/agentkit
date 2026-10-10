@@ -41,7 +41,7 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI as _ChatOpenAI
 from openai import AsyncStream, Stream
 
 from agentkit_serve_common.adapter_support import (
@@ -78,6 +78,7 @@ _DEFAULT_MCP_INIT_TIMEOUT = 120.0
 # Fixed tool results the model sees instead of upstream diagnostics.
 _MCP_TOOL_ERROR = "MCP tool execution failed"
 _INVALID_TOOL_ARGUMENTS = "tool call arguments must be a JSON object"
+_HISTORY_PHASE_KEY = "__agentkit_history_phase__"
 
 
 def _mcp_init_timeout() -> float:
@@ -184,6 +185,30 @@ class _ValidatedResponsesResource:
 
             return call
         return value
+
+
+class ChatOpenAI(_ChatOpenAI):
+    """Preserve history phases even with langchain-openai 1.0's serializer."""
+
+    def _get_request_payload(self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "input" not in payload:
+            return payload
+        assistant_items = iter(
+            item for item in payload["input"]
+            if item.get("type", "message") == "message" and item.get("role") == "assistant"
+        )
+        # Marked client history is a prefix with one message item per assistant
+        # turn. Generated tool/reasoning items must not consume or acquire phases.
+        for message in self._convert_input(input_).to_messages():
+            if not isinstance(message, AIMessage) or _HISTORY_PHASE_KEY not in message.additional_kwargs:
+                continue
+            item = next(assistant_items, None)
+            if item is None:
+                break
+            if (phase := message.additional_kwargs[_HISTORY_PHASE_KEY]) is not None:
+                item.setdefault("phase", phase)
+        return payload
 
 
 def build_model(
@@ -439,7 +464,15 @@ def _to_messages(request: RunRequest) -> list[BaseMessage]:
         elif turn.role == "user":
             messages.append(HumanMessage(content=turn.text))
         elif turn.role == "assistant":
-            messages.append(AIMessage(content=turn.text))
+            # Native Responses serializers read phase from text blocks. Both the
+            # minimum and current Chat serializers strip it from these blocks.
+            content = turn.text if turn.phase is None else [
+                {"type": "text", "text": turn.text, "phase": turn.phase},
+            ]
+            messages.append(AIMessage(
+                content=content,
+                additional_kwargs={_HISTORY_PHASE_KEY: turn.phase},
+            ))
     messages.append(HumanMessage(content=request.prompt))
     return messages
 

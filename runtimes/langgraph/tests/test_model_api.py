@@ -13,11 +13,12 @@ from unittest import mock
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
-from langchain_openai import ChatOpenAI
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from agentkit_serve import agent_factory
+from agentkit_serve.agent_factory import ChatOpenAI
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import ConversationTurn, RunRequest
 from agentkit_serve_common.runtime import AgentRunError
@@ -598,6 +599,150 @@ def test_chat_serving_protocol_and_stream_guard_are_independent_of_upstream_api(
     assert response.json()["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     assert len(requests) == 1
 
+
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
+@pytest.mark.parametrize("selection,upstream_api", [
+    ("responses", "responses"),
+    ("auto", "responses"),
+    ("chat_completions", "chat_completions"),
+    ("auto", "chat_completions"),
+])
+def test_responses_facade_preserves_assistant_phase_only_on_responses_wire(
+    monkeypatch, phase, selection, upstream_api,
+):
+    _select(monkeypatch, selection)
+    payloads = []
+
+    def handle(request):
+        api = "responses" if request.url.path.endswith("/responses") else "chat_completions"
+        payload = _payload(request, api)
+        payloads.append((api, payload))
+        if api == "responses" and upstream_api == "chat_completions":
+            assert selection == "auto"
+            return httpx.Response(404, json={"error": {"code": "unsupported_endpoint"}})
+        assert api == upstream_api
+        return httpx.Response(200, json=_reply(api))
+
+    async def exercise():
+        async with _mock_upstream(monkeypatch, handle):
+            with TestClient(create_app(_spec(), agent_factory)) as client:
+                # Two identical texts with different phases catch positional mixups.
+                history = [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "prior answer", "phase": phase},
+                    {"role": "assistant", "content": [{"type": "output_text", "text": "prior answer"}]},
+                    {"role": "user", "content": "hello"},
+                ]
+                return client.post("/v1/responses", json={"model": "test-model", "input": history})
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200, response.text
+    assert response.json()["output"][0]["content"][0]["text"] == "offline reply"
+    expected_apis = (
+        ["responses", "chat_completions"]
+        if selection == "auto" and upstream_api == "chat_completions" else [upstream_api]
+    )
+    assert [api for api, _ in payloads] == expected_apis
+    for api, payload in payloads:
+        content = "prior answer" if api == "responses" or phase is None else [
+            {"type": "text", "text": "prior answer"},
+        ]
+        assert _history(payload, api) == [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": content},
+            {"role": "assistant", "content": "prior answer"},
+            {"role": "user", "content": "hello"},
+        ]
+        if api == "responses":
+            assistants = [item for item in payload["input"] if item.get("role") == "assistant"]
+            assert len(assistants) == 2
+            if phase is None:
+                assert "phase" not in assistants[0]
+            else:
+                assert assistants[0]["phase"] == phase
+            assert "phase" not in assistants[1]
+            assert all("phase" not in item for item in payload["input"] if item.get("role") != "assistant")
+        else:
+            assert '"phase"' not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("selection", ["responses", "auto"])
+@pytest.mark.parametrize("output_version", ["v0", "responses/v1"])
+def test_responses_history_phase_survives_tool_roundtrip(monkeypatch, selection, output_version):
+    _select(monkeypatch, selection)
+    payloads = []
+    calls = []
+
+    async def echo(text: str):
+        calls.append(text)
+        return "tool reply"
+
+    tool = StructuredTool.from_function(coroutine=echo, name=_TOOL_NAME, description="Echo text.")
+    monkeypatch.setattr(agent_factory.LangGraphRuntime, "_load_tools", mock.AsyncMock(return_value=[tool]))
+
+    def handle(request):
+        payload = _payload(request, "responses")
+        payloads.append(payload)
+        arguments = '{"text":"hello"}' if len(payloads) == 1 else None
+        return httpx.Response(200, json=_reply("responses", arguments=arguments))
+
+    async def exercise():
+        async with _mock_upstream(monkeypatch, handle, output_version=output_version):
+            with TestClient(create_app(_spec(), agent_factory)) as client:
+                return client.post("/v1/responses", json={
+                    "model": "test-model",
+                    "input": [
+                        {"role": "assistant", "content": "prior", "phase": "commentary"},
+                        {"role": "assistant", "content": "prior", "phase": "final_answer"},
+                        {"role": "user", "content": "hello"},
+                    ],
+                })
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200, response.text
+    assert calls == ["hello"]
+    assert len(payloads) == 2
+    for payload in payloads:
+        items = payload["input"]
+        assistants = [item for item in items if item.get("role") == "assistant"]
+        assert [item["phase"] for item in assistants] == ["commentary", "final_answer"]
+        assert all("phase" not in item for item in items if item.get("role") != "assistant")
+    call, output = payloads[-1]["input"][-2:]
+    assert call["type"] == "function_call"
+    assert output["type"] == "function_call_output"
+    assert call["call_id"] == output["call_id"] == "call-1"
+
+
+def test_phase_compatibility_overlay_leaves_generated_items_and_native_phase_intact(monkeypatch):
+    model = ChatOpenAI(model="test-model", api_key="not-needed", use_responses_api=True)
+    messages = agent_factory._to_messages(RunRequest("hello", history=(
+        ConversationTurn("assistant", "prior", phase="commentary"),
+        ConversationTurn("assistant", "prior", phase="final_answer"),
+    )))
+    messages.extend([
+        AIMessage(content=[{"type": "reasoning", "phase": "final_answer"}], tool_calls=[
+            {"name": _TOOL_NAME, "args": {"text": "hello"}, "id": "call-1", "type": "tool_call"},
+        ]),
+        ToolMessage(content="tool reply", tool_call_id="call-1"),
+        AIMessage(content=[{"type": "text", "text": "generated", "phase": "final_answer"}]),
+        HumanMessage(content="next"),
+    ])
+    # Exercise easy role/content items and an already-populated native phase.
+    items = [
+        {"role": "assistant", "content": "prior"},
+        {"type": "message", "role": "assistant", "content": "prior", "phase": "final_answer"},
+        {"type": "reasoning", "summary": []},
+        {"type": "function_call", "call_id": "call-1"},
+        {"type": "function_call_output", "call_id": "call-1", "output": "tool reply"},
+        {"type": "message", "role": "assistant", "content": "generated", "phase": "commentary"},
+    ]
+    expected = [{**items[0], "phase": "commentary"}, *items[1:]]
+    monkeypatch.setattr(agent_factory._ChatOpenAI, "_get_request_payload", lambda *a, **kw: {"input": items})
+
+    assert model._get_request_payload(messages)["input"] == expected
 
 
 def _responses_stream(response, termination, *, done_status=None):

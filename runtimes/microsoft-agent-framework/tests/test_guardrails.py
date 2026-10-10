@@ -237,6 +237,7 @@ def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
     class FakeFoundryClient:
         def __init__(self, **kwargs):
             calls.update(kwargs)
+            self._prepare_message_for_openai = mock.Mock(return_value=[])
 
     monkeypatch.setattr("azure.identity.DefaultAzureCredential", FakeCredential)
     monkeypatch.setattr("agent_framework.foundry.FoundryChatClient", FakeFoundryClient)

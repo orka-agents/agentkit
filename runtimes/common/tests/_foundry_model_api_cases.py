@@ -39,12 +39,13 @@ def _assert_model_request(request: httpx.Request, *, model_api: str | None = Non
         assert request.url.path.endswith("/responses")
         assert "input" in body and "messages" not in body
         assert body["store"] is False
+        assert body["include"] == ["reasoning.encrypted_content"]
         assert not body.get("previous_response_id") and not body.get("conversation")
         assert all(tool["type"] == "function" and "name" in tool for tool in body.get("tools", []))
     else:
         assert request.url.path.endswith("/chat/completions")
         assert "messages" in body and "input" not in body
-        assert "store" not in body
+        assert "store" not in body and "include" not in body
         assert all(tool["type"] == "function" and "function" in tool for tool in body.get("tools", []))
         assert all("phase" not in message and "reasoning" not in message for message in body["messages"])
 

@@ -638,6 +638,8 @@ def test_runtime_owns_model_fallback_credential_and_project_client_without_doubl
             events.append("model-http-close")
 
     class _FoundryClient:
+        _prepare_message_for_openai = mock.Mock(return_value=[])
+
         def __init__(self, **kwargs):
             assert isinstance(kwargs["credential"], _Credential)
             self.project_client = _ProjectClient()
@@ -782,6 +784,8 @@ def test_partial_agent_startup_closes_all_runtime_owned_resources_in_dependency_
             events.append("model-http-close")
 
     class _FoundryClient:
+        _prepare_message_for_openai = mock.Mock(return_value=[])
+
         def __init__(self, **kwargs):
             self.project_client = _ProjectClient()
             self.client = _ModelHTTPClient()
@@ -929,6 +933,8 @@ def test_startup_cancellation_waits_for_all_runtime_owned_resource_cleanup(monke
             events.append("model-http-close")
 
     class _FoundryClient:
+        _prepare_message_for_openai = mock.Mock(return_value=[])
+
         def __init__(self, **kwargs):
             self.project_client = _ProjectClient()
             self.client = _ModelHTTPClient()
@@ -1056,6 +1062,8 @@ def test_runtime_closes_model_fallback_http_client_before_project_and_credential
             events.append("model-http-close")
 
     class _FoundryClient:
+        _prepare_message_for_openai = mock.Mock(return_value=[])
+
         def __init__(self, **kwargs):
             assert isinstance(kwargs["credential"], _Credential)
             self.project_client = _ProjectClient()

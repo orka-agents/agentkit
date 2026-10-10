@@ -296,6 +296,7 @@ def test_project_auth_keeps_model_and_project_lifetimes_for_both_apis(monkeypatc
         def __init__(self, **kwargs):
             self.client = Resource("model")
             self.project_client = Resource("project")
+            self._prepare_message_for_openai = mock.Mock(return_value=[])
 
     class ChatClient:
         def __init__(self, *, model, async_client):
@@ -531,6 +532,7 @@ def test_auto_project_candidate_preserves_owned_resource_cleanup(monkeypatch, mo
             self.client = Resource("model")
             self.client.responses = object()
             self.project_client = Resource("project")
+            self._prepare_message_for_openai = mock.Mock(return_value=[])
 
     class ChatClient:
         STORES_BY_DEFAULT = False
@@ -657,3 +659,126 @@ def test_auto_runtime_first_request_uses_real_responses_client_for_each_auth(mon
         assert token_hook.call_args_list == [mock.call("https://ai.azure.com/.default")] * 2
     else:
         token_hook.assert_not_called()
+
+
+def test_responses_phase_requires_message_serializer():
+    with pytest.raises(agent_factory.AgentBuildError, match="required message serialization hook"):
+        agent_factory._preserve_responses_phase(SimpleNamespace())
+
+
+def _phase_reply(model_api):
+    import httpx
+
+    if model_api == "responses":
+        body = {
+            "id": "resp_phase", "object": "response", "created_at": 1,
+            "model": "test-model", "status": "completed",
+            "output": [{"type": "message", "id": "msg_phase", "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}],
+        }
+    else:
+        body = {
+            "id": "chatcmpl_phase", "object": "chat.completion", "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Done."}}],
+        }
+    return httpx.Response(200, json=body)
+
+
+def _inject_phase_http(monkeypatch, handler, spec, *, foundry=False):
+    import httpx
+    from openai import AsyncOpenAI
+
+    clients = []
+
+    def http_client():
+        # Fallback closes the Responses candidate before constructing Chat.
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        clients.append(client)
+        return client
+
+    def sdk_client(**kwargs):
+        if "http_client" not in kwargs:
+            kwargs["http_client"] = http_client()
+        return AsyncOpenAI(**kwargs, max_retries=0)
+
+    # Keep both MAF clients and SDK serialization real, including auto fallback.
+    monkeypatch.setattr("agent_framework_openai._shared.AsyncOpenAI", sdk_client)
+    if foundry:
+        class Project:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_openai_client(self, **kwargs):
+                return sdk_client(api_key="test-key", base_url=spec.model.base_url, **kwargs)
+
+        monkeypatch.setattr("agent_framework_foundry._chat_client.AIProjectClient", Project)
+        monkeypatch.setattr(
+            "agent_framework_foundry._chat_client.create_foundry_feature_usage_http_client",
+            http_client,
+            raising=False,
+        )
+        monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: object())
+    return clients
+
+
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
+@pytest.mark.parametrize("selection", ["responses", "auto", "chat_completions", "auto-chat"])
+@pytest.mark.parametrize("foundry", [False, True], ids=["openai", "foundry"])
+def test_responses_facade_preserves_assistant_phase_on_upstream_wire(monkeypatch, selection, phase, foundry):
+    import json
+    import httpx
+    from fastapi.testclient import TestClient
+    from agentkit_serve_common.server import create_app
+
+    for name in (
+        "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN", "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
+        "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "auto" if selection == "auto-chat" else selection)
+    spec = _spec(workload_identity=foundry)
+    requests = []
+    expected_api = "chat_completions" if selection in {"chat_completions", "auto-chat"} else "responses"
+
+    def handle(request):
+        requests.append((request.url.path, json.loads(request.content)))
+        if selection == "auto-chat" and request.url.path.endswith("/responses"):
+            return httpx.Response(404, json={"error": {"code": "unsupported_endpoint"}})
+        assert request.url.path.endswith("/responses" if expected_api == "responses" else "/chat/completions")
+        return _phase_reply(expected_api)
+
+    clients = _inject_phase_http(monkeypatch, handle, spec, foundry=foundry)
+    text = "Checking the logs."
+    try:
+        with TestClient(create_app(spec, agent_factory)) as client:
+            response = client.post("/v1/responses", json={
+                "input": [
+                    {"role": "user", "content": "Prior request"},
+                    {"type": "message", "role": "assistant", "phase": phase,
+                     "content": [{"type": "output_text", "text": text}]},
+                    {"role": "user", "content": "Anything else?"},
+                    # Identical unphased text must remain a separate, unphased turn.
+                    {"role": "assistant", "content": text},
+                    {"role": "user", "content": "Continue."},
+                ],
+            })
+            assert response.status_code == 200, response.text
+            assert response.json()["output"][0]["content"][0]["text"] == "Done."
+        assert len(requests) == (2 if selection == "auto-chat" else 1)
+        for path, body in requests:
+            responses = path.endswith("/responses")
+            items = body["input"] if responses else body["messages"]
+            assert [item["role"] for item in items if item["role"] != "system"] == [
+                "user", "assistant", "user", "assistant", "user",
+            ]
+            prior = [item for item in items if item["role"] == "assistant"]
+            expected_content = [{"type": "output_text", "text": text, "annotations": []}] if responses else text
+            assert all(item["content"] == expected_content for item in prior)
+            if responses and phase is not None:
+                assert prior[0]["phase"] == phase
+            else:
+                assert "phase" not in prior[0]
+            assert all("phase" not in item for item in items if item is not prior[0])
+    finally:
+        for http in clients:
+            asyncio.run(http.aclose())

@@ -264,6 +264,25 @@ async def _close_resource(resource: object) -> None:
         await result
 
 
+def _preserve_responses_phase(client) -> None:
+    # OpenAI and Foundry share this serialization hook in the minimum supported
+    # SDK. Message.additional_properties alone is not forwarded to either API.
+    prepare = getattr(client, "_prepare_message_for_openai", None)
+    if not callable(prepare):
+        raise AgentBuildError("Responses client lacks the required message serialization hook")
+
+    def prepare_with_phase(message: Message, **kwargs):
+        items = prepare(message, **kwargs)
+        phase = message.additional_properties.get("phase")
+        if message.role == "assistant" and phase in ("commentary", "final_answer"):
+            for item in items:
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    item["phase"] = phase
+        return items
+
+    client._prepare_message_for_openai = prepare_with_phase
+
+
 def build_client(
     spec: AgentSpec,
     *,
@@ -296,6 +315,8 @@ def build_client(
             base_url=spec.model.base_url,
             api_key=resolve_api_key(spec),
         )
+    if model_api == "responses":
+        _preserve_responses_phase(chat_client)
     if auto_state is not None:
         chat_client.client.responses = auto_state.wrap_responses(chat_client.client.responses, client=chat_client.client)
     return chat_client
@@ -933,7 +954,12 @@ def _result_usage(result: object) -> dict[str, int]:
 def _history_messages(request: RunRequest) -> tuple[Message, ...]:
     """Map a neutral RunRequest's prior turns to MAF messages."""
     return tuple(
-        Message(role=turn.role, contents=[turn.text])
+        Message(
+            role=turn.role,
+            contents=[turn.text],
+            additional_properties={"phase": turn.phase}
+            if turn.role == "assistant" and turn.phase in ("commentary", "final_answer") else None,
+        )
         for turn in request.history
         if turn.role in FORWARDED_ROLES and turn.text
     )

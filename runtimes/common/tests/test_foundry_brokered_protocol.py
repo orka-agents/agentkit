@@ -3545,16 +3545,31 @@ def test_foundry_brokered_model_loop_can_return_final_message_without_tool_call(
     assert fake.requests[0]["tool_choice"] == "auto"
 
 
-@pytest.mark.parametrize("phase", [None, "commentary"])
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
 @pytest.mark.parametrize("persisted", [False, True])
-def test_foundry_brokered_model_loop_preserves_assistant_phase_on_tool_resume(tmp_path, phase, persisted):
+@pytest.mark.parametrize("model_api", ["responses", "auto"])
+def test_foundry_brokered_model_loop_preserves_assistant_phase_on_tool_resume(
+    tmp_path, monkeypatch, phase, persisted, model_api,
+):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", model_api)
+
+    class ConditionalReasoningTransport(_FakeChatTransport):
+        def handler(self, request):
+            payload = json.loads(request.content)
+            # Providers need not return encrypted reasoning unless requested.
+            if "reasoning.encrypted_content" not in payload.get("include", []):
+                for item in self.responses[0]["output"]:
+                    if item.get("type") == "reasoning":
+                        item.pop("encrypted_content", None)
+            return super().handler(request)
+
     assistant = {
         "type": "message", "role": "assistant",
         "content": [{"type": "output_text", "text": "Checking SFO."}],
     }
     if phase is not None:
         assistant["phase"] = phase
-    fake = _FakeChatTransport([
+    fake = ConditionalReasoningTransport([
         {
             "status": "completed", "output": [
                 {"type": "reasoning", "summary": [], "encrypted_content": "opaque-reasoning"},
@@ -3581,6 +3596,8 @@ def test_foundry_brokered_model_loop_preserves_assistant_phase_on_tool_resume(tm
             json=_continuation(initial.json()["id"], call["call_id"], {"approved": True, "output": {"ok": True}}),
         )
     assert final.status_code == 200, final.text
+    assert all(request["store"] is False for request in fake.requests)
+    assert all(request.get("include") == ["reasoning.encrypted_content"] for request in fake.requests)
     expected = {"type": "message", "role": "assistant", "content": "Checking SFO."}
     if phase is not None:
         expected["phase"] = phase
