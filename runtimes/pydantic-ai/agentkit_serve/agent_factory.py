@@ -223,6 +223,10 @@ class PydanticRuntime:
         return await run_agent(self.agent, request, instructions=self.instructions)
 
 
+def supports_a2a() -> bool:
+    return True
+
+
 def supports_brokered_read() -> bool:
     return offline_orka_echo_enabled()
 

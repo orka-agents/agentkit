@@ -53,6 +53,7 @@ RUN python -m venv /opt/agentkit \
     && /opt/agentkit/bin/pip install --upgrade pip \
     && /opt/agentkit/bin/pip install ./common \
     && /opt/agentkit/bin/pip install ./pydantic-ai \
+    && /opt/agentkit/bin/python -c 'from a2a.server.apps import A2AFastAPIApplication' \
     && { /opt/agentkit/bin/agentkit-serve --help >/dev/null 2>&1 || true; }
 
 # --- non-root user + agent config mount point --------------------------------

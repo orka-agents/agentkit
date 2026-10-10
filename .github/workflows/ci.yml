@@ -51,6 +51,8 @@ jobs:
           shellcheck -x scripts/orka-harness-v2-e2e.sh
           bash -n scripts/parity-container-smoke.sh
           shellcheck scripts/parity-container-smoke.sh
+          bash -n scripts/a2a-container-smoke.sh
+          shellcheck scripts/a2a-container-smoke.sh
           bash -n scripts/generate-agentsessions-stubs.sh
           shellcheck scripts/generate-agentsessions-stubs.sh
           bash -n scripts/agentsessions-e2e.sh
@@ -282,6 +284,36 @@ jobs:
         working-directory: ${{ matrix.path }}
         run: .venv/bin/python -m pytest -q
 
+  python-a2a:
+    name: A2A SDK conformance (${{ matrix.resolution }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        resolution: [highest, lowest-direct]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Install A2A extra
+        working-directory: runtimes/common
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --resolution "${{ matrix.resolution }}" -e '.[dev,a2a]'
+
+      - name: Exercise A2A server with SDK client
+        working-directory: runtimes/common
+        run: .venv/bin/python -m pytest -q tests/test_a2a*.py
+
   container-build:
     name: Container build and offline smoke
     runs-on: ubuntu-latest
@@ -493,6 +525,12 @@ jobs:
           smoke agentkit-smoke-maf maf-agent:ci 18081
           smoke agentkit-smoke-langgraph langgraph-agent:ci 18082
           orka_smoke agentkit-smoke-orka hello-agent:ci 18083
+
+      - name: Built-image A2A SDK conformance smoke
+        run: |
+          make build-test-agent TAG=ci BUILDER= \
+            FIXTURE=test/agentkitfile-a2a.yaml AGENT_IMAGE=agentkit-a2a:ci
+          bash scripts/a2a-container-smoke.sh agentkit-a2a:ci
 
       - name: Setup Go for agentsessions replay proof
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
