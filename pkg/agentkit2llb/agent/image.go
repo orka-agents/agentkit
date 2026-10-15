@@ -79,3 +79,90 @@ func NewImageConfig(agent effective.Agent, platform *specs.Platform) *specs.Imag
 
 	return img
 }
+
+// NewComposedImageConfig preserves a narrow, safe subset of the selected base
+// image metadata while keeping AgentKit authoritative over process execution.
+func NewComposedImageConfig(agent effective.Agent, platform *specs.Platform, composition Composition) *specs.Image {
+	img := NewImageConfig(agent, platform)
+	img.Config.User = composition.User
+
+	baseEnv := allowedBaseEnv(composition.BaseImage.Config.Env)
+	basePath := system.DefaultPathEnv(utils.PlatformLinux)
+	for _, entry := range baseEnv {
+		if key, value, ok := strings.Cut(entry, "="); ok && strings.EqualFold(key, "PATH") {
+			basePath = value
+			break
+		}
+	}
+	img.Config.Env = mergeEnv(baseEnv, []string{
+		"PATH=" + utils.AgentKitRoot + "/bin:" + basePath,
+		"AGENTKIT_BIND=127.0.0.1",
+		"HOME=/tmp",
+		"PYTHONPATH=" + utils.AgentKitRoot + "/packages",
+		"PYTHONUNBUFFERED=1",
+		"SHELL=" + utils.AgentKitRoot + "/bin/sh",
+		"npm_config_script_shell=" + utils.AgentKitRoot + "/bin/sh",
+	})
+
+	for key, value := range composition.BaseImage.Config.Labels {
+		if _, authoritative := img.Config.Labels[key]; !authoritative {
+			img.Config.Labels[key] = value
+		}
+	}
+	img.Config.Labels["org.opencontainers.image.base.name"] = composition.BaseName
+	img.Config.Labels["org.opencontainers.image.base.digest"] = composition.BaseDigest
+	img.Config.Labels[utils.LabelPrefix+".harness.name"] = composition.HarnessName
+	img.Config.Labels[utils.LabelPrefix+".harness.digest"] = composition.HarnessDigest
+
+	return img
+}
+
+func allowedBaseEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		if upper == "PATH" ||
+			upper == "LANG" ||
+			upper == "LANGUAGE" ||
+			upper == "TZ" ||
+			upper == "HTTP_PROXY" ||
+			upper == "HTTPS_PROXY" ||
+			upper == "NO_PROXY" ||
+			upper == "SSL_CERT_FILE" ||
+			upper == "SSL_CERT_DIR" ||
+			strings.HasPrefix(upper, "LC_") {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func mergeEnv(base, overrides []string) []string {
+	values := make(map[string]string, len(base)+len(overrides))
+	order := make([]string, 0, len(base)+len(overrides))
+	add := func(entry string) {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			return
+		}
+		if _, exists := values[key]; !exists {
+			order = append(order, key)
+		}
+		values[key] = entry
+	}
+	for _, entry := range base {
+		add(entry)
+	}
+	for _, entry := range overrides {
+		add(entry)
+	}
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		out = append(out, values[key])
+	}
+	return out
+}

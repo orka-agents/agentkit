@@ -269,11 +269,42 @@ AgentKit supports the normal BuildKit frontend options used by `docker buildx`:
 
 The only output kind registered by the router is an OCI image.
 
+### Experimental split-image composition
+
+The frontend accepts `baseImage` and `harnessImage` as an experimental paired
+alternative to the combined `adapter` image:
+
+```sh
+docker buildx build . -f test/agentkitfile-hello.yaml \
+  --build-arg baseImage=ubuntu:24.04 \
+  --build-arg harnessImage=agentkit-harness-pydantic-ai:test
+```
+
+Both inputs are required together and cannot be combined with `adapter`. AgentKit
+resolves both images for the target platform, pins the resolved digests, validates
+the harness labels, copies only the declared harness artifact onto the base, and
+then generates `/agent/agent.yaml`. AgentKit remains authoritative over the final
+entrypoint, command, exposed ports, runtime labels, and generated configuration.
+
+The harness image must declare:
+
+- `io.github.orka-agents.agentkit.harness.version=1`
+- `io.github.orka-agents.agentkit.harness.runtime=<Agentkitfile runtime>`
+- `io.github.orka-agents.agentkit.harness.artifact=<absolute artifact path>`
+
+The base image user must be root or numeric. Root and an unset user map to
+`1000:1000`; a positive numeric UID or `UID:GID` is preserved. Only a narrow
+allowlist of base environment values is inherited. Harness Python, Node, package
+tools, shell, and native dependencies must be relocatable within the declared
+artifact. This interface remains a spike and does not yet promise arbitrary base
+image compatibility, especially for native-library differences.
+
 ## What gets baked
 
 The built image contains:
 
-- the selected runtime adapter filesystem,
+- either the selected runtime adapter filesystem or the experimentally composed
+  base and harness filesystems,
 - `/agent/agent.yaml`, rendered from the effective Agent,
 - an entrypoint of `/opt/agentkit/bin/agentkit-serve --config /agent/agent.yaml`,
 - non-root user `1000:1000`,

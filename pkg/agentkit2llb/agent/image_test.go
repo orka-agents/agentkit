@@ -141,3 +141,67 @@ func TestNewImageConfigPreservesEffectivePort(t *testing.T) {
 		t.Fatalf("ExposedPorts = %#v, did not want Foundry default when explicit port is set", img.Config.ExposedPorts)
 	}
 }
+
+func TestNewComposedImageConfigUsesControlledBaseMetadata(t *testing.T) {
+	platform := &specs.Platform{OS: "linux", Architecture: utils.PlatformARM64}
+	base := &specs.Image{
+		Config: specs.ImageConfig{
+			User: "65532",
+			Env: []string{
+				"Path=/custom/bin",
+				"LANG=C.UTF-8",
+				"HTTP_PROXY=http://proxy.example",
+				"PYTHONHOME=/unsafe",
+				"LD_PRELOAD=/unsafe.so",
+			},
+			Labels: map[string]string{
+				"com.example.base":             "kept",
+				config.ImageLabelNativeRuntime: "base-controlled",
+			},
+		},
+	}
+	composition := Composition{
+		User:          "65532:65532",
+		BaseImage:     base,
+		BaseName:      "registry.example/base:latest",
+		BaseDigest:    "sha256:base",
+		HarnessName:   "registry.example/harness:latest",
+		HarnessDigest: "sha256:harness",
+	}
+
+	img := NewComposedImageConfig(imageAgent(runtimes.PydanticAI, 0), platform, composition)
+
+	if img.Config.User != "65532:65532" {
+		t.Fatalf("User = %q", img.Config.User)
+	}
+	env := strings.Join(img.Config.Env, "\n")
+	for _, want := range []string{
+		"PATH=/opt/agentkit/bin:/custom/bin",
+		"LANG=C.UTF-8",
+		"HTTP_PROXY=http://proxy.example",
+		"HOME=/tmp",
+		"PYTHONPATH=/opt/agentkit/packages",
+		"SHELL=/opt/agentkit/bin/sh",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("Env = %q, want %q", env, want)
+		}
+	}
+	for _, unwanted := range []string{"PYTHONHOME=", "LD_PRELOAD="} {
+		if strings.Contains(env, unwanted) {
+			t.Errorf("Env = %q, did not want %q", env, unwanted)
+		}
+	}
+	if got := img.Config.Labels["com.example.base"]; got != "kept" {
+		t.Fatalf("base label = %q", got)
+	}
+	if got := img.Config.Labels[config.ImageLabelNativeRuntime]; got != runtimes.PydanticAI {
+		t.Fatalf("runtime label = %q", got)
+	}
+	if got := img.Config.Labels["org.opencontainers.image.base.digest"]; got != "sha256:base" {
+		t.Fatalf("base digest = %q", got)
+	}
+	if got := img.Config.Labels[utils.LabelPrefix+".harness.digest"]; got != "sha256:harness" {
+		t.Fatalf("harness digest = %q", got)
+	}
+}
