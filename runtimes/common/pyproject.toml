@@ -33,6 +33,8 @@ agentkit-foundry-brokered = "agentkit_serve_common.foundry_brokered_cli:main"
 agentkit-foundry-conformance = "agentkit_serve_common.foundry_conformance:main"
 
 [project.optional-dependencies]
+# Pin the 0.3 implementation qualified against kagent v0.10.3, not the v1 SDK.
+a2a = ["a2a-sdk[http-server]==0.3.26"]
 foundry-conformance = ["azure-ai-agentserver-responses>=1.0.0b8,<2"]
 # Starlette/FastAPI TestClient currently imports the httpx2 compatibility package.
 # Keep the Foundry SDK here as well because the common test suite exercises the

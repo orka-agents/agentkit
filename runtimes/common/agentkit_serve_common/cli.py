@@ -13,6 +13,7 @@ Protocol modes:
 * ``orka``: observed-mode ``orka.harness.v1`` over HTTP+SSE.
 * ``acp``: Orka-owned ACP protocol v1 over newline-delimited JSON-RPC on stdio.
 * ``agentsessions``: keyless native protobuf Harness SPI over gRPC (h2c).
+* ``a2a``: text-only A2A 0.3 JSON-RPC and task-lifecycle SSE (Pydantic AI).
 
 Network posture:
 
@@ -52,7 +53,7 @@ from .server import create_app
 
 # Hosts that mean "loopback only" — a bind to any of these needs no auth token.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
-_PROTOCOLS = frozenset({"acp", "agentsessions", "openai", "foundry", "orka"})
+_PROTOCOLS = frozenset({"a2a", "acp", "agentsessions", "openai", "foundry", "orka"})
 
 DEFAULT_CONFIG_PATH = "/agent/agent.yaml"
 DEFAULT_PORT = 8080
@@ -129,6 +130,19 @@ def _create_protocol_app(protocol: str, spec, factory: RuntimeFactory, auth_toke
         return create_foundry_app(spec, factory, auth_token=auth_token)
     if protocol == "orka":
         return create_orka_app(spec, factory, auth_token=auth_token)
+    if protocol == "a2a":
+        # Other protocols do not need the optional SDK, including in adapter images.
+        try:
+            from .a2a import create_a2a_app
+        except ModuleNotFoundError as exc:
+            if exc.name == "a2a" or (exc.name and exc.name.startswith("a2a.")):
+                _fail("A2A requires the agentkit-serve-common[a2a] extra")
+            raise
+        url = os.environ.get("AGENTKIT_A2A_URL") or f"http://localhost:{_resolve_port(protocol, spec.expose.port)}/"
+        try:
+            return create_a2a_app(spec, factory, auth_token=auth_token, advertised_url=url)
+        except ValueError as exc:
+            _fail(str(exc))
     raise AssertionError(f"unknown protocol: {protocol}")
 
 
@@ -142,6 +156,10 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
     # are intentionally adapter-owned and read AGENTKIT_PROTOCOL when a turn later
     # builds a runtime session.
     os.environ["AGENTKIT_PROTOCOL"] = protocol
+    if protocol == "a2a":
+        supports_a2a = getattr(factory, "supports_a2a", None)
+        if supports_a2a is None or not supports_a2a():
+            _fail("this runtime adapter does not support A2A")
     if protocol == "acp":
         try:
             spec = load_verified_acp_runtime_binding(args.config)
@@ -180,6 +198,9 @@ def run(factory: RuntimeFactory, argv: list[str] | None = None) -> None:
             f"AGENTKIT_AUTH_TOKEN to require `Authorization: Bearer <token>` on "
             f"protected endpoints, or bind 127.0.0.1 (the default) for loopback-only access"
         )
+
+    if protocol == "a2a" and not _is_loopback(bind) and not os.environ.get("AGENTKIT_A2A_URL"):
+        _fail("non-loopback A2A requires AGENTKIT_A2A_URL for client discovery")
 
     if binding is not None:
         # Optional, explicit per-Start capability. No default provider runtime

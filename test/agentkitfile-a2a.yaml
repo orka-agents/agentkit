@@ -1,0 +1,13 @@
+#syntax=agentkit:test
+apiVersion: v1alpha1
+kind: Agent
+metadata:
+  name: a2a-smoke
+runtime: pydantic-ai
+model:
+  provider: openai-compatible
+  baseURL: http://model:8081/v1
+  name: fixture
+instructions: Answer the user.
+expose:
+  openai: true
