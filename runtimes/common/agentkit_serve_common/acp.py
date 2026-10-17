@@ -574,10 +574,12 @@ class ACPStdioServer:
     def _initialize(self, params: Any) -> dict[str, Any]:
         request = _required_object(params)
         version = request.get("protocolVersion")
-        if type(version) is not int or version != ACP_PROTOCOL_VERSION:
+        # Answer with the version this agent implements. The client decides
+        # whether that is new enough. Valid ACP version numbers are 0 through 65535.
+        if type(version) is not int or version < 0 or version > 65535:
             raise ACPProtocolError(
                 _INVALID_PARAMS,
-                f"protocolVersion must be {ACP_PROTOCOL_VERSION}",
+                "protocolVersion must be an integer from 0 to 65535",
             )
         self.initialized = True
         mcp_capabilities: dict[str, bool] = {"http": True} if self.http_mcp else {}
