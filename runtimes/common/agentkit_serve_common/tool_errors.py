@@ -33,7 +33,10 @@ def orka_tool_error_details(value: object) -> tuple[str, str] | None:
     if message is None:
         return None
     if code in _CONTROLLER_SUMMARY_CODES:
-        message = _controller_summary(value.get("message")) or message
+        # Orka's broker result carries the summary in "error"; hosted
+        # continuations relay it as "message".
+        summary = _controller_summary(value.get("error")) or _controller_summary(value.get("message"))
+        message = summary or message
     return code, message
 
 

@@ -109,7 +109,11 @@ def test_approved_call_without_effect_continues_with_the_controller_summary(monk
         no_effect = types.CallToolResult(
             isError=True,
             content=[types.TextContent(type="text", text=_PRIVATE)],
-            structuredContent={"code": "tool_failed_without_effect", "message": summary, "detail": _PRIVATE},
+            # The exact result shape Orka's broker returns for a refused approved call.
+            structuredContent={
+                "isError": True, "code": "tool_failed_without_effect",
+                "approvalID": "acp-tool-approval-v2:sha256:1", "error": summary, "detail": _PRIVATE,
+            },
         )
         async with AsyncExitStack() as stack:
             agent, server, session, model = await _setup(stack, monkeypatch, [no_effect])
