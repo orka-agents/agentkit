@@ -28,7 +28,6 @@ dependencies = [
 ]
 
 [project.scripts]
-agentkit-brokered-tools = "agentkit_serve_common.brokered:main"
 agentkit-foundry-brokered = "agentkit_serve_common.foundry_brokered_cli:main"
 agentkit-foundry-conformance = "agentkit_serve_common.foundry_conformance:main"
 

@@ -11,6 +11,7 @@ const (
 	testTargetFlag           = "--target"
 	testNameFlag             = "--name"
 	testExternalEndpointFlag = "--external-endpoint"
+	testExampleEndpoint      = "http://example.invalid"
 )
 
 func TestOrkaAgentRuntimeExternalEndpoint(t *testing.T) {
@@ -70,7 +71,7 @@ func TestOrkaAgentRuntimeValidation(t *testing.T) {
 		t.Fatalf("expected image unsupported error, got %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{testTargetFlag, "other", testNameFlag, testRuntimeName, testExternalEndpointFlag, "http://example.invalid"}, &stdout, &stderr)
+	code := RunCLI([]string{testTargetFlag, "other", testNameFlag, testRuntimeName, testExternalEndpointFlag, testExampleEndpoint}, &stdout, &stderr)
 	if code == 0 || !strings.Contains(stderr.String(), "unsupported --target") {
 		t.Fatalf("RunCLI() code=%d stderr=%q", code, stderr.String())
 	}
