@@ -38,6 +38,37 @@ strictly decodes the full schema. This means:
 - Unknown or misspelled fields fail the build with line/column context.
 - Validation reports all detected schema problems together where possible.
 
+## Extension fields (`x-`)
+
+A field whose name starts with `x-` or `X-`, at any level of the file, is
+accepted and ignored — the same convention Docker Compose and OpenAPI use.
+Two common uses:
+
+- **Reusing values with YAML anchors.** No field exists to hold a value you
+  only want to reuse, so define it inside an `x-` field with `&name` and
+  reference it elsewhere with `*name`.
+- **Notes for other tooling.** An owner, a cost center, or settings another
+  tool reads from the same file, without loosening the strict-decode typo
+  check for every other field.
+
+```yaml
+x-owner: platform-team
+x-proxy-env: &proxy-env [HTTP_PROXY, HTTPS_PROXY, NO_PROXY]
+tools:
+  - name: fetch
+    command: ["mcp-server-fetch"]
+    env: *proxy-env
+  - name: search
+    command: ["mcp-server-search"]
+    env: *proxy-env
+```
+
+`x-` fields are never copied anywhere: not into `/agent/agent.yaml`, not into
+image labels. A key starting with `x-` inside a free-form map that already
+accepts any key, such as `metadata.labels`, is unaffected — it is kept as an
+ordinary key, since only real Agentkitfile fields get the extension-prefix
+exception. Every other unknown or misspelled field still fails the build.
+
 ## Fields
 
 ### `metadata`

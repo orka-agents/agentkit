@@ -7,4 +7,14 @@ client-visible behavior as every other adapter.
 
 from __future__ import annotations
 
+import pytest
+
 from agentkit_serve_common.parity import *  # noqa: F401,F403
+
+
+@pytest.fixture
+def openai_client_factory():
+    # Model SDK imports stay in adapter-owned tests, outside the shared core.
+    from openai import OpenAI
+
+    return OpenAI

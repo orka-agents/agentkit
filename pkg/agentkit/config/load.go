@@ -86,10 +86,21 @@ func probeKind(b []byte) (string, error) {
 }
 
 func decodeStrict(b []byte, out any) error {
-	if err := yaml.UnmarshalWithOptions(b, out, yaml.Strict()); err != nil {
+	if err := yaml.UnmarshalWithOptions(b, out, strictDecodeOptions()...); err != nil {
 		return fmt.Errorf("parsing agentkitfile: %w", formatYAMLError(b, err))
 	}
 	return nil
+}
+
+// strictDecodeOptions are the decode options used everywhere an agentkitfile
+// (or a fragment of one, such as a mapping-form Source) is strict-unmarshaled.
+// Strict() turns an unknown field into a load-time error; AllowFieldPrefixes
+// carves out an exception for x-/X- fields, following the Docker Compose and
+// OpenAPI convention for reusable values (YAML anchors) and tool-specific
+// notes that AgentKit itself ignores. See the "x- fields" section of
+// docs/agentkitfile.md.
+func strictDecodeOptions() []yaml.DecodeOption {
+	return []yaml.DecodeOption{yaml.Strict(), yaml.AllowFieldPrefixes("x-", "X-")}
 }
 
 // formatYAMLError enriches a goccy decode error with line:column context.

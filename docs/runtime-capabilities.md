@@ -51,6 +51,15 @@ for the qualified direct MAF and hosted Foundry paths.
 
 ## Current support
 
+All three adapters serve both `POST /v1/chat/completions` and
+`POST /v1/responses` in `AGENTKIT_PROTOCOL=openai`. They share one listener,
+runtime session, baked tools, auth, and lifecycle; no new protocol or capability
+flag is required. Generic Responses is synchronous, stateless, and text-only,
+with client-supplied message history and completed assistant text and usage.
+It rejects unsupported features before execution, as defined in
+[the HTTP contract](agent-abi.md#served-http-contract). This does not change
+`foundry-responses-minimal` or Foundry/brokered continuation support.
+
 | Runtime | Capabilities |
 |---|---|
 | `pydantic-ai` | `stdio-mcp`, `streamable-http-mcp`, `foundry-invocations-protocol`, `foundry-responses-minimal`, `orka-harness-v1`, `orka-observed-tools` |
@@ -74,7 +83,7 @@ read/write/coordination and `/continue` behind
 advertise observed mode only. Foundry hosted `/responses` can also exercise a
 deterministic brokered function-call loop from static `brokeredTools`. For
 A4/A5 fallback validation, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1` enables a
-lower-level OpenAI-compatible chat-completions loop that exposes static safe
+lower-level OpenAI-compatible model loop that exposes static safe
 brokered schemas as function tools, emits hosted Responses `function_call`
 items, and resumes the model with Orka-provided `function_call_output`. Orka
 remains responsible for coordination policy,
@@ -83,6 +92,34 @@ adapter brokered hooks are still intentionally gated: today the brokered profile
 are validated through the offline echo/conformance runtime, while real model
 adapters should only enable those gates after their native pause/resume/tool-output
 hooks have matching conformance coverage.
+
+`AGENTKIT_MODEL_API` is a shared startup selector for the upstream model API.
+All three runtime adapters and the Foundry brokered model loop support
+`chat_completions`, the default, explicit `responses`, and opt-in `auto`.
+This choice is independent of local/container deployment, inbound HTTP/ACP
+protocol, and MAF model auth mode.
+MAF supports both APIs with API keys, token hooks, and its Azure project-credential
+fallback. LangGraph explicitly sets its SDK transport so ambient LangChain
+settings cannot override this selector.
+
+Explicit Responses requires a backend that implements `/responses`; explicit
+Chat requires `/chat/completions`. Neither explicit selector falls back. Use
+`AGENTKIT_MODEL_API=auto` to send the first real request to Responses without a
+separate probe. Only a recognized initial endpoint/API rejection allows one
+Chat retry. The concrete choice is cached per runtime/backend/model lifetime;
+acceptance locks Responses even if a stream or output later fails. Unknown
+404s, missing models, auth/rate-limit errors, timeouts, and generic 5xx failures
+never trigger fallback. History, tools, and upstream Responses `store: false`
+are preserved, and rejected Responses resources close before Chat starts.
+See [the exact rejection rules](runtime-adapters.md#model-endpoint-compatibility).
+
+Foundry brokered auto persists the concrete API for continuation and restores
+it on resume. Explicit mismatch protections remain in place. Both inbound
+routes remain available with every selector. Invalid selector values fail
+before client/auth initialization. The separate `agentsessions` host-mediated
+model contract remains Chat-only. Native Anthropic
+Messages is not supported. This selector does not change the agent.yaml model
+ABI or the endpoints AgentKit exposes.
 
 ## Brokered runtime feasibility decisions
 

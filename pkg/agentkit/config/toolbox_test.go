@@ -220,3 +220,18 @@ func TestAgentLoaderRejectsToolbox(t *testing.T) {
 		t.Fatalf("NewFromBytes error = %v", err)
 	}
 }
+
+func TestToolboxAcceptsExtensionFields(t *testing.T) {
+	in := strings.Replace(validToolboxYAML(), "spec:\n", `x-yq-sha256: &yq-sha "`+toolboxTestSHA256A+`"
+spec:
+  x-note: shared checksums live in x- fields
+`, 1)
+	in = strings.Replace(in, `sha256: "`+toolboxTestSHA256A+`"}`+"\n          linux/arm64", `sha256: *yq-sha}`+"\n          linux/arm64", 1)
+	cfg := loadToolbox(t, in)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := cfg.Spec.Tools[0].Source.Download["linux/amd64"].SHA256; got != toolboxTestSHA256A {
+		t.Fatalf("anchored sha256 = %q", got)
+	}
+}

@@ -37,6 +37,7 @@ from typing import Any, Mapping
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from .adapter_support import MODEL_APIS, ModelAPI
 from .brokered import brokered_tool_definitions
 from .config import AgentSpec, _unsafe_brokered_key, _unsafe_brokered_text
 from .foundry_model_loop import (
@@ -48,6 +49,10 @@ from .model_errors import normalized_model_error_details
 from .foundry_streaming import BrokeredResponseStream, brokered_stream_response
 from .conversation import FORWARDED_ROLES, ConversationTurn, RunRequest
 from .runtime import AgentRunError, BrokeredToolDefinition, RunResult, RuntimeFactory, RuntimeHealth
+from .responses import (
+    responses_payload,
+    responses_usage as _responses_usage,
+)
 from .server import make_auth_dependency
 from .tool_errors import orka_tool_error_details
 
@@ -132,18 +137,6 @@ def _usage(result: RunResult) -> dict[str, int]:
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
-    }
-
-
-def _responses_usage(result: RunResult | None = None, usage: Mapping[str, int] | None = None) -> dict[str, int]:
-    raw = dict(usage or (result.usage if result is not None else {}) or {})
-    input_tokens = int(raw.get("input_tokens", raw.get("prompt_tokens", 0)) or 0)
-    output_tokens = int(raw.get("output_tokens", raw.get("completion_tokens", 0)) or 0)
-    total_tokens = int(raw.get("total_tokens", input_tokens + output_tokens) or 0)
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
     }
 
 
@@ -378,9 +371,12 @@ def _responses_input_to_run_request(value: Any, *, session_id: str | None) -> Ru
         history: list[ConversationTurn] = []
         for item in value:
             role = str(item.get("role") or "")
+            phase = item.get("phase") if role == "assistant" else None
+            if phase not in (None, "commentary", "final_answer"):
+                raise ValueError("Responses assistant phase must be commentary or final_answer")
             text = _responses_content_to_text(item.get("content"))
             if role in FORWARDED_ROLES and text:
-                history.append(ConversationTurn(role=role, text=text))
+                history.append(ConversationTurn(role=role, text=text, phase=phase))
         if not history:
             return RunRequest(prompt="", session_id=session_id)
         last = history[-1]
@@ -415,33 +411,16 @@ def _responses_payload(
     created_at: int | None = None,
 ) -> dict[str, Any]:
     response_id = response_id or _new_response_id(previous_response_id)
-    message_id = _new_message_id(response_id)
-    payload: dict[str, Any] = {
-        "id": response_id,
-        "object": "response",
-        "created_at": int(time.time()) if created_at is None else created_at,
-        "status": "completed",
-        "model": spec.model.name,
-        "output": [
-            {
-                "id": message_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": result.text,
-                        "annotations": [],
-                    }
-                ],
-                "response_id": response_id,
-            }
-        ],
-        "usage": _responses_usage(result),
-    }
-    if previous_response_id:
-        payload["previous_response_id"] = previous_response_id
+    payload = responses_payload(
+        spec.model.name,
+        result,
+        previous_response_id=previous_response_id,
+        response_id=response_id,
+        message_id=_new_message_id(response_id),
+        created_at=created_at,
+    )
+    # The hosted SDK associates each message with its Foundry response ID.
+    payload["output"][0]["response_id"] = response_id
     return payload
 
 
@@ -465,6 +444,7 @@ class _HostedResponseState:
     final_payload: dict[str, Any] | None = None
     terminal_error: str | None = None
     model_messages: list[dict[str, Any]] | None = None
+    model_api: ModelAPI | None = None
     initial_usage: dict[str, int] = field(default_factory=dict)
     final_persistence_pending: bool = False
     # All rounds share one bounded store entry. A completed round retains its
@@ -577,6 +557,8 @@ def _state_to_payload(state: _HostedResponseState) -> dict[str, Any]:
         "modelMessages": state.model_messages,
         "initialUsage": dict(state.initial_usage),
     }
+    if state.model_api is not None:
+        payload["modelAPI"] = state.model_api
     if state.terminal_error is not None:
         payload["terminalError"] = state.terminal_error
     if state.response_calls:
@@ -613,6 +595,10 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     final_payload = data.get("finalPayload")
     terminal_error = data.get("terminalError")
     model_messages = data.get("modelMessages")
+    # Unmarked released model-loop state predates Responses support.
+    model_api = data.get("modelAPI", "chat_completions" if model_messages is not None else None)
+    if model_api is not None and model_api not in MODEL_APIS:
+        raise ValueError("stored modelAPI must be chat_completions or responses")
     initial_usage = data.get("initialUsage", {})
     response_calls = data.get("responseCalls", {})
     continuation_payloads = data.get("continuationPayloads", {})
@@ -622,8 +608,11 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
     if not isinstance(continuation_payloads, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in continuation_payloads.items()):
         raise ValueError("stored continuationPayloads must map call IDs to response objects")
     if not isinstance(conversation_history, list) or not all(
-        isinstance(turn, dict) and set(turn) == {"role", "content"}
+        isinstance(turn, dict) and set(turn) in ({"role", "content"}, {"role", "content", "phase"})
         and turn["role"] in {"user", "assistant"} and isinstance(turn["content"], str)
+        and ("phase" not in turn or (
+            turn["role"] == "assistant" and turn["phase"] in (None, "commentary", "final_answer")
+        ))
         for turn in conversation_history
     ):
         raise ValueError("stored conversationHistory must contain user and assistant text")
@@ -668,6 +657,7 @@ def _state_from_payload(data: Mapping[str, Any]) -> _HostedResponseState:
         final_payload=final_payload,
         terminal_error=terminal_error,
         model_messages=model_messages,
+        model_api=model_api,
         initial_usage={str(key): int(value or 0) for key, value in initial_usage.items()},
         response_calls=response_calls,
         continuation_payloads=continuation_payloads,
@@ -2259,7 +2249,10 @@ def _model_pending_call(
 def _bounded_conversation_history(messages: list[dict[str, Any]], *, max_bytes: int) -> list[dict[str, str]]:
     """Retain complete recent exchanges, without system prompts or tool data."""
     turns = [
-        {"role": message["role"], "content": message["content"]}
+        {
+            "role": message["role"], "content": message["content"],
+            **({"phase": message["phase"]} if message.get("phase") is not None else {}),
+        }
         for message in messages
         if message.get("role") in {"user", "assistant"}
         and isinstance(message.get("content"), str) and message["content"]
@@ -2576,6 +2569,14 @@ async def _handle_brokered_continuation(
             status=503,
             code="brokered_model_loop_unavailable",
         )
+    if state.model_messages is not None and model_loop is not None:
+        if model_loop.model_api_selection == "auto":
+            model_loop = model_loop.for_model_api(state.model_api or "chat_completions")
+        elif (state.model_api or "chat_completions") != model_loop.model_api:
+            return _error(
+                "pending response requires the model API it started with",
+                status=409, code="brokered_model_api_mismatch",
+            )
     if state.status != "pending":
         return _error("previous response is not pending a tool result", status=409, code="response_not_pending")
 
@@ -2585,6 +2586,7 @@ async def _handle_brokered_continuation(
             model_loop.validate_static_credentials()
         except AgentRunError as exc:
             return _brokered_model_run_error(exc)
+        state.model_api = model_loop.model_api
         state.accepted_output_digests[call_id] = output_digest
         state.accepted_output_sizes[call_id] = accepted_output_size
         state.status = "resuming"
@@ -2947,7 +2949,8 @@ def create_foundry_app(
             return _error(str(exc), status=400, code="invalid_input")
         if model_loop is not None and session_id and previous_state is not None:
             run_request = replace(run_request, history=(
-                *(ConversationTurn(role=turn["role"], text=turn["content"]) for turn in previous_state.conversation_history),
+                *(ConversationTurn(role=turn["role"], text=turn["content"], phase=turn.get("phase"))
+                  for turn in previous_state.conversation_history),
                 *run_request.history,
             ))
 
@@ -3054,6 +3057,7 @@ def create_foundry_app(
                         pending_calls={call_id: call},
                         expires_at=time.time() + response_states.ttl_seconds,
                         model_messages=model_result.messages,
+                        model_api=model_loop.model_api,
                         initial_usage=dict(model_result.usage),
                     )
                     try:

@@ -44,7 +44,7 @@ func (s *Source) UnmarshalYAML(b []byte) error {
 
 	// Fall back to the mapping form: `instructions: { file: ./prompt.md }`.
 	var aux sourceStruct
-	if err := yaml.UnmarshalWithOptions(b, &aux, yaml.Strict()); err != nil {
+	if err := yaml.UnmarshalWithOptions(b, &aux, strictDecodeOptions()...); err != nil {
 		return fmt.Errorf("instructions/source must be a string or a {inline|file} mapping: %w", err)
 	}
 	s.Inline = aux.Inline

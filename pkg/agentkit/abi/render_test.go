@@ -66,6 +66,44 @@ func TestVersionAndPath(t *testing.T) {
 	}
 }
 
+// TestRenderOmitsExtensionFields proves x-/X- fields accepted at load time
+// (AllowFieldPrefixes) never reach the baked agent.yaml: they are dropped at
+// decode because no AgentConfig field exists to hold them, so there is
+// nothing for effective.FromConfig or Render to carry forward.
+func TestRenderOmitsExtensionFields(t *testing.T) {
+	in := []byte(`apiVersion: v1alpha1
+kind: Agent
+x-owner: platform-team
+metadata:
+  name: extension-fields-agent
+model:
+  provider: openai-compatible
+  baseURL: https://api.openai.com/v1
+  name: gpt-4o-mini
+  apiKeyEnv: OPENAI_API_KEY
+  x-model-note: internal
+instructions: hi
+tools:
+  - name: fetch
+    command: ["mcp-server-fetch"]
+    x-tool-note: internal
+expose:
+  openai: true
+`)
+	cfg, err := config.NewFromBytes(in)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	out, err := Render(effective.FromConfig(cfg, testInstructions))
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	if strings.Contains(string(out), "x-") {
+		t.Fatalf("expected no x- fields in rendered agent.yaml, got:\n%s", out)
+	}
+}
+
 func TestRenderAgentYAMLMatchesGolden(t *testing.T) {
 	out, err := Render(sampleAgent())
 	if err != nil {

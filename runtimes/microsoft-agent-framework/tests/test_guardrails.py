@@ -226,6 +226,7 @@ def test_status_of_unwraps_maf_wrapped_error():
 
 
 def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
+    monkeypatch.setenv("AGENTKIT_MODEL_API", "responses")
     from agentkit_serve_common.config import AgentSpec
 
     calls = {}
@@ -236,6 +237,7 @@ def test_build_client_uses_foundry_for_model_workload_identity(monkeypatch):
     class FakeFoundryClient:
         def __init__(self, **kwargs):
             calls.update(kwargs)
+            self._prepare_message_for_openai = mock.Mock(return_value=[])
 
     monkeypatch.setattr("azure.identity.DefaultAzureCredential", FakeCredential)
     monkeypatch.setattr("agent_framework.foundry.FoundryChatClient", FakeFoundryClient)

@@ -40,6 +40,9 @@ PLATFORM ?= linux/amd64
 # `make run-test-agent LOCAL_AUTH_TOKEN=my-local-token`.
 LOCAL_AUTH_TOKEN ?= agentkit-local-dev-token
 
+# The upstream model API is independent of the runtime or local HTTP facade.
+AGENTKIT_MODEL_API ?= chat_completions
+
 # RUNTIME selects which runtime adapter the test-agent targets: `pydantic-ai`
 # (default), Microsoft Agent Framework (`maf` alias or canonical name), or
 # LangGraph (`langgraph`). build-test-agent derives the adapter image, fixture,
@@ -137,5 +140,6 @@ run-test-agent:
 		-p 127.0.0.1:8080:8080 \
 		-e AGENTKIT_BIND=0.0.0.0 \
 		-e AGENTKIT_AUTH_TOKEN="$(LOCAL_AUTH_TOKEN)" \
+		-e AGENTKIT_MODEL_API="$(AGENTKIT_MODEL_API)" \
 		-e OPENAI_API_KEY \
 		$(AGENT_IMAGE)

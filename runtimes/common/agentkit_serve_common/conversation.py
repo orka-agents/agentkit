@@ -25,6 +25,7 @@ class ConversationTurn:
 
     role: str
     text: str
+    phase: Literal["commentary", "final_answer"] | None = None
 
 
 @dataclass(frozen=True)
