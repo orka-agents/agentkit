@@ -22,14 +22,9 @@ type Route struct {
 	Handler RouteHandler
 }
 
-// RuntimeConfig describes a swappable runtime adapter (the DistroConfig analog,
-// plan §7.1). v0 registers exactly one (pydantic-ai). A second runtime is one
-// init() registration with zero edits to Build().
+// RuntimeConfig is the per-runtime adapter configuration.
 type RuntimeConfig struct {
-	// Name is the runtime identifier used in agentkitfile `runtime:` and routes.
-	Name string
-	// defaultAdapterRef is the OCI ref of the serve adapter image used as the
-	// LLB base when no `adapter` build-arg override is supplied.
+	Name              string
 	defaultAdapterRef string
 }
 
@@ -73,6 +68,11 @@ func init() {
 			defaultAdapterRef: rt.DefaultAdapterRef,
 		})
 	}
+
+	// Register the debug/agent-yaml target. It is not runtime-specific.
+	const debugAgentYAML = "debug/agent-yaml"
+	routes[debugAgentYAML] = Route{Handler: nil} // context handler only
+	contextRouteHandlers[debugAgentYAML] = handleDebugAgentYAML
 }
 
 // IsRegisteredRuntime reports whether name (after alias resolution) has a wired
