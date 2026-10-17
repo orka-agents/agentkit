@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,9 +18,9 @@ const (
 
 	// verifyOutputTail is how much recent output Verify keeps to explain a failure.
 	verifyOutputTail = 64 << 10
-	// verifyWaitDelay bounds how long a timed-out command's children may hold
-	// its output open.
-	verifyWaitDelay = 5 * time.Second
+	// verifyDrainDelay bounds how long output may keep arriving after a
+	// command's process group is killed, from a process that left the group.
+	verifyDrainDelay = 5 * time.Second
 )
 
 // Verify runs each command with /bin/sh -c, streaming its output to out. It
@@ -49,16 +50,39 @@ func runVerifyCommand(ctx context.Context, command string, timeout time.Duration
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// The shell writes to a pipe file, not an io.Writer, so Wait returns when
+	// the shell exits even if a background child still holds the pipe.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("could not run: %w", err)
+	}
+	defer r.Close()
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(out, r)
+		close(drained)
+	}()
+
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	cmd.WaitDelay = verifyWaitDelay
+	cmd.Stdout = w
+	cmd.Stderr = w
 	// The command runs in its own process group so a timeout stops everything
 	// it started, and nothing it left in the background outlives it.
 	startProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessGroup(cmd.Process) }
-	err := cmd.Run()
-	_ = killProcessGroup(cmd.Process)
+	err = cmd.Start()
+	w.Close()
+	if err == nil {
+		err = cmd.Wait()
+		_ = killProcessGroup(cmd.Process)
+	}
+	select {
+	case <-drained:
+	case <-time.After(verifyDrainDelay):
+		r.Close()
+		<-drained
+	}
+
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("timed out after %s", timeout)
 	}

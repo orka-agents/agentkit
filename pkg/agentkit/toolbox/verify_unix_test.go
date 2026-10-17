@@ -20,14 +20,19 @@ func TestVerifyStopsChildProcesses(t *testing.T) {
 	dir := t.TempDir()
 	timedOut := filepath.Join(dir, "timed-out")
 	background := filepath.Join(dir, "background")
+	start := time.Now()
 	err := Verify(context.Background(), []string{
 		// The shell waits on its child, so only the timeout ends it.
 		fmt.Sprintf("sleep 30 & echo $! > %s; wait", timedOut),
-		// The shell exits at once and leaves its child behind.
-		fmt.Sprintf("sleep 30 >/dev/null 2>&1 & echo $! > %s", background),
+		// The shell exits at once and leaves its child behind, still holding
+		// the output pipe. That must neither fail nor delay verification.
+		fmt.Sprintf("sleep 30 & echo $! > %s", background),
 	}, time.Second, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "1 of 2 verify commands failed") || !strings.Contains(err.Error(), "timed out after 1s") {
 		t.Fatalf("Verify error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= verifyDrainDelay {
+		t.Fatalf("Verify took %s, want the background child killed when its shell exits", elapsed)
 	}
 	for _, pidFile := range []string{timedOut, background} {
 		dt, err := os.ReadFile(pidFile)
