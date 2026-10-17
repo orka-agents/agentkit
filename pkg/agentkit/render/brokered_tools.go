@@ -16,6 +16,9 @@ const (
 	TargetBrokeredTools = "brokered-tools"
 	orkaToolAPIVersion  = "core.orka.ai/v1alpha1"
 	orkaToolKind        = "Tool"
+	schemaTypeKey       = "type"
+	schemaTypeObject    = "object"
+	schemaTypeString    = "string"
 )
 
 var orkaBrokeredToolClasses = []string{config.BrokeredClassRead, config.BrokeredClassWrite, config.BrokeredClassCoordination}
@@ -127,7 +130,7 @@ func orkaBrokeredTool(idx int, document any) (config.BrokeredTool, bool, error) 
 	if !slices.Contains(orkaBrokeredToolClasses, brokeredClass) {
 		return config.BrokeredTool{}, false, fmt.Errorf("tool CRD %q has unsupported spec.brokeredToolClass %q; expected %s", name, brokeredClass, strings.Join(orkaBrokeredToolClasses, ", "))
 	}
-	parameters := map[string]any{"type": "object"}
+	parameters := map[string]any{schemaTypeKey: schemaTypeObject}
 	if raw, ok := spec["parameters"]; ok && raw != nil {
 		if parameters, ok = raw.(map[string]any); !ok {
 			return config.BrokeredTool{}, false, fmt.Errorf("tool CRD %q parameters schema must be an object", name)

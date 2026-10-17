@@ -63,7 +63,7 @@ tags: [*base]
 	}
 	doc, _ := docs[0].(map[string]any)
 	site, _ := doc["site"].(map[string]any)
-	if site["type"] != "string" || site["minLength"] != json.Number("2") {
+	if site[schemaTypeKey] != schemaTypeString || site["minLength"] != json.Number("2") {
 		t.Fatalf("merged mapping = %#v", site)
 	}
 	if !reflect.DeepEqual(doc["tags"], []any{doc["base"]}) {

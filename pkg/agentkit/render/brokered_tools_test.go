@@ -161,7 +161,7 @@ func TestOrkaBrokeredToolsDefaultsParametersToObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OrkaBrokeredTools() error = %v", err)
 	}
-	if tools[0].Parameters["type"] != "object" || len(tools[0].Parameters) != 1 {
+	if tools[0].Parameters[schemaTypeKey] != schemaTypeObject || len(tools[0].Parameters) != 1 {
 		t.Fatalf("parameters = %#v", tools[0].Parameters)
 	}
 }
@@ -191,7 +191,7 @@ func TestBrokeredToolsFromFilesRendersSchemaOnlyFragmentWithDigests(t *testing.T
 		Name:          "check-network-telemetry",
 		Description:   "Read telemetry.",
 		BrokeredClass: config.BrokeredClassRead,
-		Parameters:    map[string]any{"type": "object", "properties": map[string]any{"site": map[string]any{"type": "string"}}},
+		Parameters:    map[string]any{schemaTypeKey: schemaTypeObject, "properties": map[string]any{"site": map[string]any{schemaTypeKey: schemaTypeString}}},
 	})
 	if err != nil {
 		t.Fatal(err)
