@@ -1,0 +1,3 @@
+#!/opt/agentkit/bin/node
+
+require("/opt/agentkit/node/lib/node_modules/npm/bin/npx-cli.js");

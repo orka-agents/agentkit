@@ -1,0 +1,11 @@
+abiVersion: "v0"
+metadata:
+  name: "portable-harness-smoke"
+model:
+  provider: "openai-compatible"
+  baseURL: "https://example.invalid/v1"
+  name: "offline-smoke"
+instructions: "Run the portable harness smoke test."
+expose:
+  openai: true
+  port: 8080
