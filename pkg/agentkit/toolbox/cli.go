@@ -8,15 +8,14 @@ import (
 )
 
 const (
-	// InstallCommand and VerifyCommand are the frontend subcommands a toolbox
-	// build runs inside the AgentKit frontend image.
-	InstallCommand = "toolbox-install"
-	VerifyCommand  = "toolbox-verify"
+	// InstallCommand and VerifyCommand are the agentkit-toolbox subcommands.
+	InstallCommand = "install"
+	VerifyCommand  = "verify"
 )
 
-// RunInstallCLI implements `agentkit toolbox-install`.
+// RunInstallCLI implements `agentkit-toolbox install`.
 func RunInstallCLI(args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agentkit "+InstallCommand, flag.ContinueOnError)
+	fs := flag.NewFlagSet("agentkit-toolbox "+InstallCommand, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var req Request
 	fs.StringVar(&req.Source, "src", "", "downloaded file, or file copied from an image")
@@ -27,32 +26,32 @@ func RunInstallCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 2
 	}
 	if req.Source == "" || req.Arch == "" || req.Dest == "" || fs.NArg() != 0 {
-		fmt.Fprintf(stderr, "agentkit %s: --src, --arch, and --dest are required\n", InstallCommand)
+		fmt.Fprintf(stderr, "agentkit-toolbox %s: --src, --arch, and --dest are required\n", InstallCommand)
 		return 2
 	}
 	result, err := Install(req, DefaultLimits)
 	if err != nil {
-		fmt.Fprintf(stderr, "agentkit %s: %v\n", InstallCommand, err)
+		fmt.Fprintf(stderr, "agentkit-toolbox %s: %v\n", InstallCommand, err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "installed tool sha256:%s\n", result.SHA256)
 	return 0
 }
 
-// RunVerifyCLI implements `agentkit toolbox-verify -- <command>...`.
+// RunVerifyCLI implements `agentkit-toolbox verify -- <command>...`.
 func RunVerifyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agentkit "+VerifyCommand, flag.ContinueOnError)
+	fs := flag.NewFlagSet("agentkit-toolbox "+VerifyCommand, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	timeout := fs.Duration("timeout", DefaultVerifyTimeout, "timeout for each command")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if fs.NArg() == 0 || *timeout <= 0 {
-		fmt.Fprintf(stderr, "agentkit %s: a positive --timeout and at least one command are required\n", VerifyCommand)
+		fmt.Fprintf(stderr, "agentkit-toolbox %s: a positive --timeout and at least one command are required\n", VerifyCommand)
 		return 2
 	}
 	if err := Verify(context.Background(), fs.Args(), *timeout, stdout); err != nil {
-		fmt.Fprintf(stderr, "agentkit %s: %v\n", VerifyCommand, err)
+		fmt.Fprintf(stderr, "agentkit-toolbox %s: %v\n", VerifyCommand, err)
 		return 1
 	}
 	return 0

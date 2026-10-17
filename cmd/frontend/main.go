@@ -7,23 +7,14 @@ import (
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/orka-agents/agentkit/pkg/agentkit/render"
-	"github.com/orka-agents/agentkit/pkg/agentkit/toolbox"
 	"github.com/orka-agents/agentkit/pkg/build"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/grpclog"
 )
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "render":
-			os.Exit(render.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
-		// Toolbox builds run these inside the frontend image itself.
-		case toolbox.InstallCommand:
-			os.Exit(toolbox.RunInstallCLI(os.Args[2:], os.Stdout, os.Stderr))
-		case toolbox.VerifyCommand:
-			os.Exit(toolbox.RunVerifyCLI(os.Args[2:], os.Stdout, os.Stderr))
-		}
+	if len(os.Args) > 1 && os.Args[1] == "render" {
+		os.Exit(render.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	bklog.L.Logger.SetOutput(os.Stderr)

@@ -53,7 +53,12 @@ func runVerifyCommand(ctx context.Context, command string, timeout time.Duration
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.WaitDelay = verifyWaitDelay
+	// The command runs in its own process group so a timeout stops everything
+	// it started, and nothing it left in the background outlives it.
+	startProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessGroup(cmd.Process) }
 	err := cmd.Run()
+	_ = killProcessGroup(cmd.Process)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("timed out after %s", timeout)
 	}

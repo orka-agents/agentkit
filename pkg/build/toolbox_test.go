@@ -262,16 +262,23 @@ func TestBuildToolboxRejectsBeforeFetching(t *testing.T) {
 		want         string
 	}{
 		{
-			name:         "missing platform download",
+			name: "missing platform download",
+			agentkitfile: []byte(strings.Replace(string(toolboxAgentkitfile(false)),
+				"          linux/arm64: {url: https://example.com/helm-linux-arm64.tar.gz", "          # no arm64 helm: {url: https://example.com/helm-linux-arm64.tar.gz", 1)),
+			opts: map[string]string{keyTargetPlatform: toolboxAMD64 + "," + toolboxARM64},
+			want: `tool "helm" has no download for linux/arm64 (it has linux/amd64)`,
+		},
+		{
+			name:         "unsupported architecture",
 			agentkitfile: toolboxAgentkitfile(false),
 			opts:         map[string]string{keyTargetPlatform: toolboxAMD64 + ",linux/riscv64"},
-			want:         `tool "yq" has no download for linux/riscv64 (it has linux/amd64, linux/arm64)`,
+			want:         "platform linux/riscv64 is not supported; toolboxes are built for linux/amd64, linux/arm64",
 		},
 		{
 			name:         "non-linux platform",
 			agentkitfile: toolboxAgentkitfile(false),
 			opts:         map[string]string{keyTargetPlatform: "windows/amd64"},
-			want:         "platform windows/amd64 is not supported: toolboxes are linux images",
+			want:         "platform windows/amd64 is not supported; toolboxes are built for linux/amd64, linux/arm64",
 		},
 		{
 			name:         "verify without spec.verify",

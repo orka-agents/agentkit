@@ -33,7 +33,6 @@ var (
 func testFrontend() Frontend {
 	return Frontend{
 		State:    llb.Image("example.com/agentkit:test"),
-		Binary:   "/bin/agentkit",
 		Platform: linuxAMD64,
 	}
 }
@@ -79,9 +78,10 @@ spec:
 }
 
 type definitionOps struct {
-	execs   []*pb.ExecOp
-	sources []*pb.Op
-	files   []*pb.FileOp
+	execs         []*pb.ExecOp
+	execPlatforms []*pb.Platform
+	sources       []*pb.Op
+	files         []*pb.FileOp
 }
 
 func marshalOps(t *testing.T, st llb.State) definitionOps {
@@ -99,6 +99,7 @@ func marshalOps(t *testing.T, st llb.State) definitionOps {
 		switch {
 		case op.GetExec() != nil:
 			out.execs = append(out.execs, op.GetExec())
+			out.execPlatforms = append(out.execPlatforms, op.Platform)
 		case op.GetSource() != nil:
 			out.sources = append(out.sources, &op)
 		case op.GetFile() != nil:
@@ -166,7 +167,11 @@ func TestInstallStateDownloadsWithChecksumAndInstallsOffline(t *testing.T) {
 	ops.source(t, testFrontendID)
 
 	exec := onlyExec(t, ops)
-	wantArgs := []string{"/bin/agentkit", toolbox.InstallCommand, "--src", "/src/helm", "--arch", linuxARM64.Architecture, "--dest", "/out", "--member", "linux-arm64/helm"}
+	if p := ops.execPlatforms[0]; p.Architecture != "amd64" {
+		t.Fatalf("install exec platform = %+v, want the worker's amd64", p)
+	}
+	// The install runs natively, so it uses the amd64 helper for an arm64 tool.
+	wantArgs := []string{"/usr/libexec/agentkit/agentkit-toolbox-linux-amd64", toolbox.InstallCommand, "--src", "/src/helm", "--arch", linuxARM64.Architecture, "--dest", "/out", "--member", "linux-arm64/helm"}
 	if !reflect.DeepEqual(exec.Meta.Args, wantArgs) {
 		t.Fatalf("args = %q, want %q", exec.Meta.Args, wantArgs)
 	}
@@ -378,21 +383,26 @@ func TestInventoryRequiresInstalledDigest(t *testing.T) {
 
 func TestVerifyStateRunsCommandsSandboxed(t *testing.T) {
 	cfg := testToolbox(t)
-	toolboxState, _, err := Assemble(cfg, installedTools(cfg), linuxAMD64)
+	toolboxState, _, err := Assemble(cfg, installedTools(cfg), linuxARM64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ops := marshalOps(t, VerifyState(testFrontend(), cfg, toolboxState, linuxAMD64))
+	// An amd64 worker verifying the arm64 toolbox.
+	ops := marshalOps(t, VerifyState(testFrontend(), cfg, toolboxState, linuxARM64))
 
 	// Solving the returned state must run the exec. A read-only root has no
 	// output, so returning the exec's root would only pull the runtime image.
 	exec := onlyExec(t, ops)
 	runtime := ops.source(t, "docker-image://"+testRuntime)
-	if runtime.Platform == nil || runtime.Platform.Architecture != "amd64" {
+	if runtime.Platform == nil || runtime.Platform.Architecture != linuxARM64.Architecture {
 		t.Fatalf("runtime platform = %+v", runtime.Platform)
 	}
+	if p := ops.execPlatforms[0]; p.Architecture != linuxARM64.Architecture {
+		t.Fatalf("verify exec platform = %+v, want arm64", p)
+	}
 
-	wantArgs := []string{"/run/agentkit/agentkit", toolbox.VerifyCommand, "--timeout", "1m0s", "--", "yq --version", "helm version --short"}
+	// The helper must be built for the exec's platform, not the worker's.
+	wantArgs := []string{"/run/agentkit/agentkit-toolbox-linux-arm64", toolbox.VerifyCommand, "--timeout", "1m0s", "--", "yq --version", "helm version --short"}
 	if !reflect.DeepEqual(exec.Meta.Args, wantArgs) {
 		t.Fatalf("args = %q, want %q", exec.Meta.Args, wantArgs)
 	}
@@ -411,8 +421,8 @@ func TestVerifyStateRunsCommandsSandboxed(t *testing.T) {
 	if m := mountAt(t, exec, "/opt/yq-jq"); !m.Readonly || m.Selector != "/opt/yq-jq" {
 		t.Fatalf("toolbox mount = %+v, want read-only /opt/yq-jq", m)
 	}
-	if m := mountAt(t, exec, "/run/agentkit"); !m.Readonly || m.Selector != "/bin" {
-		t.Fatalf("helper mount = %+v, want read-only /bin of the frontend", m)
+	if m := mountAt(t, exec, "/run/agentkit"); !m.Readonly || m.Selector != toolbox.HelperDir {
+		t.Fatalf("helper mount = %+v, want read-only %s of the frontend", m, toolbox.HelperDir)
 	}
 	if m := mountAt(t, exec, "/run/agentkit-verify"); m.Output == int64(pb.SkipOutput) {
 		t.Fatalf("result mount = %+v, want an output", m)

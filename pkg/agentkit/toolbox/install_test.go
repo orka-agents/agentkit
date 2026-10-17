@@ -2,13 +2,13 @@ package toolbox
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,33 +91,6 @@ func zstdBytes(t *testing.T, in []byte) []byte {
 	return zw.EncodeAll(in, nil)
 }
 
-type zipEntry struct {
-	name string
-	mode os.FileMode
-	body []byte
-}
-
-func zipBytes(t *testing.T, entries ...zipEntry) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for _, e := range entries {
-		hdr := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
-		hdr.SetMode(e.mode)
-		w, err := zw.CreateHeader(hdr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := w.Write(e.body); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
 func install(t *testing.T, download []byte, member, arch string, limits Limits) (string, Result, error) {
 	t.Helper()
 	dir := t.TempDir()
@@ -175,11 +148,9 @@ func TestInstallPlainDownload(t *testing.T) {
 		body []byte
 		arch string
 	}{
-		"amd64 ELF":    {amd64ELF, utils.PlatformAMD64},
-		"arm64 ELF":    {arm64ELF, utils.PlatformARM64},
-		"big-endian":   {s390xELF, "s390x"},
-		"script":       {[]byte("#!/bin/sh\necho hi\n"), utils.PlatformARM64},
-		"unknown arch": {amd64ELF, "mips64le"},
+		"amd64 ELF": {amd64ELF, utils.PlatformAMD64},
+		"arm64 ELF": {arm64ELF, utils.PlatformARM64},
+		"script":    {[]byte("#!/bin/sh\necho hi\n"), utils.PlatformARM64},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dest, result, err := install(t, tc.body, "", tc.arch, DefaultLimits)
@@ -197,6 +168,16 @@ func TestInstallRejectsWrongArchitecture(t *testing.T) {
 
 	_, _, err = install(t, gzipBytes(t, tarBytes(t, file(testMember, arm64ELF))), testMember, utils.PlatformAMD64, DefaultLimits)
 	assertInstallError(t, err, "the tool is an ELF binary for arm64, not amd64")
+
+	_, _, err = install(t, s390xELF, "", utils.PlatformAMD64, DefaultLimits)
+	assertInstallError(t, err, "the tool is an ELF binary for EM_S390 (ELFCLASS64, ELFDATA2MSB), not amd64")
+}
+
+func TestInstallRejectsUnsupportedArchitecture(t *testing.T) {
+	for _, arch := range []string{"mips64le", "s390x", "riscv64", ""} {
+		_, _, err := install(t, []byte("#!/bin/sh\n"), "", arch, DefaultLimits)
+		assertInstallError(t, err, fmt.Sprintf("architecture %q is not supported; toolboxes are built for amd64 and arm64", arch))
+	}
 }
 
 func TestInstallRejectsNonExecutable(t *testing.T) {
@@ -225,11 +206,6 @@ func TestInstallExtractsFromArchiveFormats(t *testing.T) {
 		"tar":     plain,
 		"tar.gz":  gzipBytes(t, plain),
 		"tar.zst": zstdBytes(t, plain),
-		"zip": zipBytes(t,
-			zipEntry{name: "linux-amd64/", mode: os.ModeDir | 0o755},
-			zipEntry{name: "linux-amd64/LICENSE", mode: 0o644, body: []byte("license")},
-			zipEntry{name: "linux-amd64/helm", mode: 0o755, body: amd64ELF},
-		),
 	} {
 		t.Run(name, func(t *testing.T) {
 			dest, result, err := install(t, archive, testMember, utils.PlatformAMD64, DefaultLimits)
@@ -332,59 +308,6 @@ func TestInstallRejectsCraftedTarArchives(t *testing.T) {
 	}
 }
 
-func TestInstallRejectsCraftedZipArchives(t *testing.T) {
-	tests := []struct {
-		name    string
-		entries []zipEntry
-		limits  func(*Limits)
-		want    string
-	}{
-		{
-			name:    "dotdot path",
-			entries: []zipEntry{{name: "../evil", mode: 0o755, body: amd64ELF}, {name: testMember, mode: 0o755, body: amd64ELF}},
-			want:    "a path with '..'",
-		},
-		{
-			name:    "absolute path",
-			entries: []zipEntry{{name: "/evil", mode: 0o755, body: amd64ELF}},
-			want:    "an absolute path",
-		},
-		{
-			name:    "symlink member",
-			entries: []zipEntry{{name: testMember, mode: os.ModeSymlink | 0o777, body: []byte("/etc/shadow")}},
-			want:    "is a symlink, not a regular file",
-		},
-		{
-			name:    "oversized member",
-			entries: []zipEntry{{name: testMember, mode: 0o755, body: amd64ELF}},
-			limits:  func(l *Limits) { l.MaxFileBytes = 10 },
-			want:    "is larger than 10 bytes",
-		},
-		{
-			name:    "too many entries",
-			entries: []zipEntry{{name: "a", mode: 0o644}, {name: "b", mode: 0o644}, {name: testMember, mode: 0o755, body: amd64ELF}},
-			limits:  func(l *Limits) { l.MaxEntries = 2 },
-			want:    "the archive has more than 2 entries",
-		},
-		{
-			name:    "expands too far",
-			entries: []zipEntry{{name: "padding", mode: 0o644, body: make([]byte, 4096)}, {name: testMember, mode: 0o755, body: amd64ELF}},
-			limits:  func(l *Limits) { l.MaxUncompressedBytes = 2048 },
-			want:    "the archive expands to more than 2048 bytes",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			limits := DefaultLimits
-			if tt.limits != nil {
-				tt.limits(&limits)
-			}
-			_, _, err := install(t, zipBytes(t, tt.entries...), testMember, utils.PlatformAMD64, limits)
-			assertInstallError(t, err, tt.want)
-		})
-	}
-}
-
 func TestInstallRejectsArchiveLimitsAndFormats(t *testing.T) {
 	archive := gzipBytes(t, tarBytes(t, file(testMember, amd64ELF)))
 	limits := DefaultLimits
@@ -394,6 +317,9 @@ func TestInstallRejectsArchiveLimitsAndFormats(t *testing.T) {
 
 	_, _, err = install(t, []byte{0xfd, '7', 'z', 'X', 'Z', 0x00, 1, 2, 3}, testMember, utils.PlatformAMD64, DefaultLimits)
 	assertInstallError(t, err, "xz archives are not supported")
+
+	_, _, err = install(t, []byte("PK\x03\x04 a zip local header"), testMember, utils.PlatformAMD64, DefaultLimits)
+	assertInstallError(t, err, "zip archives are not supported")
 
 	_, _, err = install(t, bytes.Repeat(amd64ELF, 20), testMember, utils.PlatformAMD64, DefaultLimits)
 	assertInstallError(t, err, "not a supported archive")

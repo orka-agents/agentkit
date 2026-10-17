@@ -363,18 +363,20 @@ runtime:
   - `name` follows the same rules as `metadata.name` and must be unique.
   - `description` is optional and recorded in the inventory.
   - `source` sets exactly one of `download` or `image`.
-- `source.download` maps a platform (`linux/amd64`, `linux/arm64`, ...) to a
+- `source.download` maps a platform, `linux/amd64` or `linux/arm64`, to a
   download:
   - `url` is an absolute `https` URL without credentials.
   - `sha256` is the download's checksum, 64 lowercase hex characters. BuildKit
     verifies it before anything uses the file.
   - `extract` is optional: the path of one regular file inside a `tar`,
-    `tar.gz`, `tar.bz2`, `tar.zst`, or `zip` archive. It must be a clean
-    relative path. Without it, the download itself is the tool.
+    `tar.gz`, `tar.bz2`, or `tar.zst` archive. It must be a clean relative
+    path. Without it, the download itself is the tool.
 
   Platforms are matched after normalization (`linux/aarch64` is
-  `linux/arm64`). Every platform you build must have a download for every
-  download tool, or the build fails before fetching anything.
+  `linux/arm64`). Toolboxes are built for `linux/amd64` and `linux/arm64`, the
+  platforms Orka runs its built-in agents on. Every platform you build must have
+  a download for every download tool, or the build fails before fetching
+  anything.
 - `source.image` is an image reference pinned by digest, and `source.path` is
   the absolute path of the tool inside it. The image is pulled for each target
   platform. Symlinks in `path` resolve inside the image only, and the result
@@ -384,9 +386,9 @@ runtime:
 
 ### Safety checks
 
-AgentKit installs each tool with its own frontend binary, running from its own
-image with no network. It takes exactly one regular file per tool and fails the
-build when:
+AgentKit installs each tool with a small static `agentkit-toolbox` helper that
+ships in its frontend image, running with no network and a read-only root. It
+takes exactly one regular file per tool and fails the build when:
 
 - an archive entry has an absolute path or a `..` component;
 - the `extract` member is missing, appears more than once, or is a symlink, hard
@@ -398,7 +400,9 @@ build when:
   downloaded without `extract`), or is an ELF binary for another CPU
   architecture than the platform being built.
 
-`xz` archives are not supported yet.
+`zip` and `xz` archives are not supported. Go's zip reader loads every
+central-directory entry before the entry limit could be checked, so zip support
+would need its own bounded parser.
 
 ### Output image
 

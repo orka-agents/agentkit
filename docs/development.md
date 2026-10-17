@@ -160,7 +160,7 @@ The toolbox e2e builds `test/toolbox/toolbox.yaml` for `linux/amd64` and
 architectures, the `ai.orka.toolbox` label, and the inventory digests. It then
 proves that `--target verify` passes and leaves the image unchanged, that a tool
 needing a newer glibc than the runtime image fails verify with a clear message,
-and that a platform without a download fails before anything is fetched. It
+and that an unsupported platform fails before anything is fetched. It
 downloads the fixture tools, so it needs network access.
 
 ```sh

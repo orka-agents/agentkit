@@ -39,8 +39,13 @@ pkg/build.Build
 
 `cmd/frontend/main.go` is the BuildKit gateway entrypoint. It configures logging
 and delegates every build to `build.Build` via `grpcclient.RunFromEnvironment`.
-Toolbox builds also run its `toolbox-install` and `toolbox-verify` subcommands
-inside the build, from the frontend's own image.
+
+### `cmd/toolbox`
+
+`agentkit-toolbox` is the helper that toolbox builds run inside the build. The
+frontend image ships one static copy per toolbox architecture under
+`/usr/libexec/agentkit`, so each exec runs a helper built for its own platform,
+natively or under emulation.
 
 ### `pkg/agentkit/config`
 
@@ -144,12 +149,12 @@ No tool root filesystem or secret value is merged into the image.
 ### `pkg/agentkit2llb/toolbox`
 
 `InstallState` fetches a tool with a checksum (`llb.HTTP`) or a digest-pinned
-image copy, then runs `toolbox-install` from the frontend image with no network
-and a read-only root. `Assemble` lays the installed tools out under
+image copy, then runs the worker-native `agentkit-toolbox install` from the
+frontend image with no network and a read-only root. `Assemble` lays the installed tools out under
 `/opt/<name>` in one layer, writes `.toolbox.json`, and builds a `FROM scratch`
 image config whose only generated labels are `ai.orka.toolbox` and the OCI
-title. `VerifyState` runs the verify commands in the runtime image without ever
-becoming part of the output.
+title. `VerifyState` runs `agentkit-toolbox verify` for the target platform in
+the runtime image without ever becoming part of the output.
 
 ## Runtime flow
 

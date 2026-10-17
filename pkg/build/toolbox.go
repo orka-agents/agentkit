@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/containerd/platforms"
@@ -14,6 +13,7 @@ import (
 	"github.com/orka-agents/agentkit/pkg/agentkit/config"
 	"github.com/orka-agents/agentkit/pkg/agentkit/toolbox"
 	toolboxllb "github.com/orka-agents/agentkit/pkg/agentkit2llb/toolbox"
+	"github.com/orka-agents/agentkit/pkg/utils"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -22,9 +22,6 @@ const (
 	// toolboxTargetVerify builds the toolbox, runs spec.verify against it, and
 	// outputs the same image the default target does.
 	toolboxTargetVerify = "verify"
-
-	// defaultFrontendBinary is where the Dockerfile installs the frontend.
-	defaultFrontendBinary = "/bin/agentkit"
 )
 
 // currentFrontendClient is implemented by BuildKit's gateway client, which
@@ -71,8 +68,9 @@ func handleToolbox(ctx context.Context, c client.Client, cfg *config.ToolboxConf
 func checkToolboxPlatforms(cfg *config.ToolboxConfig, targetPlatforms []*specs.Platform) error {
 	var missing []string
 	for _, platform := range targetPlatforms {
-		if platform.OS != "linux" {
-			missing = append(missing, fmt.Sprintf("platform %s is not supported: toolboxes are linux images", platforms.Format(*platform)))
+		if !config.IsToolboxPlatform(*platform) {
+			missing = append(missing, fmt.Sprintf("platform %s is not supported; toolboxes are built for %s",
+				platforms.Format(*platform), strings.Join(config.ToolboxPlatforms, ", ")))
 			continue
 		}
 		for _, tool := range cfg.Spec.Tools {
@@ -103,15 +101,16 @@ func currentFrontend(c client.Client) (toolboxllb.Frontend, error) {
 	if state == nil {
 		return toolboxllb.Frontend{}, errors.New("kind Toolbox must be built through the AgentKit frontend image (#syntax=...); BuildKit did not provide it")
 	}
-	binary, err := os.Executable()
-	if err != nil {
-		binary = defaultFrontendBinary
+	// The frontend runs in a Linux container on the worker, so its own
+	// architecture is the worker's native one.
+	native := platforms.DefaultSpec()
+	native.OS = utils.PlatformLinux
+	native = platforms.Normalize(native)
+	if !config.IsToolboxPlatform(native) {
+		return toolboxllb.Frontend{}, errors.Errorf("kind Toolbox needs a BuildKit worker running on %s, not %s",
+			strings.Join(config.ToolboxPlatforms, " or "), platforms.Format(native))
 	}
-	return toolboxllb.Frontend{
-		State:    *state,
-		Binary:   binary,
-		Platform: platforms.Normalize(platforms.DefaultSpec()),
-	}, nil
+	return toolboxllb.Frontend{State: *state, Platform: native}, nil
 }
 
 // buildToolboxImage installs every tool for one platform, records each

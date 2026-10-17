@@ -3,7 +3,7 @@
 # Toolbox e2e: build the kind: Toolbox fixtures with the local frontend image
 # (`make build-agentkit TAG=...`) and check the multi-platform output, that the
 # verify target passes and leaves the image unchanged, that a tool needing a
-# newer glibc fails verify clearly, and that a missing download fails early.
+# newer glibc fails verify clearly, and that an unsupported platform fails early.
 
 set -Eeuo pipefail
 
@@ -58,10 +58,10 @@ for want in "GLIBC_2.38' not found" 'hint: the tool needs a newer glibc' "\"trix
   grep -qF "$want" "$work/glibc.log" || { cat "$work/glibc.log" >&2; die "verify failure output lacks: $want"; }
 done
 
-log "a platform without a download must fail before anything is fetched"
+log "an unsupported platform must fail before anything is fetched"
 if build test/toolbox/toolbox.yaml --platform linux/riscv64 -o "type=oci,dest=$work/riscv.tar" >"$work/riscv.log" 2>&1; then
   die "built a toolbox for a platform without downloads"
 fi
-grep -qF 'tool "yq" has no download for linux/riscv64' "$work/riscv.log" || { cat "$work/riscv.log" >&2; die "missing-platform error unclear"; }
+grep -qF 'platform linux/riscv64 is not supported' "$work/riscv.log" || { cat "$work/riscv.log" >&2; die "unsupported-platform error unclear"; }
 
 log "toolbox e2e passed"

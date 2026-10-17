@@ -6,6 +6,7 @@ import (
 	"net/url"
 	pathpkg "path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -35,6 +36,10 @@ var (
 	orkaReservedToolboxNames = [...]string{
 		"claude", "claude-agent-acp", "codex", "codex-acp", "copilot", "opencode", "ripgrep",
 	}
+
+	// ToolboxPlatforms are the platforms a toolbox can be built for: the ones
+	// Orka runs its built-in agents on.
+	ToolboxPlatforms = []string{"linux/amd64", "linux/arm64"}
 )
 
 // ToolboxConfig is the parsed agentkitfile for kind: Toolbox. A toolbox is a
@@ -117,6 +122,11 @@ func (s ToolboxToolSource) DownloadPlatforms() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// IsToolboxPlatform reports whether platform is one of ToolboxPlatforms.
+func IsToolboxPlatform(platform specs.Platform) bool {
+	return slices.Contains(ToolboxPlatforms, platforms.Format(platforms.Normalize(platform)))
 }
 
 func normalizedPlatformKey(key string) (string, bool) {
@@ -232,8 +242,8 @@ func validateToolboxSource(add func(string, ...any), field string, src ToolboxTo
 
 		if platform, ok := normalizedPlatformKey(key); !ok {
 			add("%s: platform must be <os>/<arch>[/<variant>], for example linux/amd64", keyField)
-		} else if !strings.HasPrefix(platform, utils.PlatformLinux+"/") {
-			add("%s: platform must be a linux platform", keyField)
+		} else if !slices.Contains(ToolboxPlatforms, platform) {
+			add("%s: platform must be one of %s", keyField, strings.Join(ToolboxPlatforms, ", "))
 		} else if first, dup := normalized[platform]; dup {
 			add("%s names the same platform as %q", keyField, first)
 		} else {

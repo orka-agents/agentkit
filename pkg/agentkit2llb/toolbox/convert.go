@@ -1,6 +1,6 @@
 // Package toolbox converts a kind: Toolbox config into BuildKit LLB. Each tool
-// is fetched with a checksum or a digest, then installed by the AgentKit
-// frontend binary running from its own image with no network, so exactly one
+// is fetched with a checksum or a digest, then installed by the agentkit-toolbox
+// helper running from the frontend image with no network, so exactly one
 // checked regular file per tool reaches the FROM scratch output.
 package toolbox
 
@@ -21,7 +21,7 @@ const (
 	// verifySystemPath mirrors the system PATH Orka gives agent processes;
 	// toolbox folders come after it so they never replace system commands.
 	verifySystemPath = "/usr/local/bin:/usr/bin:/bin"
-	// verifyHelperDir is where the frontend binary is mounted for verify.
+	// verifyHelperDir is where toolbox.HelperDir is mounted for verify.
 	verifyHelperDir = "/run/agentkit"
 	// verifyResultDir is an unused writable mount. A read-only root has no
 	// output, so solving this mount is what makes BuildKit run the commands.
@@ -31,13 +31,11 @@ const (
 	installDestDir   = "/out"
 )
 
-// Frontend is the AgentKit frontend image. Its static binary runs the install
-// and verify helpers inside the build.
+// Frontend is the AgentKit frontend image, which ships an agentkit-toolbox
+// helper for each toolbox architecture under toolbox.HelperDir.
 type Frontend struct {
 	State llb.State
-	// Binary is the absolute path of the agentkit binary inside State.
-	Binary string
-	// Platform is the platform State's binary runs on.
+	// Platform is the native platform of the worker, where installs run.
 	Platform specs.Platform
 }
 
@@ -49,13 +47,14 @@ type Tool struct {
 	Result toolbox.Result
 }
 
-// InstallState fetches tool for platform and installs it with the frontend
-// binary. The returned state holds toolbox.ToolFile and toolbox.ResultFile.
+// InstallState fetches tool for platform and installs it with the helper for
+// the worker's own platform. The returned state holds toolbox.ToolFile and
+// toolbox.ResultFile.
 func InstallState(fe Frontend, tool config.ToolboxTool, platform specs.Platform) (llb.State, error) {
 	pf := platforms.Format(platform)
 	sourceFile := pathpkg.Join(installSourceDir, tool.Name)
 	args := []string{
-		fe.Binary, toolbox.InstallCommand,
+		pathpkg.Join(toolbox.HelperDir, toolbox.HelperName(fe.Platform.Architecture)), toolbox.InstallCommand,
 		"--src", sourceFile,
 		"--arch", platform.Architecture,
 		"--dest", installDestDir,
@@ -131,8 +130,10 @@ func Assemble(cfg *config.ToolboxConfig, tools []Tool, platform specs.Platform) 
 func VerifyState(fe Frontend, cfg *config.ToolboxConfig, toolboxState llb.State, platform specs.Platform) llb.State {
 	verify := cfg.Spec.Verify
 	mountPath := cfg.MountPath()
+	// The helper must match the platform the exec runs on: BuildKit's own
+	// emulator only runs binaries built for that platform.
 	args := append([]string{
-		pathpkg.Join(verifyHelperDir, pathpkg.Base(fe.Binary)), toolbox.VerifyCommand,
+		pathpkg.Join(verifyHelperDir, toolbox.HelperName(platform.Architecture)), toolbox.VerifyCommand,
 		"--timeout", toolbox.DefaultVerifyTimeout.String(),
 		"--",
 	}, verify.Commands...)
@@ -149,7 +150,7 @@ func VerifyState(fe Frontend, cfg *config.ToolboxConfig, toolboxState llb.State,
 		llb.AddEnv("PATH", verifySystemPath+":"+pathpkg.Join(mountPath, config.ToolboxPathEntry)),
 		llb.AddMount("/tmp", llb.Scratch(), llb.Tmpfs()),
 		llb.AddMount(mountPath, toolboxState, llb.SourcePath(mountPath), llb.Readonly),
-		llb.AddMount(verifyHelperDir, fe.State, llb.SourcePath(pathpkg.Dir(fe.Binary)), llb.Readonly),
+		llb.AddMount(verifyHelperDir, fe.State, llb.SourcePath(toolbox.HelperDir), llb.Readonly),
 		llb.WithCustomNamef("[%s] verify %s in %s", platforms.Format(platform), mountPath, verify.RuntimeImage),
 	)
 	return run.AddMount(verifyResultDir, llb.Scratch())
