@@ -185,13 +185,9 @@ jobs:
         if: matrix.path == 'runtimes/common'
         run: scripts/generate-agentsessions-stubs.sh --check
 
-      - name: Validate Foundry helper rendering
+      - name: Validate Foundry helper syntax
         if: matrix.path == 'runtimes/common'
-        run: |
-          set -euxo pipefail
-          python3 -m py_compile deploy/foundry/render_agent.py test/foundry-hosted-agent/foundry_live.py
-          runtimes/common/.venv/bin/python deploy/foundry/render_agent.py deploy/foundry/agentkit.foundry.yaml.example >/tmp/agentkit-foundry-agent.yaml
-          grep -q '^environment_variables:' /tmp/agentkit-foundry-agent.yaml
+        run: python3 -m py_compile test/foundry-hosted-agent/foundry_live.py
 
       - name: Compile Python modules
         working-directory: ${{ matrix.path }}

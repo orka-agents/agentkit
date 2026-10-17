@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/orka-agents/agentkit/pkg/agentkit/config"
 	"github.com/orka-agents/agentkit/pkg/agentkit/effective"
 )
 
@@ -392,22 +393,11 @@ func Render(agent effective.Agent) ([]byte, error) {
 		}
 		out.Tools = append(out.Tools, tool)
 	}
-	for _, t := range agent.BrokeredTools {
-		parameters, err := normalizeJSONValue(t.Parameters)
-		if err != nil {
-			return nil, err
-		}
-		out.BrokeredTools = append(out.BrokeredTools, abiBrokeredTool{
-			Name:          yamlString(t.Name),
-			Description:   yamlString(t.Description),
-			BrokeredClass: yamlString(t.BrokeredClass),
-			Parameters:    parameters,
-			SchemaDigest:  yamlString(t.SchemaDigest),
-		})
+	brokeredTools, err := renderBrokeredTools(agent.BrokeredTools)
+	if err != nil {
+		return nil, err
 	}
-	if len(out.BrokeredTools) == 0 {
-		out.BrokeredTools = nil
-	}
+	out.BrokeredTools = brokeredTools
 	for _, e := range agent.Env {
 		out.Env = append(out.Env, abiEnvVar{Name: yamlString(e.Name), Required: e.Required})
 	}
@@ -443,4 +433,38 @@ func Render(agent effective.Agent) ([]byte, error) {
 	}
 
 	return yaml.Marshal(out)
+}
+
+// RenderBrokeredTools renders brokeredTools entries exactly as Render bakes
+// them into agent.yaml, as a fragment under a top-level brokeredTools key or,
+// when bare is set, as the list alone.
+func RenderBrokeredTools(tools []config.BrokeredTool, bare bool) ([]byte, error) {
+	rendered, err := renderBrokeredTools(tools)
+	if err != nil {
+		return nil, err
+	}
+	if bare {
+		return yaml.Marshal(rendered)
+	}
+	return yaml.Marshal(struct {
+		BrokeredTools []abiBrokeredTool `yaml:"brokeredTools"`
+	}{BrokeredTools: rendered})
+}
+
+func renderBrokeredTools(tools []config.BrokeredTool) ([]abiBrokeredTool, error) {
+	var out []abiBrokeredTool
+	for _, t := range tools {
+		parameters, err := normalizeJSONValue(t.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, abiBrokeredTool{
+			Name:          yamlString(t.Name),
+			Description:   yamlString(t.Description),
+			BrokeredClass: yamlString(t.BrokeredClass),
+			Parameters:    parameters,
+			SchemaDigest:  yamlString(t.SchemaDigest),
+		})
+	}
+	return out, nil
 }

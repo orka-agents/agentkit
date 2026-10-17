@@ -49,12 +49,12 @@ Schema `type: object`, and validates `schemaDigest` when present.
 ## Drift workflow
 
 Orka Tool CRDs remain the source of truth. Deployment tooling should export only
-the safe model-facing subset into AgentKit `brokeredTools`. The shared helper
-`agentkit_serve_common.brokered.generate_brokered_tools_from_orka_tool_crds` and
-its CLI wrapper produce deterministic entries and compute `schemaDigest`; AgentKit
-startup fails if a configured digest no longer matches the safe schema in
-`agent.yaml`. Orka still validates every live call against current Tool CRDs at
-execution time.
+the safe model-facing subset into AgentKit `brokeredTools`.
+`agentkit render --target brokered-tools` produces deterministic entries and
+computes `schemaDigest` with the same Go validator and ABI writer the frontend
+uses; AgentKit startup fails if a configured digest no longer matches the safe
+schema in `agent.yaml`. Orka still validates every live call against current
+Tool CRDs at execution time.
 
 The exporter accepts canonical `core.orka.ai/v1alpha1` `Tool` resources and
 reads the governed class from `spec.brokeredToolClass`. Tools without that field
@@ -64,7 +64,7 @@ fails instead of silently downgrading a tool to `read`.
 Example export command:
 
 ```sh
-agentkit-brokered-tools ./orka-tools/*.yaml -o brokered-tools.generated.yaml
+agentkit render --target brokered-tools ./orka-tools/*.yaml -o brokered-tools.generated.yaml
 ```
 
 The output is an `agent.yaml` fragment shaped as:
@@ -477,7 +477,7 @@ requires deployed Foundry/Orka/Fibey state.
 | Golden hosted Responses fixtures | Implemented locally | `runtimes/common/tests/fixtures/foundry_brokered/*`, `tests/test_foundry_brokered_protocol.py` | Orka repo must consume/verify the same wire shapes. |
 | A0 SDK hosted Responses spike | Local SDK app and container fixture implemented | `agentkit_serve_common.foundry_conformance`, `agentkit-foundry-conformance`, `test/foundry-brokered-conformance/`, `tests/test_foundry_conformance.py` | Deploy to Foundry and archive a verified live transcript with `deploy/foundry/scripts/foundry_brokered_conformance.sh`. |
 | A1 hosted Responses lifecycle/state | Implemented for deterministic/local brokered mode; file-backed state available for single-writer/sticky deployments | `agentkit_serve_common.foundry.create_foundry_app`, `tests/test_foundry_brokered_protocol.py` | Live Foundry must accept generated response IDs and state/routing constraints must be chosen for deployment. |
-| A2 static schemas and drift control | Implemented in Go writer/validator and Python runtime; export CLI added | `brokeredTools` ABI, `agentkit-brokered-tools`, `tests/test_config_validation.py`, `tests/test_brokered_schema.py`, Go config/ABI tests | Orka Tool CRDs must be exported during deployment and current digests verified before live runs. |
+| A2 static schemas and drift control | Implemented in Go writer/validator and Python runtime; Go export target added | `brokeredTools` ABI, `agentkit render --target brokered-tools`, `tests/test_config_validation.py`, `pkg/agentkit/render` tests, Go config/ABI tests | Orka Tool CRDs must be exported during deployment and current digests verified before live runs. |
 | A3 deterministic brokered runtime | Implemented for local/fake hosted protocol integration | deterministic `/responses` brokered path and tests | Live Orka deterministic read/write smoke still required. |
 | A4 framework pause/resume decision | Lower-level OpenAI-compatible fallback implemented; high-level framework native hooks remain gated | `agentkit_serve_common.foundry_model_loop`, `AGENTKIT_FOUNDRY_BROKERED_MODEL_LOOP=1`, model-loop tests | Live model smoke for brokered read/write prompts. |
 | A5 first real model adapter brokered mode | Model loop supports sequential brokered calls, local instruction skills, and bounded hosted dialogue | `tests/test_foundry_brokered_protocol.py`, `tests/test_foundry_tool_workflows.py` | Deployed real model read and write prompts, including policy/error outcomes. |

@@ -25,14 +25,18 @@ endpoint without adding Foundry-specific keys to `/agent/agent.yaml`.
 
 ## Hosted-agent rendering
 
-Use `render_agent.py` to map a provider-neutral Foundry deployment profile to
-the `agent.yaml` shape consumed by azd hosted agents. The `image` must already
-serve Foundry's `/readiness`, `/invocations`, and `/responses` contract (for
-example by wrapping an AgentKit image with `test/foundry-hosted-agent/foundry_live.py`):
+Use `agentkit render --target foundry-hosted-agent` to map a provider-neutral
+Foundry deployment profile to the `agent.yaml` shape consumed by azd hosted
+agents. The `image` must already serve Foundry's `/readiness`, `/invocations`,
+and `/responses` contract (for example by wrapping an AgentKit image with
+`test/foundry-hosted-agent/foundry_live.py`):
 
 ```sh
-python deploy/foundry/render_agent.py deploy/foundry/agentkit.foundry.yaml.example -o agent.yaml
+agentkit render --target foundry-hosted-agent deploy/foundry/agentkit.foundry.yaml.example -o agent.yaml
 ```
+
+From a source checkout, `go run ./cmd/frontend render ...` runs the same
+command.
 
 The renderer intentionally emits Foundry's sample-compatible
 `environment_variables` list form:
@@ -47,7 +51,7 @@ Do not hand-author the camelCase `environmentVariables` map form for hosted
 AgentKit validation: it can validate locally while failing to inject variables
 into the hosted container.
 
-`render_agent.py` requires `foundryWrapper: true` (or `imageKind:
+The `foundry-hosted-agent` target requires `foundryWrapper: true` (or `imageKind:
 foundry-wrapper`) so a plain AgentKit `/v1` image is not accidentally advertised
 as a Foundry-hosted protocol image.
 
