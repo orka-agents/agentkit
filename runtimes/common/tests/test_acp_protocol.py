@@ -427,8 +427,8 @@ def test_stdio_rejects_invalid_messages_and_recovers(monkeypatch, message, respo
     "version",
     [
         pytest.param(None, id="missing-version"),
-        pytest.param(0, id="old-version"),
-        pytest.param(2, id="future-version"),
+        pytest.param(-1, id="negative-version"),
+        pytest.param(65536, id="above-range-version"),
         pytest.param("1", id="string-version"),
         pytest.param(True, id="boolean-version"),
         pytest.param(1.0, id="float-version"),
@@ -464,6 +464,32 @@ def test_stdio_rejects_protocol_versions_without_initializing(monkeypatch, versi
 
     asyncio.run(exercise())
 
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param(0, id="oldest-version"),
+        pytest.param(1, id="supported-version"),
+        pytest.param(2, id="newer-version"),
+        pytest.param(65535, id="max-version"),
+    ],
+)
+def test_stdio_answers_with_supported_protocol_version(monkeypatch, version):
+    _set_provider_environment(monkeypatch)
+    runtime = RecordingRuntime([RunResult("recovered")])
+    factory = RecordingFactory(lambda: runtime)
+
+    async def exercise() -> None:
+        async with _stdio_connection(factory) as (reader, writer):
+            request = _initialize()
+            request["params"]["protocolVersion"] = version
+            reader.feed(request)
+            initialized = await _wait_for_stdio_response(writer, 1)
+            assert initialized["result"]["protocolVersion"] == 1
+            await _assert_stdio_recovery(reader, writer, factory, runtime)
+        assert runtime.exited == 1
+
+    asyncio.run(exercise())
 
 def test_stdio_rejects_session_before_initialize_and_recovers(monkeypatch):
     _set_provider_environment(monkeypatch)
