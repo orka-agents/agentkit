@@ -24,6 +24,7 @@ func TestDecodeJSONDocumentsKeepsNumberText(t *testing.T) {
 ---
 half: .5
 whole: 1.
+leading: 01.5
 hex: 0x1F
 exact: 9007199254740993.0
 quoted: "123"
@@ -38,14 +39,47 @@ tagged: !!str 123
 			"big":  json.Number("99999999999999999999999"),
 		},
 		map[string]any{
-			"half":   json.Number("0.5"),
-			"whole":  json.Number("1"),
-			"hex":    json.Number("31"),
-			"exact":  json.Number("9007199254740993"),
-			"quoted": "123",
-			"tagged": "123",
+			"half":    json.Number("0.5"),
+			"whole":   json.Number("1"),
+			"leading": json.Number("1.5"),
+			"hex":     json.Number("31"),
+			"exact":   json.Number("9007199254740993"),
+			"quoted":  "123",
+			"tagged":  "123",
 		},
 	}
+	if !reflect.DeepEqual(docs, want) {
+		t.Fatalf("docs = %#v, want %#v", docs, want)
+	}
+}
+
+func TestDecodeJSONDocumentsDecodesCoreTagsByType(t *testing.T) {
+	docs, err := decodeJSONDocuments([]byte(`int: !!int 3
+quotedInt: !!int "42"
+bigInt: !!int "9007199254740993"
+float: !!float "0.5"
+wholeFloat: !!float 3
+bool: !!bool "true"
+null: !!null ""
+str: !!str 1.5
+map: !!map {a: 1}
+seq: !!seq [1]
+`))
+	if err != nil {
+		t.Fatalf("decodeJSONDocuments() error = %v", err)
+	}
+	want := []any{map[string]any{
+		"int":        json.Number("3"),
+		"quotedInt":  json.Number("42"),
+		"bigInt":     json.Number("9007199254740993"),
+		"float":      json.Number("0.5"),
+		"wholeFloat": json.Number("3"),
+		"bool":       true,
+		"null":       nil,
+		"str":        "1.5",
+		"map":        map[string]any{"a": json.Number("1")},
+		"seq":        []any{json.Number("1")},
+	}}
 	if !reflect.DeepEqual(docs, want) {
 		t.Fatalf("docs = %#v, want %#v", docs, want)
 	}
@@ -78,6 +112,9 @@ func TestDecodeJSONDocumentsRejectsNonJSONValues(t *testing.T) {
 	}{
 		{"value: .inf\n", "must be finite"},
 		{"value: !!binary aGk=\n", "YAML tag !!binary is not supported"},
+		{"value: !!int 3.0\n", `YAML !!int value "3.0" is not an integer`},
+		{"value: !!float .inf\n", "is not a valid JSON number"},
+		{"value: !!float \"\"\n", "is not a valid JSON number"},
 		{"value: *missing\n", `YAML alias "missing" has no anchor`},
 		{"a: 1\na: 2\n", `mapping key "a" already defined`},
 	} {

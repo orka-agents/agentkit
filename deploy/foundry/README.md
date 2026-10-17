@@ -8,6 +8,7 @@ features such as remote MCP tools and context providers.
 
 ```yaml
 target: foundry-hosted-agent
+name: hr-agent
 agent: ./agentkitfile.yaml
 image: docker.io/acme/hr-agent-foundry-wrapper:v1
 foundryWrapper: true

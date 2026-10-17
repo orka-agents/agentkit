@@ -276,6 +276,32 @@ func TestRunCLIBrokeredToolsReportsErrorsWithoutWritingOutput(t *testing.T) {
 	}
 }
 
+func TestRunCLITreatsArgumentsAfterTerminatorAsFiles(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("-tools.yaml", []byte(testDispatchToolCRD), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	// `--` may still be a flag value; after a standalone `--`, `--bare` is a file name.
+	code := RunCLI([]string{testTargetFlag, testBrokeredToolsTarget, "-o", "--", "--", "-tools.yaml"}, &stdout, &stderr)
+	if code != 0 || stdout.Len() != 0 {
+		t.Fatalf("RunCLI() code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	rendered, err := os.ReadFile(filepath.Join(dir, "--"))
+	if err != nil || !strings.HasPrefix(string(rendered), "brokeredTools:\n") {
+		t.Fatalf("output file err=%v content=\n%s", err, rendered)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunCLI([]string{testTargetFlag, testBrokeredToolsTarget, "--", "-tools.yaml", "--bare"}, &stdout, &stderr)
+	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "open --bare") {
+		t.Fatalf("RunCLI() code=%d stdout=%q stderr=%q, want --bare read as a file", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunCLIRejectsFlagsAndArgumentsForOtherTargets(t *testing.T) {
 	src := writeTestFile(t, "tools.yaml", testDispatchToolCRD)
 	for _, tc := range []struct {

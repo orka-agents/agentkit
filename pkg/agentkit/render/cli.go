@@ -90,19 +90,36 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 
 // parseInterleaved parses flags that may appear before, between, or after
 // positional file arguments, and returns the positional arguments in order.
+// Everything after a standalone `--` is positional, but `--` may still be the
+// value of a flag that takes one.
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
-	var positional []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
 		}
-		args = fs.Args()
-		if len(args) == 0 {
-			return positional, nil
+		if arg == "-" || !strings.HasPrefix(arg, "-") {
+			positional = append(positional, arg)
+			continue
 		}
-		positional = append(positional, args[0])
-		args = args[1:]
+		flags = append(flags, arg)
+		name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+		if f := fs.Lookup(name); f != nil && !isBoolFlag(f) && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
 	}
+	if err := fs.Parse(flags); err != nil {
+		return nil, err
+	}
+	return positional, nil
+}
+
+func isBoolFlag(f *flag.Flag) bool {
+	b, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && b.IsBoolFlag()
 }
 
 func checkTargetFlags(fs *flag.FlagSet, target string, allowed []string) error {
