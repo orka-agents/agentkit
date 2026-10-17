@@ -401,7 +401,7 @@ workflow.
 ## More docs
 
 - [`docs/agentkitfile.md`](docs/agentkitfile.md) — Agentkitfile schema and build
-  arguments.
+  arguments, including `kind: Toolbox` images of command-line tools for Orka.
 - [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) — runtime feature
   capability names and current support.
 - [`docs/runtime-adapters.md`](docs/runtime-adapters.md) — runtime behavior,

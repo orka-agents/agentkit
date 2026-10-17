@@ -1,6 +1,7 @@
 package config
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/orka-agents/agentkit/pkg/utils"
@@ -32,6 +33,8 @@ const (
 
 	// ImageLabelOrkaHarnessVersion identifies the supported Orka harness contract.
 	ImageLabelOrkaHarnessVersion = orkaImageLabelNamespace + ".harness.version"
+	// ImageLabelOrkaToolbox describes where a toolbox image keeps its tools.
+	ImageLabelOrkaToolbox = orkaImageLabelNamespace + ".toolbox"
 
 	// ImageLabelOCITitle is the standard OCI title generated from metadata.name.
 	ImageLabelOCITitle = "org.opencontainers.image.title"
@@ -64,4 +67,23 @@ func isReservedMetadataLabelKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// validateMetadataLabels rejects user labels that would spoof AgentKit- or
+// Orka-generated image metadata. Every document kind shares this check.
+func validateMetadataLabels(add func(string, ...any), labels map[string]string) {
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if namespace, reserved := reservedMetadataLabelNamespace(key); reserved {
+			add("metadata.labels[%q] uses reserved AgentKit/Orka control-plane label namespace %q", key, namespace)
+			continue
+		}
+		if isReservedMetadataLabelKey(key) {
+			add("metadata.labels[%q] is reserved for AgentKit-generated image identity metadata", key)
+		}
+	}
 }

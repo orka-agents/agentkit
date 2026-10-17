@@ -154,6 +154,20 @@ scripts/parity-container-smoke.sh langgraph       # one runtime
 Set `PLATFORM=linux/arm64` on ARM hosts and `BUILDER` to a docker-driver Buildx
 builder, as for `make build-test-agent`.
 
+The toolbox e2e builds `test/toolbox/toolbox.yaml` for `linux/amd64` and
+`linux/arm64` with the local frontend and checks the exported OCI layout with
+`test/toolbox-image-smoke.py`: one layer, file modes and owners, ELF
+architectures, the `ai.orka.toolbox` label, and the inventory digests. It then
+proves that `--target verify` passes and leaves the image unchanged, that a tool
+needing a newer glibc than the runtime image fails verify with a clear message,
+and that a platform without a download fails before anything is fetched. It
+downloads the fixture tools, so it needs network access.
+
+```sh
+make build-agentkit TAG=test
+scripts/toolbox-e2e.sh
+```
+
 ## Harness v2 end-to-end checks
 
 The composed v2 checks build the current AgentKit frontend and agent images,

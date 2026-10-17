@@ -112,20 +112,7 @@ func (c *AgentConfig) Validate() error {
 	if c.Metadata.Name == "" {
 		add("metadata.name is required")
 	}
-	metadataLabelKeys := make([]string, 0, len(c.Metadata.Labels))
-	for key := range c.Metadata.Labels {
-		metadataLabelKeys = append(metadataLabelKeys, key)
-	}
-	sort.Strings(metadataLabelKeys)
-	for _, key := range metadataLabelKeys {
-		if namespace, reserved := reservedMetadataLabelNamespace(key); reserved {
-			add("metadata.labels[%q] uses reserved AgentKit/Orka control-plane label namespace %q", key, namespace)
-			continue
-		}
-		if isReservedMetadataLabelKey(key) {
-			add("metadata.labels[%q] is reserved for AgentKit-generated image identity metadata", key)
-		}
-	}
+	validateMetadataLabels(add, c.Metadata.Labels)
 
 	// --- runtime -----------------------------------------------------------
 	runtimeName := c.Runtime

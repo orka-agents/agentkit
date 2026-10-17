@@ -19,8 +19,9 @@ Agent YAML ABI file.
 ### Agentkitfile
 
 The user-authored YAML input consumed by the Go BuildKit frontend. It is strict,
-kind-discriminated input (`apiVersion: v1alpha1`, `kind: Agent`) and can contain
-authored sources such as inline instructions or an instructions file path.
+kind-discriminated input (`apiVersion: v1alpha1`, `kind: Agent` or `kind: Toolbox`)
+and can contain authored sources such as inline instructions or an instructions
+file path.
 
 ### Effective Agent
 
@@ -29,6 +30,13 @@ resolution. It carries canonical runtime identity, effective serve port,
 fully-resolved instructions, copied labels, copied tool definitions, env
 requirements, context providers, and observability settings so ABI and image
 writers do not reinterpret raw authoring defaults.
+
+### Toolbox
+
+A `kind: Toolbox` Agentkitfile and the `FROM scratch` image built from it: tools
+installed read-only under `/opt/<name>/bin`, labeled `ai.orka.toolbox` so Orka
+can mount them into the pods of its built-in coding agents. It is not an Agent
+and has no runtime adapter.
 
 ### Instruction Source
 
