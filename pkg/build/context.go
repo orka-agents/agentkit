@@ -20,9 +20,11 @@ import (
 
 const httpContextProbeSize = 1024
 
+// loadedAgentkitfile holds exactly one of config (kind: Agent) or toolbox.
 type loadedAgentkitfile struct {
 	config       *config.AgentConfig
 	instructions contextFileReader
+	toolbox      *config.ToolboxConfig
 }
 
 type remoteContextIdentity struct {
@@ -155,10 +157,14 @@ func loadHTTPAgentkitfile(ctx context.Context, c client.Client, opts map[string]
 }
 
 func parseLoadedAgentkitfile(dt []byte, opts map[string]string, reader contextFileReader) (*loadedAgentkitfile, error) {
-	cfg, err := config.NewFromBytes(dt)
+	doc, err := config.NewDocumentFromBytes(dt)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting config")
 	}
+	if doc.Toolbox != nil {
+		return &loadedAgentkitfile{toolbox: doc.Toolbox}, nil
+	}
+	cfg := doc.Agent
 	if err := parseBuildArgs(opts, cfg); err != nil {
 		return nil, errors.Wrap(err, "parsing build args")
 	}

@@ -23,10 +23,29 @@ Docker/BuildKit
   -> final OCI image
 ```
 
+A `kind: Toolbox` file takes a separate path after loading:
+
+```text
+pkg/build.Build
+  -> pkg/agentkit/config.NewDocumentFromBytes + ToolboxConfig.Validate
+  -> pkg/build.handleToolbox (per platform)
+       -> pkg/agentkit2llb/toolbox.InstallState, solved per tool
+       -> pkg/agentkit2llb/toolbox.Assemble
+       -> pkg/agentkit2llb/toolbox.VerifyState (--target verify only)
+  -> final FROM scratch OCI image
+```
+
 ### `cmd/frontend`
 
 `cmd/frontend/main.go` is the BuildKit gateway entrypoint. It configures logging
 and delegates every build to `build.Build` via `grpcclient.RunFromEnvironment`.
+
+### `cmd/toolbox`
+
+`agentkit-toolbox` is the helper that toolbox builds run inside the build. The
+frontend image ships one static copy per toolbox architecture under
+`/usr/libexec/agentkit`, so each exec runs a helper built for its own platform,
+natively or under emulation.
 
 ### `pkg/agentkit/config`
 
@@ -46,6 +65,16 @@ This package owns the authored Agentkitfile schema and validation rules:
 The loader is intentionally strict: kind-less files, unsupported kinds, unknown
 fields, invalid sources, and likely secret literals all fail before LLB work
 starts.
+
+`toolbox.go` declares `ToolboxConfig` and its validator: names, digest-pinned
+images, per-platform checksum-pinned downloads, and clean extract paths.
+
+### `pkg/agentkit/toolbox`
+
+The helpers a toolbox build runs inside the frontend image. `Install` takes
+exactly one regular file from a download, an archive, or an image copy, enforces
+the archive limits, and checks the ELF architecture. `Verify` runs the verify
+commands with a timeout and reports each failure with its output.
 
 ### `pkg/agentkit/runtimes`
 
@@ -116,6 +145,16 @@ instructions, tool commands/env allowlists, and expose information. `abi.Path` i
 - AgentKit and OCI labels.
 
 No tool root filesystem or secret value is merged into the image.
+
+### `pkg/agentkit2llb/toolbox`
+
+`InstallState` fetches a tool with a checksum (`llb.HTTP`) or a digest-pinned
+image copy, then runs the worker-native `agentkit-toolbox install` from the
+frontend image with no network and a read-only root. `Assemble` lays the installed tools out under
+`/opt/<name>` in one layer, writes `.toolbox.json`, and builds a `FROM scratch`
+image config whose only generated labels are `ai.orka.toolbox` and the OCI
+title. `VerifyState` runs `agentkit-toolbox verify` for the target platform in
+the runtime image without ever becoming part of the output.
 
 ## Runtime flow
 

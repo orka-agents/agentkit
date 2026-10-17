@@ -16,6 +16,41 @@ type probe struct {
 	Kind       string `yaml:"kind"`
 }
 
+// Document is one parsed agentkitfile. Exactly one field is set, chosen by kind.
+type Document struct {
+	Agent   *AgentConfig
+	Toolbox *ToolboxConfig
+}
+
+const supportedKinds = "`kind: Agent` or `kind: Toolbox`"
+
+// NewDocumentFromBytes parses an agentkitfile of any supported kind. Like
+// NewFromBytes, it dispatches on an explicit kind and decodes strictly.
+func NewDocumentFromBytes(b []byte) (*Document, error) {
+	kind, err := probeKind(b)
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
+	case "":
+		return nil, errors.New("kind is not defined; expected " + supportedKinds)
+	case utils.KindAgent:
+		cfg := &AgentConfig{}
+		if err := decodeStrict(b, cfg); err != nil {
+			return nil, err
+		}
+		return &Document{Agent: cfg}, nil
+	case utils.KindToolbox:
+		cfg := &ToolboxConfig{}
+		if err := decodeStrict(b, cfg); err != nil {
+			return nil, err
+		}
+		return &Document{Toolbox: cfg}, nil
+	default:
+		return nil, fmt.Errorf("kind %q is not supported; expected %s", kind, supportedKinds)
+	}
+}
+
 // NewFromBytes parses an agentkitfile. It first reads a {apiVersion, kind}
 // probe (non-strict, so the probe tolerates other fields), dispatches on kind,
 // then strict-unmarshals the full AgentConfig so unknown/misspelled fields are
@@ -24,23 +59,37 @@ type probe struct {
 // Only kind: Agent is supported. A kind-less file is rejected with a clear
 // message rather than silently misparsing.
 func NewFromBytes(b []byte) (*AgentConfig, error) {
-	var p probe
-	if err := yaml.Unmarshal(b, &p); err != nil {
-		return nil, fmt.Errorf("reading apiVersion/kind probe: %w", formatYAMLError(b, err))
+	kind, err := probeKind(b)
+	if err != nil {
+		return nil, err
 	}
-
-	if p.Kind == "" {
+	if kind == "" {
 		return nil, errors.New("kind is not defined; expected `kind: Agent`")
 	}
-	if p.Kind != utils.KindAgent {
-		return nil, fmt.Errorf("kind %q is not supported; expected `kind: Agent`", p.Kind)
+	if kind != utils.KindAgent {
+		return nil, fmt.Errorf("kind %q is not supported; expected `kind: Agent`", kind)
 	}
 
 	cfg := &AgentConfig{}
-	if err := yaml.UnmarshalWithOptions(b, cfg, strictDecodeOptions()...); err != nil {
-		return nil, fmt.Errorf("parsing agentkitfile: %w", formatYAMLError(b, err))
+	if err := decodeStrict(b, cfg); err != nil {
+		return nil, err
 	}
 	return cfg, nil
+}
+
+func probeKind(b []byte) (string, error) {
+	var p probe
+	if err := yaml.Unmarshal(b, &p); err != nil {
+		return "", fmt.Errorf("reading apiVersion/kind probe: %w", formatYAMLError(b, err))
+	}
+	return p.Kind, nil
+}
+
+func decodeStrict(b []byte, out any) error {
+	if err := yaml.UnmarshalWithOptions(b, out, strictDecodeOptions()...); err != nil {
+		return fmt.Errorf("parsing agentkitfile: %w", formatYAMLError(b, err))
+	}
+	return nil
 }
 
 // strictDecodeOptions are the decode options used everywhere an agentkitfile
