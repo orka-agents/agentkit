@@ -426,6 +426,8 @@ takes exactly one regular file per tool and fails the build when:
   link, device, folder, or anything else that is not a regular file;
 - an archive is larger than 1 GiB, expands to more than 2 GiB, or has more than
   100,000 entries;
+- an archive contains a sparse file, or one entry's headers (PAX records, long
+  names, sparse maps) exceed 4 MiB;
 - the tool is larger than 512 MiB (Orka's per-file limit);
 - the tool is neither an ELF binary nor a `#!` script (usually an archive
   downloaded without `extract`), or is an ELF binary for another CPU
@@ -453,7 +455,9 @@ AgentKit generates two labels:
 - `org.opencontainers.image.title=<name>`
 
 `.toolbox.json` lists, for that platform, each tool's name, description, path,
-source, and the SHA-256 of the installed file:
+source, and the SHA-256 of the installed file. Download URLs are recorded
+without their query string or fragment, which can carry tokens or presigned
+signatures:
 
 ```json
 {

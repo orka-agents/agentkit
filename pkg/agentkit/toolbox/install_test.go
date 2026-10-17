@@ -344,3 +344,71 @@ func TestInstallRejectsNonRegularSource(t *testing.T) {
 		assertInstallError(t, err, want)
 	}
 }
+
+// gnuSparseTar returns an old GNU sparse entry named name whose sparse map
+// continues through extensionBlocks extension blocks, then the end marker.
+// archive/tar cannot write this format, so it is laid out by hand.
+func gnuSparseTar(name string, extensionBlocks int) []byte {
+	octal := func(dst []byte, v int64) { copy(dst, fmt.Sprintf("%0*o\x00", len(dst)-1, v)) }
+	entry := func(dst []byte, offset int64) {
+		octal(dst[:12], offset)
+		octal(dst[12:24], 0)
+	}
+	hdr := make([]byte, 512)
+	copy(hdr, name)
+	octal(hdr[100:108], 0o755)
+	octal(hdr[108:116], 0)
+	octal(hdr[116:124], 0)
+	octal(hdr[124:136], 0) // no stored data: every fragment is empty
+	octal(hdr[136:148], 0)
+	hdr[156] = tar.TypeGNUSparse
+	copy(hdr[257:265], "ustar  \x00")
+	entry(hdr[386:], 1)
+	if extensionBlocks > 0 {
+		hdr[482] = 1
+	}
+	octal(hdr[483:495], 1<<40) // logical size
+	copy(hdr[148:156], "        ")
+	var sum int64
+	for _, b := range hdr {
+		sum += int64(b)
+	}
+	copy(hdr[148:156], fmt.Sprintf("%06o\x00 ", sum))
+
+	out := hdr
+	for i := range extensionBlocks {
+		blk := make([]byte, 512)
+		for j := range 21 {
+			entry(blk[j*24:], int64(2+i*21+j))
+		}
+		if i < extensionBlocks-1 {
+			blk[504] = 1
+		}
+		out = append(out, blk...)
+	}
+	return append(out, make([]byte, 1024)...)
+}
+
+func TestInstallRejectsSparseArchives(t *testing.T) {
+	_, _, err := install(t, gzipBytes(t, gnuSparseTar(testMember, 1)), testMember, utils.PlatformAMD64, DefaultLimits)
+	assertInstallError(t, err, `the archive contains a sparse file "linux-amd64/helm"; sparse archives are not supported`)
+
+	// A sparse map spread over more extension blocks than the header budget
+	// fails while archive/tar parses it, before it can grow without bound.
+	// Go 1.27 caps old GNU sparse maps itself; Go 1.26 relies on the budget.
+	blocks := maxHeaderBytes/512 + 1
+	_, _, err = install(t, gzipBytes(t, gnuSparseTar(testMember, blocks)), testMember, utils.PlatformAMD64, DefaultLimits)
+	budget := fmt.Sprintf("an archive entry's headers are larger than %d bytes", maxHeaderBytes)
+	if err == nil || !strings.Contains(err.Error(), budget) && !strings.Contains(err.Error(), "archive/tar: sparse map too long") {
+		t.Fatalf("Install error = %v, want the header budget or archive/tar's sparse map limit", err)
+	}
+}
+
+func TestInstallHeaderBudgetIgnoresEntryData(t *testing.T) {
+	archive := gzipBytes(t, tarBytes(t, file("large-docs", make([]byte, 2*maxHeaderBytes)), file(testMember, amd64ELF)))
+	dest, result, err := install(t, archive, testMember, utils.PlatformAMD64, DefaultLimits)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	assertInstalled(t, dest, result, amd64ELF)
+}

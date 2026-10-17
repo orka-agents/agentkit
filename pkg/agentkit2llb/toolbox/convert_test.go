@@ -437,3 +437,29 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestInventoryOmitsURLQueryButFetchKeepsIt(t *testing.T) {
+	cfg := testToolbox(t)
+	const signed = "https://downloads.example.com/yq?X-Amz-Signature=secret-signature&token=secret-token#frag"
+	tool := cfg.Spec.Tools[0]
+	download := tool.Source.Download["linux/amd64"]
+	download.URL = signed
+	tool.Source.Download = map[string]config.ToolboxDownload{"linux/amd64": download}
+
+	dt, err := Inventory(cfg, []Tool{{ToolboxTool: tool, Result: toolbox.Result{SHA256: testSHA256A}}}, linuxAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(dt), "secret") || strings.Contains(string(dt), "frag") {
+		t.Fatalf("inventory leaks the URL query or fragment:\n%s", dt)
+	}
+	if !strings.Contains(string(dt), `"url": "https://downloads.example.com/yq"`) {
+		t.Fatalf("inventory = %s, want the URL without its query", dt)
+	}
+
+	st, err := InstallState(testFrontend(), tool, linuxAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marshalOps(t, st).source(t, signed)
+}

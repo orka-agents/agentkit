@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -41,6 +42,11 @@ const (
 
 	// maxZstdWindow bounds decoder memory for a hostile zstd frame.
 	maxZstdWindow = 128 << 20
+	// maxHeaderBytes bounds what one tar.Reader.Next may read: header blocks,
+	// PAX and GNU long-name records (archive/tar caps each at 1 MiB), and
+	// sparse maps, which old GNU sparse headers would otherwise grow in memory
+	// with every extension block.
+	maxHeaderBytes = 4 << 20
 	// maxSuggestions caps the "did you mean" member names in an error.
 	maxSuggestions = 5
 )
@@ -195,22 +201,38 @@ func extractTarMember(r io.Reader, member string, write func(io.Reader) error, l
 		remaining: limits.MaxUncompressedBytes,
 		err:       fmt.Errorf("the archive expands to more than %d bytes", limits.MaxUncompressedBytes),
 	}
-	tr := tar.NewReader(expanded)
+	headers := &limitedReader{
+		r:         expanded,
+		remaining: math.MaxInt64,
+		err:       fmt.Errorf("an archive entry's headers are larger than %d bytes", maxHeaderBytes),
+	}
+	tr := tar.NewReader(headers)
 	scan := memberScan{member: member, limits: limits}
 	for {
+		// Read the rest of the previous entry first, so the header budget
+		// counts only what Next parses. Sparse entries never get here: their
+		// logical size can far exceed the bytes they store.
+		if _, err := io.CopyN(io.Discard, tr, limits.MaxUncompressedBytes); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		headers.remaining = maxHeaderBytes
 		hdr, err := tr.Next()
+		headers.remaining = math.MaxInt64
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		// ErrInsecurePath still returns the header; cleanEntryName rejects it.
 		if err != nil && !errors.Is(err, tar.ErrInsecurePath) {
-			if errors.Is(err, expanded.err) {
+			if errors.Is(err, expanded.err) || errors.Is(err, headers.err) {
 				return err
 			}
-			if scan.entries == 0 {
+			if scan.entries == 0 && (errors.Is(err, tar.ErrHeader) || errors.Is(err, io.ErrUnexpectedEOF)) {
 				return errors.New("the download is not a supported archive (tar, tar.gz, tar.bz2, or tar.zst)")
 			}
 			return fmt.Errorf("reading tar archive: %w", err)
+		}
+		if isSparse(hdr) {
+			return fmt.Errorf("the archive contains a sparse file %q; sparse archives are not supported", hdr.Name)
 		}
 		match, err := scan.next(hdr.Name, tarEntryType(hdr), hdr.Size)
 		if err != nil {
@@ -223,6 +245,19 @@ func extractTarMember(r io.Reader, member string, write func(io.Reader) error, l
 		}
 	}
 	return scan.finish()
+}
+
+// isSparse reports an old GNU or PAX sparse entry.
+func isSparse(hdr *tar.Header) bool {
+	if hdr.Typeflag == tar.TypeGNUSparse {
+		return true
+	}
+	for key := range hdr.PAXRecords {
+		if strings.HasPrefix(key, "GNU.sparse.") {
+			return true
+		}
+	}
+	return false
 }
 
 // memberScan applies the per-entry archive rules.

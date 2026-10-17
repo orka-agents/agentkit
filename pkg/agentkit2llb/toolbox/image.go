@@ -3,6 +3,7 @@ package toolbox
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	pathpkg "path"
 
 	"github.com/containerd/platforms"
@@ -76,6 +77,21 @@ type inventoryDownload struct {
 	Extract string `json:"extract,omitempty"`
 }
 
+// inventoryURL drops the query and fragment, which can carry tokens or
+// presigned signatures, from a download URL recorded in the image. The
+// checksum next to it already identifies the content.
+func inventoryURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
 // Inventory renders InventoryFile for one platform: each tool's name,
 // description, source, and the SHA-256 of the installed file.
 func Inventory(cfg *config.ToolboxConfig, tools []Tool, platform specs.Platform) ([]byte, error) {
@@ -103,7 +119,7 @@ func Inventory(cfg *config.ToolboxConfig, tools []Tool, platform specs.Platform)
 				return nil, fmt.Errorf("tool %q has no download for %s", tool.Name, inv.Platform)
 			}
 			entry.Source = inventorySource{Download: &inventoryDownload{
-				URL:     download.URL,
+				URL:     inventoryURL(download.URL),
 				SHA256:  download.SHA256,
 				Extract: download.Extract,
 			}}
