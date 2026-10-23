@@ -14,7 +14,10 @@ dependencies = [
     # Microsoft Agent Framework — bounded slice only (plan §12 lock-in boundary):
     # core + OpenAI client + provider adapters needed by generic AgentKit capabilities.
     # Do not pull unrelated Copilot Studio/Purview/etc. packages.
-    "agent-framework-core>=1.9,<2",
+    # 1.23.0 imports MCP SDK v2 names (mcp.MCPError, mcp.Client) while the mcp
+    # bound below keeps SDK v1, so every MCP tool session fails. Raise both
+    # bounds together.
+    "agent-framework-core>=1.9,<1.23",
     # NOTE: agent-framework-openai's latest is 1.8.2 (verified in the M0 spike);
     # the plan's >=1.9 pin would fail to resolve. Pin >=1.8,<2.
     "agent-framework-openai>=1.8,<2",
