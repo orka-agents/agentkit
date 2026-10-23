@@ -3,12 +3,17 @@ package build
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"math"
 	"strings"
 
 	"github.com/containerd/platforms"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/pb"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/orka-agents/agentkit/pkg/agentkit/config"
 	"github.com/orka-agents/agentkit/pkg/agentkit/effective"
@@ -40,7 +45,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 	cfg := loaded.config
 
-	if err := validateAgentConfig(cfg); err != nil {
+	if err := validateAgentConfig(loaded); err != nil {
 		return nil, errors.Wrap(err, "validating agentkitfile")
 	}
 
@@ -65,8 +70,42 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 }
 
 // validateAgentConfig runs the report-all config validation (plan §16.2 #3).
-func validateAgentConfig(cfg *config.AgentConfig) error {
-	return cfg.Validate()
+// Each problem is reported as "<file>:<line>: <message>" and carries its
+// location, so BuildKit clients can show the surrounding lines of the file.
+func validateAgentConfig(loaded *loadedAgentkitfile) error {
+	err := loaded.config.Validate()
+	if err == nil || loaded.source == nil {
+		return err
+	}
+	return locateValidationErrors(err, loaded.filename, loaded.source)
+}
+
+func locateValidationErrors(err error, filename string, source []byte) error {
+	info := &pb.SourceInfo{Filename: filename, Data: source, Language: "YAML"}
+	located := config.LocateProblems(err, source)
+	errs := make([]error, 0, len(located))
+	for _, lp := range located {
+		e := fmt.Errorf("%s:%d: %s", filename, lp.StartLine, lp.Message)
+		errs = append(errs, errdefs.WithSource(e, &errdefs.Source{
+			Info: info,
+			Ranges: []*pb.Range{{
+				Start: &pb.Position{Line: clampInt32(lp.StartLine), Character: clampInt32(lp.StartColumn)},
+				End:   &pb.Position{Line: clampInt32(lp.EndLine), Character: clampInt32(lp.EndColumn)},
+			}},
+		}))
+	}
+	return stderrors.Join(errs...)
+}
+
+// clampInt32 converts a line or column number for BuildKit's int32 positions.
+func clampInt32(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < 0 {
+		return 0
+	}
+	return int32(n)
 }
 
 // HandleAgent is the image-output route handler. It resolves instructions,

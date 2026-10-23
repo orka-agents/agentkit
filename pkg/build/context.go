@@ -23,6 +23,10 @@ const httpContextProbeSize = 1024
 type loadedAgentkitfile struct {
 	config       *config.AgentConfig
 	instructions contextFileReader
+	// filename and source are the Agentkitfile as read, so validation
+	// problems can be reported with their line.
+	filename string
+	source   []byte
 }
 
 type remoteContextIdentity struct {
@@ -103,7 +107,7 @@ func loadLocalAgentkitfile(ctx context.Context, c client.Client, opts map[string
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read agentkitfile")
 	}
-	return parseLoadedAgentkitfile(dt, opts, localContextReader{client: c})
+	return parseLoadedAgentkitfile(filename, dt, opts, localContextReader{client: c})
 }
 
 func loadRemoteAgentkitfile(ctx context.Context, c client.Client, opts map[string]string, filename string, state *llb.State, identity remoteContextIdentity, kind string) (*loadedAgentkitfile, error) {
@@ -117,7 +121,7 @@ func loadRemoteAgentkitfile(ctx context.Context, c client.Client, opts map[strin
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read agentkitfile")
 	}
-	return parseLoadedAgentkitfile(dt, opts, reader)
+	return parseLoadedAgentkitfile(filename, dt, opts, reader)
 }
 
 func loadHTTPAgentkitfile(ctx context.Context, c client.Client, opts map[string]string, filename string, identity remoteContextIdentity, state *llb.State, downloadedFilename string) (*loadedAgentkitfile, error) {
@@ -144,7 +148,7 @@ func loadHTTPAgentkitfile(ctx context.Context, c client.Client, opts map[string]
 			"instructions.file is not supported for single-file HTTP context %q; use an HTTP archive, Git context, local context, or inline instructions",
 			identity.displayURL,
 		)}
-		return parseLoadedAgentkitfile(dt, opts, reader)
+		return parseLoadedAgentkitfile(downloadedFilename, dt, opts, reader)
 	}
 
 	unpacked := llb.Scratch().File(
@@ -154,7 +158,7 @@ func loadHTTPAgentkitfile(ctx context.Context, c client.Client, opts map[string]
 	return loadRemoteAgentkitfile(ctx, c, opts, filename, &unpacked, identity, "HTTP build context")
 }
 
-func parseLoadedAgentkitfile(dt []byte, opts map[string]string, reader contextFileReader) (*loadedAgentkitfile, error) {
+func parseLoadedAgentkitfile(filename string, dt []byte, opts map[string]string, reader contextFileReader) (*loadedAgentkitfile, error) {
 	cfg, err := config.NewFromBytes(dt)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting config")
@@ -162,7 +166,7 @@ func parseLoadedAgentkitfile(dt []byte, opts map[string]string, reader contextFi
 	if err := parseBuildArgs(opts, cfg); err != nil {
 		return nil, errors.Wrap(err, "parsing build args")
 	}
-	return &loadedAgentkitfile{config: cfg, instructions: reader}, nil
+	return &loadedAgentkitfile{config: cfg, instructions: reader, filename: filename, source: dt}, nil
 }
 
 func solveStateReference(ctx context.Context, c client.Client, state *llb.State, description string) (client.Reference, error) {

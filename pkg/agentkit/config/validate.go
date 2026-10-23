@@ -92,25 +92,32 @@ var brokeredUnicode15Case = unicode.SpecialCase{
 // It covers both schema validity and the v0 deterministic security gates that
 // run BEFORE any LLB (plan §10): no secret literals in YAML, exposure sanity.
 // Behavioral evals are out of v0 scope; these static gates are the v0 safety net.
+//
+// Each problem is a *Problem carrying the YAML path it is about, so a caller
+// that has the source file can report its line (see LocateProblems).
 func (c *AgentConfig) Validate() error {
 	var errs []error
-	add := func(format string, args ...any) {
-		errs = append(errs, fmt.Errorf(format, args...))
+	addAt := func(path, format string, args ...any) {
+		errs = append(errs, &Problem{Path: path, Message: fmt.Sprintf(format, args...)})
+	}
+	// at binds a YAML path to the field or item a helper reports against.
+	at := func(path string) func(string, ...any) {
+		return func(format string, args ...any) { addAt(path, format, args...) }
 	}
 
 	// --- apiVersion / kind -------------------------------------------------
 	if c.APIVersion == "" {
-		add("apiVersion is not defined")
+		addAt("$.apiVersion", "apiVersion is not defined")
 	} else if c.APIVersion != utils.APIv1alpha1 {
-		add("apiVersion %q is not supported (expected %q)", c.APIVersion, utils.APIv1alpha1)
+		addAt("$.apiVersion", "apiVersion %q is not supported (expected %q)", c.APIVersion, utils.APIv1alpha1)
 	}
 	if c.Kind != utils.KindAgent {
-		add("kind %q is not supported (expected %q)", c.Kind, utils.KindAgent)
+		addAt("$.kind", "kind %q is not supported (expected %q)", c.Kind, utils.KindAgent)
 	}
 
 	// --- metadata ----------------------------------------------------------
 	if c.Metadata.Name == "" {
-		add("metadata.name is required")
+		addAt("$.metadata.name", "metadata.name is required")
 	}
 	metadataLabelKeys := make([]string, 0, len(c.Metadata.Labels))
 	for key := range c.Metadata.Labels {
@@ -118,12 +125,13 @@ func (c *AgentConfig) Validate() error {
 	}
 	sort.Strings(metadataLabelKeys)
 	for _, key := range metadataLabelKeys {
+		labelPath := yamlPathKey("$.metadata.labels", key)
 		if namespace, reserved := reservedMetadataLabelNamespace(key); reserved {
-			add("metadata.labels[%q] uses reserved AgentKit/Orka control-plane label namespace %q", key, namespace)
+			addAt(labelPath, "metadata.labels[%q] uses reserved AgentKit/Orka control-plane label namespace %q", key, namespace)
 			continue
 		}
 		if isReservedMetadataLabelKey(key) {
-			add("metadata.labels[%q] is reserved for AgentKit-generated image identity metadata", key)
+			addAt(labelPath, "metadata.labels[%q] is reserved for AgentKit-generated image identity metadata", key)
 		}
 	}
 
@@ -136,151 +144,159 @@ func (c *AgentConfig) Validate() error {
 	if c.Runtime != "" && !runtimeKnown {
 		supported := runtimes.KnownRuntimes()
 		sort.Strings(supported)
-		add("runtime %q is not supported (supported: %s)", c.Runtime, strings.Join(supported, ", "))
+		addAt("$.runtime", "runtime %q is not supported (supported: %s)", c.Runtime, strings.Join(supported, ", "))
 	}
 
 	// --- model -------------------------------------------------------------
 	if c.Model.Provider == "" {
-		add("model.provider is required")
+		addAt("$.model.provider", "model.provider is required")
 	} else if c.Model.Provider != utils.ProviderOpenAICompatible {
-		add("model.provider %q is not supported in v0 (only %q); local models compose with a co-located AIKit container over baseURL, never baked", c.Model.Provider, utils.ProviderOpenAICompatible)
+		addAt("$.model.provider", "model.provider %q is not supported in v0 (only %q); local models compose with a co-located AIKit container over baseURL, never baked", c.Model.Provider, utils.ProviderOpenAICompatible)
 	}
 	if c.Model.BaseURL == "" {
-		add("model.baseURL is required")
+		addAt("$.model.baseURL", "model.baseURL is required")
 	}
 	if c.Model.Name == "" {
-		add("model.name is required")
+		addAt("$.model.name", "model.name is required")
 	}
 	// noSecretsInImage gate (plan §10): apiKeyEnv must be a NAME, not a literal.
 	if c.Model.APIKeyEnv != "" && (!isEnvVarName(c.Model.APIKeyEnv) || looksLikeSecretLiteral(c.Model.APIKeyEnv)) {
-		add("model.apiKeyEnv %q must be an env var NAME matching [A-Z0-9_]+; provide the NAME of an env var (e.g. OPENAI_API_KEY) and inject the value with `docker run -e`", c.Model.APIKeyEnv)
+		addAt("$.model.apiKeyEnv", "model.apiKeyEnv %q must be an env var NAME matching [A-Z0-9_]+; provide the NAME of an env var (e.g. OPENAI_API_KEY) and inject the value with `docker run -e`", c.Model.APIKeyEnv)
 	}
-	validateAuth(add, "model.auth", c.Model.Auth)
+	validateAuth(at, "$.model.auth", "model.auth", c.Model.Auth)
 	if c.Model.Auth != nil && c.Model.Auth.Type != AuthTypeWorkloadIdentity {
-		add("model.auth.type %q is not supported in v0; use apiKeyEnv or workload-identity-token gated by runtime capability", c.Model.Auth.Type)
+		addAt("$.model.auth.type", "model.auth.type %q is not supported in v0; use apiKeyEnv or workload-identity-token gated by runtime capability", c.Model.Auth.Type)
 	}
 
 	// --- instructions ------------------------------------------------------
 	if c.Instructions.IsZero() {
-		add("instructions are required (a string, or a {file: ...} source)")
+		addAt("$.instructions", "instructions are required (a string, or a {file: ...} source)")
 	} else if set := c.Instructions.variantsSet(); len(set) > 1 {
-		add("instructions set multiple sources %v; exactly one of inline|file is allowed", set)
+		addAt("$.instructions", "instructions set multiple sources %v; exactly one of inline|file is allowed", set)
 	}
 
 	// --- tools -------------------------------------------------------------
 	seen := map[string]bool{}
 	for i, t := range c.Tools {
+		toolPath := fmt.Sprintf("$.tools[%d]", i)
 		if t.Name == "" {
-			add("tools[%d].name is required", i)
+			addAt(toolPath+".name", "tools[%d].name is required", i)
 		} else if seen[t.Name] {
-			add("tools[%d]: duplicate tool name %q", i, t.Name)
+			addAt(toolPath+".name", "tools[%d]: duplicate tool name %q", i, t.Name)
 		}
 		seen[t.Name] = true
 
 		if t.Type != "" && t.Type != ToolTypeMCP {
-			add("tools[%d] (%s): type %q is not supported (expected %q)", i, t.Name, t.Type, ToolTypeMCP)
+			addAt(toolPath+".type", "tools[%d] (%s): type %q is not supported (expected %q)", i, t.Name, t.Type, ToolTypeMCP)
 		}
 
 		set := t.variantsSet()
 		switch len(set) {
 		case 0:
-			add("tools[%d] (%s): a tool source is required (command or urlEnv)", i, t.Name)
+			addAt(toolPath, "tools[%d] (%s): a tool source is required (command or urlEnv)", i, t.Name)
 		case 1:
 			if t.Image != "" {
-				add("tools[%d] (%s): image-based MCP servers are not supported in v0 (use command or streamable-http urlEnv; arbitrary-OCI staging is v1)", i, t.Name)
+				addAt(toolPath+".image", "tools[%d] (%s): image-based MCP servers are not supported in v0 (use command or streamable-http urlEnv; arbitrary-OCI staging is v1)", i, t.Name)
 			}
 		default:
-			add("tools[%d] (%s): sets multiple sources %v; exactly one is allowed", i, t.Name, set)
+			addAt(toolPath, "tools[%d] (%s): sets multiple sources %v; exactly one is allowed", i, t.Name, set)
 		}
 
-		validateToolTransport(add, i, t)
-		validateToolEnv(add, i, t)
-		validateToolHeaders(add, i, t)
-		validateAuth(add, fmt.Sprintf("tools[%d] (%s).auth", i, t.Name), t.Auth)
-		validateApproval(add, i, t)
+		validateToolTransport(at, i, t)
+		for j, part := range t.Command {
+			if part == "" {
+				addAt(fmt.Sprintf("%s.command[%d]", toolPath, j), "tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
+			}
+		}
+		validateToolEnv(at, i, t)
+		validateToolHeaders(at, i, t)
+		validateAuth(at, toolPath+".auth", fmt.Sprintf("tools[%d] (%s).auth", i, t.Name), t.Auth)
+		validateApproval(at(toolPath+".approval"), i, t)
 	}
 
-	validateBrokeredTools(add, c.BrokeredTools, seen)
+	validateBrokeredTools(at, c.BrokeredTools, seen)
 
 	// --- env requirements ---------------------------------------------------
 	seenEnv := map[string]bool{}
 	for i, e := range c.Env {
+		envPath := fmt.Sprintf("$.env[%d]", i)
 		if e.Name == "" {
-			add("env[%d].name is required; list env var NAMES only", i)
+			addAt(envPath+".name", "env[%d].name is required; list env var NAMES only", i)
 			continue
 		}
 		if !isEnvVarName(e.Name) || looksLikeSecretLiteral(e.Name) {
-			add("env[%d].name %q must be an env var NAME matching [A-Z0-9_]+; list names only, never values", i, e.Name)
+			addAt(envPath+".name", "env[%d].name %q must be an env var NAME matching [A-Z0-9_]+; list names only, never values", i, e.Name)
 		}
 		if seenEnv[e.Name] {
-			add("env[%d]: duplicate env var name %q", i, e.Name)
+			addAt(envPath+".name", "env[%d]: duplicate env var name %q", i, e.Name)
 		}
 		seenEnv[e.Name] = true
 	}
 
-	validateContext(add, c.Context, c.Tools)
-	validateObservability(add, c.Observability)
+	validateContext(at, c.Context, c.Tools)
+	validateObservability(at, c.Observability)
 
 	// --- runtime capability gate -------------------------------------------
 	if runtimeKnown {
 		missing := runtimeSpec.MissingCapabilities(c.requiredCapabilities())
 		if len(missing) > 0 {
-			add("runtime %q does not support requested capabilities: %s", runtimeSpec.Name, strings.Join(missing, ", "))
+			addAt("$.runtime", "runtime %q does not support requested capabilities: %s", runtimeSpec.Name, strings.Join(missing, ", "))
 		}
 	}
 
 	// --- expose ------------------------------------------------------------
 	if !c.Expose.OpenAI {
-		add("expose.openai must be true in v0 (the OpenAI /v1 façade is the only serving surface)")
+		addAt("$.expose.openai", "expose.openai must be true in v0 (the OpenAI /v1 façade is the only serving surface)")
 	}
 	if c.Expose.Port < 0 || c.Expose.Port > 65535 {
-		add("expose.port %d is out of range", c.Expose.Port)
+		addAt("$.expose.port", "expose.port %d is out of range", c.Expose.Port)
 	}
 
 	return errors.Join(errs...)
 }
 
-func validateBrokeredTools(add func(string, ...any), tools []BrokeredTool, ownedToolNames map[string]bool) {
+func validateBrokeredTools(at func(string) func(string, ...any), tools []BrokeredTool, ownedToolNames map[string]bool) {
 	if len(tools) > 0 && len(ownedToolNames) > 0 {
-		add("tools and brokeredTools cannot be mixed in v0; direct AgentKit-owned tools are disabled in brokered Foundry mode")
+		at("$.brokeredTools")("tools and brokeredTools cannot be mixed in v0; direct AgentKit-owned tools are disabled in brokered Foundry mode")
 	}
 	seen := map[string]bool{}
 	for i, tool := range tools {
 		path := fmt.Sprintf("brokeredTools[%d]", i)
+		field := func(name string) func(string, ...any) { return at("$." + path + name) }
 		if tool.Name == "" {
-			add("%s.name is required", path)
+			field(".name")("%s.name is required", path)
 		} else {
 			if !isBrokeredToolName(tool.Name) {
-				add("%s.name %q must match [A-Za-z0-9_-]{1,64}", path, tool.Name)
+				field(".name")("%s.name %q must match [A-Za-z0-9_-]{1,64}", path, tool.Name)
 			}
 			if seen[tool.Name] {
-				add("%s: duplicate brokered tool name %q", path, tool.Name)
+				field(".name")("%s: duplicate brokered tool name %q", path, tool.Name)
 			}
 			if ownedToolNames[tool.Name] {
-				add("%s.name %q cannot be both owned and brokered", path, tool.Name)
+				field(".name")("%s.name %q cannot be both owned and brokered", path, tool.Name)
 			}
 			seen[tool.Name] = true
 		}
 		if tool.Description == "" {
-			add("%s.description is required", path)
+			field(".description")("%s.description is required", path)
 		} else if hasUnsafeBrokeredDescription(tool.Description) {
-			add("%s.description must not contain URLs or secret-like material", path)
+			field(".description")("%s.description must not contain URLs or secret-like material", path)
 		}
 		switch tool.BrokeredClass {
 		case BrokeredClassRead, BrokeredClassWrite, BrokeredClassCoordination:
 		case "":
-			add("%s.brokeredClass is required", path)
+			field(".brokeredClass")("%s.brokeredClass is required", path)
 		default:
-			add("%s.brokeredClass %q is not supported (expected read, write, or coordination)", path, tool.BrokeredClass)
+			field(".brokeredClass")("%s.brokeredClass %q is not supported (expected read, write, or coordination)", path, tool.BrokeredClass)
 		}
-		validateBrokeredToolParameters(add, path+".parameters", tool.Parameters)
+		validateBrokeredToolParameters(field(".parameters"), path+".parameters", tool.Parameters)
 		if tool.SchemaDigest != "" {
 			if !isSchemaDigest(tool.SchemaDigest) {
-				add("%s.schemaDigest must be sha256:<64 lowercase hex>", path)
+				field(".schemaDigest")("%s.schemaDigest must be sha256:<64 lowercase hex>", path)
 			} else if actual, err := BrokeredToolSchemaDigest(tool); err != nil {
-				add("%s.schemaDigest could not be checked: %v", path, err)
+				field(".schemaDigest")("%s.schemaDigest could not be checked: %v", path, err)
 			} else if tool.SchemaDigest != actual {
-				add("%s.schemaDigest does not match the safe schema", path)
+				field(".schemaDigest")("%s.schemaDigest does not match the safe schema", path)
 			}
 		}
 	}
@@ -1317,7 +1333,10 @@ func BrokeredToolSchemaDigest(tool BrokeredTool) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
+// validateContext reports problems in context providers. at binds a YAML path
+// to an add function, so each problem points at the provider field it is
+// about.
+func validateContext(at func(string) func(string, ...any), ctx Context, tools []Tool) {
 	seen := map[string]bool{}
 	toolByName := map[string]Tool{}
 	for _, tool := range tools {
@@ -1327,47 +1346,48 @@ func validateContext(add func(string, ...any), ctx Context, tools []Tool) {
 	}
 	for i, provider := range ctx.Providers {
 		path := fmt.Sprintf("context.providers[%d]", i)
+		field := func(name string) func(string, ...any) { return at("$." + path + name) }
 		if provider.Name != "" {
 			if seen[provider.Name] {
-				add("%s: duplicate provider name %q", path, provider.Name)
+				field(".name")("%s: duplicate provider name %q", path, provider.Name)
 			}
 			seen[provider.Name] = true
 		}
 		switch provider.Type {
 		case ContextTypeSearch:
-			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
-			validateEnvField(add, path+".indexEnv", provider.IndexEnv, true)
-			validateContextAuth(add, path+".auth", provider.Auth)
+			validateEnvField(field(".endpointEnv"), path+".endpointEnv", provider.EndpointEnv, true)
+			validateEnvField(field(".indexEnv"), path+".indexEnv", provider.IndexEnv, true)
+			validateContextAuth(at, path+".auth", provider.Auth)
 		case ContextTypeSkills:
 			if provider.Auth != nil {
-				add("%s.auth must not be set for skills context providers; configure auth on the referenced MCP tool", path)
+				field(".auth")("%s.auth must not be set for skills context providers; configure auth on the referenced MCP tool", path)
 			}
 			switch provider.Source {
 			case ContextSourceFilesystem:
 				if provider.Path == "" {
-					add("%s.path is required for filesystem skills", path)
+					field(".path")("%s.path is required for filesystem skills", path)
 				} else if !isAgentSkillsPath(provider.Path) {
-					add("%s.path %q must be an absolute path under /agent/skills; AgentKit does not copy arbitrary filesystem skill directories into images", path, provider.Path)
+					field(".path")("%s.path %q must be an absolute path under /agent/skills; AgentKit does not copy arbitrary filesystem skill directories into images", path, provider.Path)
 				}
 			case ContextSourceMCP:
 				if provider.ToolRef == "" {
-					add("%s.toolRef is required for MCP skills", path)
+					field(".toolRef")("%s.toolRef is required for MCP skills", path)
 				} else if tool, ok := toolByName[provider.ToolRef]; !ok {
-					add("%s.toolRef %q references unknown tool", path, provider.ToolRef)
+					field(".toolRef")("%s.toolRef %q references unknown tool", path, provider.ToolRef)
 				} else if tool.URLEnv == "" || tool.Transport != ToolTransportStreamableHTTP {
-					add("%s.toolRef %q must reference a streamable-http MCP tool", path, provider.ToolRef)
+					field(".toolRef")("%s.toolRef %q must reference a streamable-http MCP tool", path, provider.ToolRef)
 				}
 			default:
-				add("%s.source %q is not supported for skills (expected filesystem or mcp)", path, provider.Source)
+				field(".source")("%s.source %q is not supported for skills (expected filesystem or mcp)", path, provider.Source)
 			}
 		case ContextTypeMemory:
-			validateEnvField(add, path+".storeNameEnv", provider.StoreNameEnv, true)
-			validateEnvField(add, path+".endpointEnv", provider.EndpointEnv, true)
-			validateContextAuth(add, path+".auth", provider.Auth)
+			validateEnvField(field(".storeNameEnv"), path+".storeNameEnv", provider.StoreNameEnv, true)
+			validateEnvField(field(".endpointEnv"), path+".endpointEnv", provider.EndpointEnv, true)
+			validateContextAuth(at, path+".auth", provider.Auth)
 		case "":
-			add("%s.type is required", path)
+			field(".type")("%s.type is required", path)
 		default:
-			add("%s.type %q is not supported (expected search, skills, or memory)", path, provider.Type)
+			field(".type")("%s.type %q is not supported (expected search, skills, or memory)", path, provider.Type)
 		}
 	}
 }
@@ -1377,18 +1397,18 @@ func isAgentSkillsPath(path string) bool {
 	return clean == "/agent/skills" || strings.HasPrefix(clean, "/agent/skills/")
 }
 
-func validateContextAuth(add func(string, ...any), path string, auth *Auth) {
-	validateAuth(add, path, auth)
+func validateContextAuth(at func(string) func(string, ...any), path string, auth *Auth) {
+	validateAuth(at, "$."+path, path, auth)
 	if auth != nil && auth.Type == AuthTypeBearer {
-		add("%s.type %q is not supported for context providers; use %q", path, auth.Type, AuthTypeWorkloadIdentity)
+		at("$."+path+".type")("%s.type %q is not supported for context providers; use %q", path, auth.Type, AuthTypeWorkloadIdentity)
 	}
 }
 
-func validateObservability(add func(string, ...any), obs Observability) {
-	validateEnvField(add, "observability.otel.endpointEnv", obs.OTel.EndpointEnv, false)
-	validateEnvField(add, "observability.logs.levelEnv", obs.Logs.LevelEnv, false)
+func validateObservability(at func(string) func(string, ...any), obs Observability) {
+	validateEnvField(at("$.observability.otel.endpointEnv"), "observability.otel.endpointEnv", obs.OTel.EndpointEnv, false)
+	validateEnvField(at("$.observability.logs.levelEnv"), "observability.logs.levelEnv", obs.Logs.LevelEnv, false)
 	if obs.Logs.LevelEnv != "" {
-		add("observability.logs.levelEnv is not supported by current runtimes; omit it until log-level wiring is implemented")
+		at("$.observability.logs.levelEnv")("observability.logs.levelEnv is not supported by current runtimes; omit it until log-level wiring is implemented")
 	}
 }
 
@@ -1404,40 +1424,38 @@ func validateEnvField(add func(string, ...any), path, value string, required boo
 	}
 }
 
-func validateToolTransport(add func(string, ...any), i int, t Tool) {
+func validateToolTransport(at func(string) func(string, ...any), i int, t Tool) {
+	path := fmt.Sprintf("$.tools[%d]", i)
+	field := func(name string) func(string, ...any) { return at(path + name) }
 	switch {
 	case len(t.Command) > 0:
 		if t.Transport != "" && t.Transport != ToolTransportStdio {
-			add("tools[%d] (%s): command tools use transport %q or omit transport", i, t.Name, ToolTransportStdio)
+			field(".transport")("tools[%d] (%s): command tools use transport %q or omit transport", i, t.Name, ToolTransportStdio)
 		}
 		if t.URLEnv != "" || len(t.Headers) > 0 || t.Auth != nil {
-			add("tools[%d] (%s): stdio command tools must not set urlEnv, headers, or auth", i, t.Name)
+			field("")("tools[%d] (%s): stdio command tools must not set urlEnv, headers, or auth", i, t.Name)
 		}
 	case t.URLEnv != "":
 		if t.Type != ToolTypeMCP {
-			add("tools[%d] (%s): remote MCP tools must set type: %s", i, t.Name, ToolTypeMCP)
+			field(".type")("tools[%d] (%s): remote MCP tools must set type: %s", i, t.Name, ToolTypeMCP)
 		}
 		if t.Transport != ToolTransportStreamableHTTP {
-			add("tools[%d] (%s): remote MCP tools must set transport: %s", i, t.Name, ToolTransportStreamableHTTP)
+			field(".transport")("tools[%d] (%s): remote MCP tools must set transport: %s", i, t.Name, ToolTransportStreamableHTTP)
 		}
 		if !isEnvVarName(t.URLEnv) || looksLikeSecretLiteral(t.URLEnv) {
-			add("tools[%d] (%s): urlEnv %q must be an env var NAME matching [A-Z0-9_]+", i, t.Name, t.URLEnv)
+			field(".urlEnv")("tools[%d] (%s): urlEnv %q must be an env var NAME matching [A-Z0-9_]+", i, t.Name, t.URLEnv)
 		}
 		if len(t.Env) > 0 {
-			add("tools[%d] (%s): remote MCP tools must use headers/auth instead of stdio env", i, t.Name)
+			field(".env")("tools[%d] (%s): remote MCP tools must use headers/auth instead of stdio env", i, t.Name)
 		}
 	case t.Transport != "" && t.Transport != ToolTransportStdio:
-		add("tools[%d] (%s): transport %q requires urlEnv", i, t.Name, t.Transport)
+		field(".transport")("tools[%d] (%s): transport %q requires urlEnv", i, t.Name, t.Transport)
 	}
 }
 
-func validateToolEnv(add func(string, ...any), i int, t Tool) {
-	for j, part := range t.Command {
-		if part == "" {
-			add("tools[%d] (%s): command[%d] must be non-empty", i, t.Name, j)
-		}
-	}
-	for _, e := range t.Env {
+func validateToolEnv(at func(string) func(string, ...any), i int, t Tool) {
+	for j, e := range t.Env {
+		add := at(fmt.Sprintf("$.tools[%d].env[%d]", i, j))
 		if e == "" {
 			add("tools[%d] (%s): env entry is empty; list env var NAMES only", i, t.Name)
 		} else if !isEnvVarName(e) || looksLikeSecretLiteral(e) {
@@ -1446,17 +1464,20 @@ func validateToolEnv(add func(string, ...any), i int, t Tool) {
 	}
 }
 
-func validateToolHeaders(add func(string, ...any), i int, t Tool) {
+func validateToolHeaders(at func(string) func(string, ...any), i int, t Tool) {
 	seen := map[string]bool{}
 	for j, h := range t.Headers {
 		path := fmt.Sprintf("tools[%d] (%s).headers[%d]", i, t.Name, j)
+		field := func(name string) func(string, ...any) {
+			return at(fmt.Sprintf("$.tools[%d].headers[%d]", i, j) + name)
+		}
 		switch {
 		case h.Name == "":
-			add("%s.name is required", path)
+			field(".name")("%s.name is required", path)
 		case !isHTTPHeaderName(h.Name):
-			add("%s.name %q is not a valid HTTP header name", path, h.Name)
+			field(".name")("%s.name %q is not a valid HTTP header name", path, h.Name)
 		case seen[strings.ToLower(h.Name)]:
-			add("%s: duplicate header name %q", path, h.Name)
+			field(".name")("%s: duplicate header name %q", path, h.Name)
 		}
 		seen[strings.ToLower(h.Name)] = true
 
@@ -1468,46 +1489,47 @@ func validateToolHeaders(add func(string, ...any), i int, t Tool) {
 			values++
 		}
 		if values != 1 {
-			add("%s must set exactly one of value or valueEnv", path)
+			field("")("%s must set exactly one of value or valueEnv", path)
 		}
 		if t.Auth != nil && strings.EqualFold(h.Name, authorizationKey) {
-			add("%s must not set Authorization when auth is also configured; use one auth path", path)
+			field(".name")("%s must not set Authorization when auth is also configured; use one auth path", path)
 		}
 		if h.Value != "" && isCredentialHeaderName(h.Name) {
-			add("%s.value must not bake a static credential header; use valueEnv or auth", path)
+			field(".value")("%s.value must not bake a static credential header; use valueEnv or auth", path)
 		}
 		if h.Value != "" && hasSecretPrefix(h.Value) {
-			add("%s.value looks like a secret value; use valueEnv instead", path)
+			field(".value")("%s.value looks like a secret value; use valueEnv instead", path)
 		}
 		if h.ValueEnv != "" && (!isEnvVarName(h.ValueEnv) || looksLikeSecretLiteral(h.ValueEnv)) {
-			add("%s.valueEnv %q must be an env var NAME matching [A-Z0-9_]+", path, h.ValueEnv)
+			field(".valueEnv")("%s.valueEnv %q must be an env var NAME matching [A-Z0-9_]+", path, h.ValueEnv)
 		}
 	}
 }
 
-func validateAuth(add func(string, ...any), path string, auth *Auth) {
+func validateAuth(at func(string) func(string, ...any), yamlPath, path string, auth *Auth) {
 	if auth == nil {
 		return
 	}
+	field := func(name string) func(string, ...any) { return at(yamlPath + name) }
 	switch auth.Type {
 	case AuthTypeBearer:
 		if auth.TokenEnv == "" {
-			add("%s.tokenEnv is required for bearer auth", path)
+			field(".tokenEnv")("%s.tokenEnv is required for bearer auth", path)
 		} else if !isEnvVarName(auth.TokenEnv) || looksLikeSecretLiteral(auth.TokenEnv) {
-			add("%s.tokenEnv %q must be an env var NAME matching [A-Z0-9_]+", path, auth.TokenEnv)
+			field(".tokenEnv")("%s.tokenEnv %q must be an env var NAME matching [A-Z0-9_]+", path, auth.TokenEnv)
 		}
 		if auth.Audience != "" {
-			add("%s.audience must be empty for bearer auth", path)
+			field(".audience")("%s.audience must be empty for bearer auth", path)
 		}
 	case AuthTypeWorkloadIdentity:
 		if auth.Audience == "" {
-			add("%s.audience is required for workload identity token auth", path)
+			field(".audience")("%s.audience is required for workload identity token auth", path)
 		}
 		if auth.TokenEnv != "" {
-			add("%s.tokenEnv must be empty for workload identity token auth", path)
+			field(".tokenEnv")("%s.tokenEnv must be empty for workload identity token auth", path)
 		}
 	default:
-		add("%s.type %q is not supported (expected %q or %q)", path, auth.Type, AuthTypeBearer, AuthTypeWorkloadIdentity)
+		field(".type")("%s.type %q is not supported (expected %q or %q)", path, auth.Type, AuthTypeBearer, AuthTypeWorkloadIdentity)
 	}
 }
 

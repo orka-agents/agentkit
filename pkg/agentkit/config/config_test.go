@@ -230,6 +230,7 @@ instructions: hi
 tools:
   - name: fetch
     command: [""]
+    env: [FETCH_TOKEN]
 expose:
   openai: true
 `)
@@ -237,8 +238,16 @@ expose:
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
-	if verr := cfg.Validate(); verr == nil || !strings.Contains(verr.Error(), "command[0]") {
+	verr := cfg.Validate()
+	if verr == nil || !strings.Contains(verr.Error(), "command[0]") {
 		t.Fatalf("expected empty command entry rejection, got: %v", verr)
+	}
+	located := LocateProblems(verr, in)
+	if len(located) != 1 {
+		t.Fatalf("expected one command problem, got: %+v", located)
+	}
+	if lp := located[0]; lp.Path != "$.tools[0].command[0]" || lp.StartLine != 13 || lp.EndLine != 13 {
+		t.Fatalf("command problem = %+v, want $.tools[0].command[0] on line 13", lp)
 	}
 }
 
