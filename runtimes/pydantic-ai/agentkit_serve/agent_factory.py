@@ -194,7 +194,10 @@ class _CompletedResponsesModel(OpenAIResponsesModel):
         *,
         expected_model_name: str | None = None,
         expected_response_id: str | None = None,
+        **kwargs: Any,
     ) -> OpenAIResponsesStreamedResponse:
+        # Forward SDK-supplied keywords (such as history) without introducing
+        # them when an older SDK calls this hook.
         # This SDK hook retains native decoded items on both supported dependency
         # versions. Its consumer needs only iteration, response and close.
         validated = cast(
@@ -203,6 +206,7 @@ class _CompletedResponsesModel(OpenAIResponsesModel):
         return await super()._process_streamed_response(
             validated, model_settings, model_request_parameters,
             expected_model_name=expected_model_name, expected_response_id=expected_response_id,
+            **kwargs,
         )
 
     def _require_completed(self, response: ModelResponse) -> None:
