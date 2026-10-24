@@ -102,6 +102,36 @@ def test_waiting_call_continues_once_with_real_outcome_while_another_agent_progr
     asyncio.run(exercise())
 
 
+def test_approved_call_without_effect_continues_with_the_controller_summary(monkeypatch, caplog):
+    summary = "GitHub refused the request (HTTP 403): Resource not accessible by integration"
+
+    async def exercise():
+        no_effect = types.CallToolResult(
+            isError=True,
+            content=[types.TextContent(type="text", text=_PRIVATE)],
+            # The exact result shape Orka's broker returns for a refused approved call.
+            structuredContent={
+                "isError": True, "code": "tool_failed_without_effect",
+                "approvalID": "acp-tool-approval-v2:sha256:1", "error": summary, "detail": _PRIVATE,
+            },
+        )
+        async with AsyncExitStack() as stack:
+            agent, server, session, model = await _setup(stack, monkeypatch, [no_effect])
+            result = await asyncio.wait_for(agent_factory.run_agent(agent, RunRequest("refused")), 3)
+            assert result.text == "done" and len(model.requests["refused"]) == 2
+            results = _function_results(model.requests["refused"][-1])
+            assert len(results) == 1
+            assert json.loads(results[0].result) == {
+                "isError": True, "code": "tool_failed_without_effect", "message": summary,
+            }
+            assert _PRIVATE not in json.dumps([str(message) for message in model.requests["refused"][-1]])
+            assert len(session.calls) == 1 and server.connect.await_count == 0
+
+    caplog.set_level(logging.DEBUG, logger="agent_framework")
+    asyncio.run(exercise())
+    assert _PRIVATE not in caplog.text
+
+
 def test_cancelling_pending_review_does_not_execute_after_late_approval(monkeypatch):
     async def exercise():
         waiting, decision, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()

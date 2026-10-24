@@ -144,3 +144,39 @@ def test_deterministic_final_error_preserves_code_without_claiming_an_action_did
         response = client.post("/responses", json=_result(initial, {"approved": False, "error": {"code": code, "message": "UNSAFE_TOOL_DETAIL"}}), headers=CONTINUATION_AUTH)
         assert response.status_code == 200
         assert _message_text(response.json()) == f"Brokered tool create-simulated-work-order: {code}: {_ERRORS[code]}"
+
+
+_NO_EFFECT_SUMMARY = "GitHub refused the request (HTTP 403): Resource not accessible by integration"
+
+
+def test_no_effect_failure_ends_deterministic_turn_with_the_controller_summary():
+    with TestClient(_app(_spec(tool_name="create-simulated-work-order", brokered_class="write"))) as client:
+        initial = client.post("/responses", json={"input": "create-simulated-work-order", "agent_session_id": "review-session"}).json()
+        error = {"code": "tool_failed_without_effect", "message": _NO_EFFECT_SUMMARY}
+        response = client.post("/responses", json=_result(initial, {"approved": False, "error": error}), headers=CONTINUATION_AUTH)
+        assert response.status_code == 200
+        assert _message_text(response.json()) == (
+            f"Brokered tool create-simulated-work-order: tool_failed_without_effect: {_NO_EFFECT_SUMMARY}"
+        )
+
+
+def test_no_effect_failure_reaches_the_model_with_the_controller_summary(model_api):
+    spec = _spec(tool_name="create-simulated-work-order", brokered_class="write")
+    model = _FakeChatTransport([
+        _tool("create-simulated-work-order"),
+        _chat_response({"role": "assistant", "content": "Nothing changed."}),
+    ])
+    with TestClient(_model_loop_app(spec, model)) as client:
+        initial = client.post("/responses", json={"input": "Create a simulated work order.", "agent_session_id": "review-session"}).json()
+        error = {"code": "tool_failed_without_effect", "message": _NO_EFFECT_SUMMARY, "details": "UNSAFE_TOOL_DETAIL"}
+        final = client.post("/responses", json=_result(initial, {"approved": False, "error": error}), headers=CONTINUATION_AUTH)
+        assert final.status_code == 200, final.text
+        assert _message_text(final.json()) == "Nothing changed."
+        items = _model_input(model.requests[-1])
+        outputs = [item for item in items if item["type"] == "function_call_output"]
+        assert len(outputs) == 1
+        assert json.loads(outputs[0]["output"]) == {
+            "approved": False,
+            "error": {"code": "tool_failed_without_effect", "message": _NO_EFFECT_SUMMARY},
+        }
+        assert "UNSAFE_TOOL_DETAIL" not in json.dumps(items)
