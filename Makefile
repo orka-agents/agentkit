@@ -74,6 +74,12 @@ endif
 # version stamping, e.g. `make build-agentkit LDFLAGS=-X main.version=$(TAG)`.
 LDFLAGS ?=
 
+# Experimental split-image composition inputs. The harness image must carry the
+# AgentKit harness v1 labels and be visible to the selected daemon-backed builder.
+BASE_IMAGE ?= ubuntu:24.04
+HARNESS_IMAGE ?= agentkit-harness-pydantic-ai:$(TAG)
+COMPOSED_AGENT_IMAGE ?= hello-agent-composed:$(TAG)
+
 .PHONY: lint
 lint:
 	golangci-lint run ./... --timeout 5m
@@ -99,6 +105,28 @@ build-agentkit:
 build-serve:
 	docker buildx build . -f runtimes/pydantic-ai/Dockerfile \
 		--platform $(PLATFORM) -t agentkit-serve:$(TAG) --load
+
+# Build and exercise the isolated portable-harness feasibility spike. These
+# targets do not change the production AgentKit frontend or adapter path.
+.PHONY: build-portable-harness-spike
+build-portable-harness-spike:
+	docker buildx build . -f test/portable-harness/Harness.Dockerfile \
+		--platform $(PLATFORM) -t agentkit-harness-pydantic-ai:$(TAG) --load
+
+.PHONY: test-portable-harness-spike
+test-portable-harness-spike:
+	PLATFORM=$(PLATFORM) TAG=$(TAG) test/portable-harness/smoke.sh
+
+# Exercise the production frontend's experimental baseImage+harnessImage path.
+# Build the frontend and portable harness first with the same TAG and PLATFORM.
+.PHONY: build-composed-test-agent-spike
+build-composed-test-agent-spike:
+	docker buildx build $(BUILDER_FLAG) . -f $(FIXTURE) \
+		--build-arg BUILDKIT_SYNTAX=agentkit:$(TAG) \
+		--build-arg baseImage=$(BASE_IMAGE) \
+		--build-arg harnessImage=$(HARNESS_IMAGE) \
+		--platform $(PLATFORM) \
+		-t $(COMPOSED_AGENT_IMAGE) --load --provenance=false
 
 # Build the Microsoft Agent Framework runtime adapter (agentkit-serve-maf) image.
 # This is the LLB base used when an agentkitfile selects

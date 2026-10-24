@@ -3,10 +3,16 @@ package build
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"path"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
 	controlapi "github.com/moby/buildkit/api/services/control"
+	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -26,6 +32,10 @@ const (
 	keyTarget         = "target"
 	keyTargetPlatform = "platform"
 	keyCacheImports   = "cache-imports"
+
+	harnessLabelVersion  = "io.github.orka-agents.agentkit.harness.version"
+	harnessLabelRuntime  = "io.github.orka-agents.agentkit.harness.runtime"
+	harnessLabelArtifact = "io.github.orka-agents.agentkit.harness.artifact"
 )
 
 // Build is the AgentKit frontend entrypoint registered with BuildKit. It loads
@@ -93,7 +103,10 @@ func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 
 	agentSpec := effective.FromConfig(cfg, instructions)
 
-	adapterRef := rc.AdapterRef(opts)
+	imageInputs, err := resolveImageInputs(opts, rc)
+	if err != nil {
+		return nil, err
+	}
 
 	// Default the build platform to the buildkit host's os/arch, preferring the
 	// first worker's platform (AIKit parity).
@@ -120,7 +133,7 @@ func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 	for i, tp := range targetPlatforms {
 		func(i int, platform *specs.Platform) {
 			eg.Go(func() (err error) {
-				result, err := buildImage(ctx, c, agentSpec, adapterRef, platform, isMultiPlatform, cacheImports)
+				result, err := buildImage(ctx, c, agentSpec, imageInputs, platform, isMultiPlatform, cacheImports)
 				if err != nil {
 					return errors.Wrap(err, "failed to build image")
 				}
@@ -145,6 +158,34 @@ func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 	return finalResult, nil
 }
 
+type imageInputs struct {
+	adapterRef  string
+	baseRef     string
+	harnessRef  string
+	composition bool
+}
+
+func resolveImageInputs(opts map[string]string, rc *RuntimeConfig) (imageInputs, error) {
+	baseRef := getBuildArg(opts, "baseImage")
+	harnessRef := getBuildArg(opts, "harnessImage")
+	adapterOverride := getBuildArg(opts, "adapter")
+
+	if baseRef == "" && harnessRef == "" {
+		return imageInputs{adapterRef: rc.AdapterRef(opts)}, nil
+	}
+	if adapterOverride != "" {
+		return imageInputs{}, errors.New("build args adapter and baseImage/harnessImage are mutually exclusive")
+	}
+	if baseRef == "" || harnessRef == "" {
+		return imageInputs{}, errors.New("build args baseImage and harnessImage must be provided together")
+	}
+	return imageInputs{
+		baseRef:     baseRef,
+		harnessRef:  harnessRef,
+		composition: true,
+	}, nil
+}
+
 // buildResult is the result of a single-platform image build (AIKit parity).
 type buildResult struct {
 	Reference      client.Reference
@@ -166,10 +207,23 @@ func (br *buildResult) AddToClientResult(cr *client.Result) {
 }
 
 // buildImage converts the effective Agent to LLB for one platform and solves it.
-func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent, adapterRef string, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
+func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent, inputs imageInputs, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
 	result := buildResult{Platform: platform, MultiPlatform: multiPlatform}
 
-	state, image, err := agentllb.Agentkit2LLB(agentSpec, adapterRef, platform)
+	var (
+		state llb.State
+		image *specs.Image
+		err   error
+	)
+	if inputs.composition {
+		var composition agentllb.Composition
+		composition, err = resolveComposition(ctx, c, agentSpec.Runtime, inputs, platform)
+		if err == nil {
+			state, image, err = agentllb.ComposeAgentkit2LLB(agentSpec, composition, platform)
+		}
+	} else {
+		state, image, err = agentllb.Agentkit2LLB(agentSpec, inputs.adapterRef, platform)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -204,6 +258,116 @@ func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent,
 	result.ExportPlatform.ID = platforms.Format(result.ExportPlatform.Platform)
 
 	return &result, nil
+}
+
+func resolveComposition(ctx context.Context, c client.Client, runtime string, inputs imageInputs, platform *specs.Platform) (agentllb.Composition, error) {
+	baseRef, err := canonicalImageRef(inputs.baseRef)
+	if err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "parsing baseImage")
+	}
+	harnessRef, err := canonicalImageRef(inputs.harnessRef)
+	if err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "parsing harnessImage")
+	}
+
+	baseName, baseDigest, baseConfig, err := c.ResolveImageConfig(ctx, baseRef, sourceresolver.Opt{
+		ImageOpt: &sourceresolver.ResolveImageOpt{Platform: platform},
+	})
+	if err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "resolving baseImage")
+	}
+	harnessName, harnessDigest, harnessConfig, err := c.ResolveImageConfig(ctx, harnessRef, sourceresolver.Opt{
+		ImageOpt: &sourceresolver.ResolveImageOpt{Platform: platform},
+	})
+	if err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "resolving harnessImage")
+	}
+
+	var baseImage specs.Image
+	if err := json.Unmarshal(baseConfig, &baseImage); err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "decoding baseImage config")
+	}
+	var harnessImage specs.Image
+	if err := json.Unmarshal(harnessConfig, &harnessImage); err != nil {
+		return agentllb.Composition{}, errors.Wrap(err, "decoding harnessImage config")
+	}
+
+	artifactPath, err := validateHarnessLabels(harnessImage.Config.Labels, runtime)
+	if err != nil {
+		return agentllb.Composition{}, err
+	}
+	user, uid, gid, err := compositionUser(baseImage.Config.User)
+	if err != nil {
+		return agentllb.Composition{}, err
+	}
+
+	return agentllb.Composition{
+		BaseRef:       pinImageRef(baseName, baseDigest.String()),
+		HarnessRef:    pinImageRef(harnessName, harnessDigest.String()),
+		ArtifactPath:  artifactPath,
+		User:          user,
+		UID:           uid,
+		GID:           gid,
+		BaseImage:     &baseImage,
+		BaseName:      baseName,
+		BaseDigest:    baseDigest.String(),
+		HarnessName:   harnessName,
+		HarnessDigest: harnessDigest.String(),
+	}, nil
+}
+
+func validateHarnessLabels(labels map[string]string, runtime string) (string, error) {
+	if labels[harnessLabelVersion] != "1" {
+		return "", errors.Errorf("harnessImage label %s must be %q", harnessLabelVersion, "1")
+	}
+	if declared := labels[harnessLabelRuntime]; declared != runtime {
+		return "", errors.Errorf(
+			"harnessImage runtime %q does not match effective Agentkitfile runtime %q",
+			declared,
+			runtime,
+		)
+	}
+	artifactPath := labels[harnessLabelArtifact]
+	if artifactPath == "" || !strings.HasPrefix(artifactPath, "/") {
+		return "", errors.Errorf("harnessImage label %s must be an absolute path", harnessLabelArtifact)
+	}
+	cleaned := path.Clean(artifactPath)
+	if cleaned == "/" || cleaned != artifactPath {
+		return "", errors.Errorf("harnessImage artifact path %q must be clean and must not be /", artifactPath)
+	}
+	return artifactPath, nil
+}
+
+func compositionUser(baseUser string) (string, int, int, error) {
+	if baseUser == "" || baseUser == "root" || baseUser == "0" || baseUser == "0:0" {
+		return "1000:1000", 1000, 1000, nil
+	}
+	userPart, groupPart, hasGroup := strings.Cut(baseUser, ":")
+	uid, err := strconv.Atoi(userPart)
+	if err != nil || uid <= 0 {
+		return "", 0, 0, errors.Errorf("baseImage user %q must be a positive numeric UID or root", baseUser)
+	}
+	gid := uid
+	if hasGroup {
+		gid, err = strconv.Atoi(groupPart)
+		if err != nil || gid <= 0 {
+			return "", 0, 0, errors.Errorf("baseImage user %q must contain a positive numeric GID", baseUser)
+		}
+	}
+	return fmt.Sprintf("%d:%d", uid, gid), uid, gid, nil
+}
+
+func canonicalImageRef(ref string) (string, error) {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", err
+	}
+	return reference.TagNameOnly(named).String(), nil
+}
+
+func pinImageRef(ref, digest string) string {
+	name, _, _ := strings.Cut(ref, "@")
+	return name + "@" + digest
 }
 
 // getBuildArg returns the value of build-arg:<k>, or "".

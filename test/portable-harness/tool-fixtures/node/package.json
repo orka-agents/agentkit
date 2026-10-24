@@ -1,0 +1,7 @@
+{
+  "name": "agentkit-portable-node-tool",
+  "version": "0.0.0",
+  "bin": {
+    "agentkit-portable-node-tool": "server.js"
+  }
+}

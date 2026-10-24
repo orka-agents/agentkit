@@ -28,6 +28,18 @@ make run-test-agent      # run the image; needs OPENAI_API_KEY
 - `adapter=agentkit-serve:test` makes the Go converter use the local adapter
   image as the LLB base.
 
+To exercise the experimental production composition path instead:
+
+```sh
+make build-agentkit TAG=spike
+make build-portable-harness-spike TAG=spike PLATFORM=linux/arm64
+make build-composed-test-agent-spike TAG=spike PLATFORM=linux/arm64
+```
+
+This passes paired `baseImage` and `harnessImage` inputs through the real
+frontend. The target defaults to `ubuntu:24.04` and can be overridden with
+`BASE_IMAGE`, `HARNESS_IMAGE`, and `COMPOSED_AGENT_IMAGE`.
+
 ## Runtime-specific loops
 
 Microsoft Agent Framework:
