@@ -57,6 +57,8 @@ jobs:
           shellcheck scripts/generate-agentsessions-stubs.sh
           bash -n scripts/agentsessions-e2e.sh
           shellcheck scripts/agentsessions-e2e.sh
+          bash -n scripts/toolbox-e2e.sh
+          shellcheck scripts/toolbox-e2e.sh
           test -z "$(gofmt -l test/agentsessions/*.go)"
           test -z "$(gofmt -l test/orka-harness-v2/probe/*.go)"
           go test test/orka-harness-v2/probe/localai.go test/orka-harness-v2/probe/localai_test.go
@@ -74,6 +76,7 @@ jobs:
           python3 -m py_compile test/maf-image-smoke.py
           python3 -m py_compile test/foundry-hosted-agent/foundry_live.py deploy/foundry/scripts/verify_brokered_transcript.py test/pydantic-image-smoke.py
           python3 -m py_compile test/langgraph-image-smoke.py
+          python3 -m py_compile test/toolbox-image-smoke.py
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -342,6 +345,12 @@ jobs:
           make build-serve TAG=ci
           make build-serve-maf TAG=ci
           make build-serve-langgraph TAG=ci
+
+      - name: Build and check toolbox images
+        env:
+          TAG: ci
+          BUILDER: ""
+        run: bash scripts/toolbox-e2e.sh
 
       - name: Build test agent images for all runtimes
         run: |

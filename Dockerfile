@@ -22,9 +22,17 @@ RUN CGO_ENABLED=0 \
     GOARCH=${TARGETARCH} \
     GOARM=${TARGETVARIANT} \
     go build -o /agentkit -ldflags "${LDFLAGS} -w -s -extldflags '-static'" ./cmd/frontend
+# kind: Toolbox builds run this helper inside the build. Ship it for every
+# toolbox architecture, whatever this image's own, so each exec runs a helper
+# built for its platform, natively or under emulation.
+RUN for arch in amd64 arm64; do \
+      CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+      go build -o "/toolbox/agentkit-toolbox-linux-$arch" -ldflags "${LDFLAGS} -w -s -extldflags '-static'" ./cmd/toolbox || exit 1; \
+    done
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/orka-agents/agentkit"
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /agentkit /bin/agentkit
+COPY --from=builder /toolbox/ /usr/libexec/agentkit/
 ENTRYPOINT ["/bin/agentkit"]

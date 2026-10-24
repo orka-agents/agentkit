@@ -8,6 +8,9 @@ const (
 	// KindAgent is the config discriminator for an agent build (see §5.1).
 	KindAgent = "Agent"
 
+	// KindToolbox is the config discriminator for an Orka toolbox image build.
+	KindToolbox = "Toolbox"
+
 	// ProviderOpenAICompatible is the only model provider supported in v0.
 	ProviderOpenAICompatible = "openai-compatible"
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/containerd/platforms"
 	controlapi "github.com/moby/buildkit/api/services/control"
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -37,6 +38,12 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	loaded, err := loadAgentkitfile(ctx, c)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting agentkitfile")
+	}
+	if loaded.toolbox != nil {
+		if err := loaded.toolbox.Validate(); err != nil {
+			return nil, errors.Wrap(err, "validating agentkitfile")
+		}
+		return handleToolbox(ctx, c, loaded.toolbox)
 	}
 	cfg := loaded.config
 
@@ -95,21 +102,37 @@ func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 
 	adapterRef := rc.AdapterRef(opts)
 
-	// Default the build platform to the buildkit host's os/arch, preferring the
-	// first worker's platform (AIKit parity).
+	targetPlatforms, err := requestedPlatforms(c)
+	if err != nil {
+		return nil, err
+	}
+	return buildPlatforms(ctx, targetPlatforms, func(ctx context.Context, platform *specs.Platform, multiPlatform bool) (*buildResult, error) {
+		return buildImage(ctx, c, agentSpec, adapterRef, platform, multiPlatform, cacheImports)
+	})
+}
+
+// requestedPlatforms returns the --platform list. Without one it defaults to
+// the buildkit host's os/arch, preferring the first worker's platform (AIKit
+// parity).
+func requestedPlatforms(c client.Client) ([]*specs.Platform, error) {
+	if platform := c.BuildOpts().Opts[keyTargetPlatform]; platform != "" {
+		targetPlatforms, err := parsePlatforms(platform)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to parse target platforms %s", platform)
+		}
+		return targetPlatforms, nil
+	}
+
 	defaultBuildPlatform := platforms.DefaultSpec()
 	if workers := c.BuildOpts().Workers; len(workers) > 0 && len(workers[0].Platforms) > 0 {
 		defaultBuildPlatform = workers[0].Platforms[0]
 	}
+	return []*specs.Platform{&defaultBuildPlatform}, nil
+}
 
-	targetPlatforms := []*specs.Platform{&defaultBuildPlatform}
-	if platform, exists := opts[keyTargetPlatform]; exists && platform != "" {
-		targetPlatforms, err = parsePlatforms(platform)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse target platforms %s", platform)
-		}
-	}
-
+// buildPlatforms builds every target platform in parallel and merges the
+// per-platform images into one result, multi-platform when more than one.
+func buildPlatforms(ctx context.Context, targetPlatforms []*specs.Platform, build func(context.Context, *specs.Platform, bool) (*buildResult, error)) (*client.Result, error) {
 	isMultiPlatform := len(targetPlatforms) > 1
 	exportPlatforms := &exptypes.Platforms{
 		Platforms: make([]exptypes.Platform, len(targetPlatforms)),
@@ -120,7 +143,7 @@ func handleAgent(ctx context.Context, c client.Client, cfg *config.AgentConfig, 
 	for i, tp := range targetPlatforms {
 		func(i int, platform *specs.Platform) {
 			eg.Go(func() (err error) {
-				result, err := buildImage(ctx, c, agentSpec, adapterRef, platform, isMultiPlatform, cacheImports)
+				result, err := build(ctx, platform, isMultiPlatform)
 				if err != nil {
 					return errors.Wrap(err, "failed to build image")
 				}
@@ -167,13 +190,18 @@ func (br *buildResult) AddToClientResult(cr *client.Result) {
 
 // buildImage converts the effective Agent to LLB for one platform and solves it.
 func buildImage(ctx context.Context, c client.Client, agentSpec effective.Agent, adapterRef string, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
-	result := buildResult{Platform: platform, MultiPlatform: multiPlatform}
-
 	state, image, err := agentllb.Agentkit2LLB(agentSpec, adapterRef, platform)
 	if err != nil {
 		return nil, err
 	}
+	return solveImage(ctx, c, state, image, platform, multiPlatform, cacheImports)
+}
 
+// solveImage solves one platform's image state and pairs it with its config.
+func solveImage(ctx context.Context, c client.Client, state llb.State, image *specs.Image, platform *specs.Platform, multiPlatform bool, cacheImports []client.CacheOptionsEntry) (*buildResult, error) {
+	result := buildResult{Platform: platform, MultiPlatform: multiPlatform}
+
+	var err error
 	result.ImageConfig, err = json.Marshal(image)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal image config")
