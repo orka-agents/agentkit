@@ -5,9 +5,6 @@ package render
 import (
 	"bytes"
 	"errors"
-	"flag"
-	"fmt"
-	"io"
 	"net/url"
 	"strings"
 	"unicode"
@@ -135,37 +132,4 @@ func OrkaAgentRuntime(opts OrkaAgentRuntimeOptions) ([]byte, error) {
 		return nil, err
 	}
 	return append(bytes.TrimSpace(out), '\n'), nil
-}
-
-// RunCLI implements `agentkit render` for the frontend binary. The BuildKit
-// frontend path still runs when no subcommand is provided.
-func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agentkit render", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	target := fs.String("target", "", "render target (orka-agentruntime)")
-	image := fs.String("image", "", "agent image reference; not supported by current Orka external-endpoint CRD")
-	name := fs.String("name", "", "AgentRuntime metadata.name")
-	externalEndpoint := fs.String("external-endpoint", "", "external Orka harness endpoint")
-	authSecretName := fs.String("auth-secret-name", "", "Secret name containing the Orka harness bearer token")
-	authSecretKey := fs.String("auth-secret-key", DefaultAuthSecretKey, "Secret key containing the Orka harness bearer token")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *target != TargetOrkaAgentRuntime {
-		fmt.Fprintf(stderr, "agentkit render: unsupported --target %q (expected %q)\n", *target, TargetOrkaAgentRuntime)
-		return 2
-	}
-	out, err := OrkaAgentRuntime(OrkaAgentRuntimeOptions{
-		Name:             *name,
-		Image:            *image,
-		ExternalEndpoint: *externalEndpoint,
-		AuthSecretName:   *authSecretName,
-		AuthSecretKey:    *authSecretKey,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "agentkit render: %v\n", err)
-		return 2
-	}
-	_, _ = stdout.Write(out)
-	return 0
 }

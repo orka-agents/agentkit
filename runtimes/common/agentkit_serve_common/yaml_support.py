@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterator
+from typing import Any
 
 import yaml
 
@@ -51,9 +51,3 @@ def safe_load_lossless(raw: str) -> Any:
     """Load one YAML document without lossy float coercion."""
 
     return yaml.load(raw, Loader=_LosslessSafeLoader)
-
-
-def safe_load_all_lossless(raw: str) -> Iterator[Any]:
-    """Load YAML documents without lossy float coercion."""
-
-    return yaml.load_all(raw, Loader=_LosslessSafeLoader)

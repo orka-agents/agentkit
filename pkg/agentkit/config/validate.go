@@ -247,12 +247,7 @@ func validateBrokeredTools(add func(string, ...any), tools []BrokeredTool, owned
 	seen := map[string]bool{}
 	for i, tool := range tools {
 		path := fmt.Sprintf("brokeredTools[%d]", i)
-		if tool.Name == "" {
-			add("%s.name is required", path)
-		} else {
-			if !isBrokeredToolName(tool.Name) {
-				add("%s.name %q must match [A-Za-z0-9_-]{1,64}", path, tool.Name)
-			}
+		if tool.Name != "" {
 			if seen[tool.Name] {
 				add("%s: duplicate brokered tool name %q", path, tool.Name)
 			}
@@ -261,27 +256,46 @@ func validateBrokeredTools(add func(string, ...any), tools []BrokeredTool, owned
 			}
 			seen[tool.Name] = true
 		}
-		if tool.Description == "" {
-			add("%s.description is required", path)
-		} else if hasUnsafeBrokeredDescription(tool.Description) {
-			add("%s.description must not contain URLs or secret-like material", path)
-		}
-		switch tool.BrokeredClass {
-		case BrokeredClassRead, BrokeredClassWrite, BrokeredClassCoordination:
-		case "":
-			add("%s.brokeredClass is required", path)
-		default:
-			add("%s.brokeredClass %q is not supported (expected read, write, or coordination)", path, tool.BrokeredClass)
-		}
-		validateBrokeredToolParameters(add, path+".parameters", tool.Parameters)
-		if tool.SchemaDigest != "" {
-			if !isSchemaDigest(tool.SchemaDigest) {
-				add("%s.schemaDigest must be sha256:<64 lowercase hex>", path)
-			} else if actual, err := BrokeredToolSchemaDigest(tool); err != nil {
-				add("%s.schemaDigest could not be checked: %v", path, err)
-			} else if tool.SchemaDigest != actual {
-				add("%s.schemaDigest does not match the safe schema", path)
-			}
+		validateBrokeredTool(add, path, tool)
+	}
+}
+
+// ValidateBrokeredTool checks one standalone brokeredTools entry, such as one
+// exported from an Orka Tool CRD, with the per-entry rules Validate applies.
+func ValidateBrokeredTool(tool BrokeredTool) error {
+	var errs []error
+	validateBrokeredTool(func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}, "brokeredTool", tool)
+	return errors.Join(errs...)
+}
+
+func validateBrokeredTool(add func(string, ...any), path string, tool BrokeredTool) {
+	if tool.Name == "" {
+		add("%s.name is required", path)
+	} else if !isBrokeredToolName(tool.Name) {
+		add("%s.name %q must match [A-Za-z0-9_-]{1,64}", path, tool.Name)
+	}
+	if tool.Description == "" {
+		add("%s.description is required", path)
+	} else if hasUnsafeBrokeredDescription(tool.Description) {
+		add("%s.description must not contain URLs or secret-like material", path)
+	}
+	switch tool.BrokeredClass {
+	case BrokeredClassRead, BrokeredClassWrite, BrokeredClassCoordination:
+	case "":
+		add("%s.brokeredClass is required", path)
+	default:
+		add("%s.brokeredClass %q is not supported (expected read, write, or coordination)", path, tool.BrokeredClass)
+	}
+	validateBrokeredToolParameters(add, path+".parameters", tool.Parameters)
+	if tool.SchemaDigest != "" {
+		if !isSchemaDigest(tool.SchemaDigest) {
+			add("%s.schemaDigest must be sha256:<64 lowercase hex>", path)
+		} else if actual, err := BrokeredToolSchemaDigest(tool); err != nil {
+			add("%s.schemaDigest could not be checked: %v", path, err)
+		} else if tool.SchemaDigest != actual {
+			add("%s.schemaDigest does not match the safe schema", path)
 		}
 	}
 }
